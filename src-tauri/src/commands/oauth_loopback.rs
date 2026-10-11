@@ -68,6 +68,8 @@ struct LoopbackState {
     app: AppHandle,
     account_name: Option<String>,
     group_id: Option<String>,
+    /// 重新登录模式：期望更新的目标账号 uid（不一致则拒绝落库）
+    expect_uid: Option<String>,
     /// 最近一次请求时间（秒），用于空闲超时
     last_active: Arc<AtomicI64>,
     /// 登录流程结束后由 handler 自发触发关闭
@@ -91,11 +93,12 @@ async fn handle_authorize(AxumState(st): AxumState<Arc<LoopbackState>>, uri: Uri
     let app = st.app.clone();
     let account_name = st.account_name.clone();
     let group_id = st.group_id.clone();
+    let expect_uid = st.expect_uid.clone();
     let url = callback_url.clone();
     let result = tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let runtime = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
-        oauth_login(state, runtime, url, account_name, group_id)
+        oauth_login(state, runtime, url, account_name, group_id, expect_uid)
     })
     .await;
 
@@ -216,6 +219,8 @@ pub async fn oauth_start_loopback(
     state: State<'_, AppState>,
     account_name: Option<String>,
     group_id: Option<String>,
+    // 重新登录模式：期望更新的目标账号 uid（Some 时后端校验授权账号必须一致）
+    expect_uid: Option<String>,
 ) -> Result<(), String> {
     // 已在监听 → 先停旧的（等待端口释放，最多 2 秒；仍未结束则由下方 bind 的明确报错兜底）
     stop_loopback().await;
@@ -244,6 +249,7 @@ pub async fn oauth_start_loopback(
         app: app.clone(),
         account_name,
         group_id,
+        expect_uid,
         last_active: last_active.clone(),
         shutdown_tx: shutdown_tx.clone(),
     });

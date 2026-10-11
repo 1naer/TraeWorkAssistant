@@ -170,7 +170,12 @@ interface AppState {
   profileBackup: (userId: string) => Promise<void>;
   profileRestore: (userId: string) => Promise<void>;
   profileDelete: (userId: string) => Promise<void>;
-  oauthLogin: (callbackUrl: string, accountName?: string, groupId?: string) => Promise<void>;
+  oauthLogin: (
+    callbackUrl: string,
+    accountName?: string,
+    groupId?: string,
+    expectUid?: string,
+  ) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
   dismissToast: (id: number) => void;
@@ -1117,9 +1122,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `删除失败：${String(err)}`);
     }
   },
-  oauthLogin: async (callbackUrl, accountName, groupId) => {
+  oauthLogin: async (callbackUrl, accountName, groupId, expectUid) => {
     try {
-      const result = await api.oauth.login(callbackUrl, accountName, groupId);
+      const result = await api.oauth.login(callbackUrl, accountName, groupId, expectUid);
       await get().refreshAccounts();
       // 同 uid 合并场景如实提示「更新已有账号」而非「已添加」（issue #80）
       if (result.merged) {
