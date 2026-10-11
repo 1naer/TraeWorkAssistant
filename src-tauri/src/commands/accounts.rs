@@ -356,6 +356,8 @@ pub fn accounts_import(
         tags_ignored: 0,
     };
 
+    // 标签定义循环外一次加载（校验 tag id 存在用；导入过程不修改 tags 表，语义等价）
+    let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
     for (_, entry) in selected {
         // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
         let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
@@ -404,7 +406,6 @@ pub fn accounts_import(
             })
             .unwrap_or_default();
         if !tags_in.is_empty() {
-            let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
             let mut ignored = 0usize;
             let valid: Vec<String> = tags_in
                 .into_iter()

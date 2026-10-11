@@ -547,7 +547,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         (s, a) => s + (a.daily.find((d) => d.date === today)?.credits ?? 0),
         0,
       ) ?? 0;
-    const todayConsumed = visibleUsage != null && usageVal > 0 ? usageVal : (snap?.consumed ?? 0);
+    // 审查 No.10：筛选明细口径可用时完全信任其值（含 0——筛掉全部有消耗账号后应显示
+    // 0，而非静默混入未过滤的全局快照口径）；仅明细缺失（fetch 失败/未加载）时回退快照
+    const todayConsumed = visibleUsage != null ? usageVal : (snap?.consumed ?? 0);
     return {
       accounts: visibleAccounts.length,
       totalCredits,
@@ -653,7 +655,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed: todaySnap?.consumed ?? null,
       expiring7d: expiring,
     };
-  }, [qoderCredits, qoderSnapshots, qoderCheckin, today]);
+  }, [visibleQoderCredits, qoderSnapshots, qoderCheckin, today]);
 
   const kpi = isTrae ? traeKpi : isQoder ? qoderKpi : buddyKpi;
 
@@ -792,7 +794,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
             selected={accountFilter}
             onChange={setAccountFilter}
           />
-          {filtersActive && tab !== 'expiry' && !(platform === 'trae' && activeSource === 'official') && (
+          {filtersActive && tab !== 'expiry' && tab !== 'sessions' && !(platform === 'trae' && activeSource === 'official') && (
             <span
               className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
               title="当前数据源为聚合口径（无账号维度），筛选仅作用于 KPI 与到期日历；消耗/Token 明细不做静默截断"

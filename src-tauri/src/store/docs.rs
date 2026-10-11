@@ -78,7 +78,7 @@ pub fn wb_credits_history_save(s: &Store, root: &Value) -> Result<(), String> {
 
 // ── P6 流水迁出：消耗明细增量缓存（原 kv usage_history）──────────────────────
 
-/// 读回 CacheFile 形状 Value：{fetched_at, accounts:{uid:{name,last_fetch_end_ts,daily:{date:stat}}}}
+/// 读回 CacheFile 形状 Value：{fetched_at, accounts:{uid:{name,last_fetch_end_ts,daily:{date:stat},sessions:{date:[rows]}}}}
 pub fn usage_history_load(s: &Store) -> Value {
     let mut out = serde_json::Map::new();
     let metas = s
@@ -100,7 +100,7 @@ pub fn usage_history_load(s: &Store) -> Value {
     for (uid, name, ts) in metas {
         out.insert(
             uid.clone(),
-            json!({"name": name, "last_fetch_end_ts": ts, "daily": {}}),
+            json!({"name": name, "last_fetch_end_ts": ts, "daily": {}, "sessions": {}}),
         );
     }
     let days = s
@@ -124,6 +124,28 @@ pub fn usage_history_load(s: &Store) -> Value {
             }
         }
     }
+    // 会话行回读（issue #82 会话明细 Tab 数据源；旧库无该表时返回空集，serde default 兜底）
+    let sessions = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare("SELECT uid, date, data FROM usage_history_sessions")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    for (uid, date, data) in sessions {
+        if let Some(acc) = out.get_mut(&uid).and_then(Value::as_object_mut) {
+            if let Some(list) = acc.get_mut("sessions").and_then(Value::as_object_mut) {
+                list.insert(
+                    date,
+                    serde_json::from_str::<Value>(&data).unwrap_or(Value::Array(vec![])),
+                );
+            }
+        }
+    }
     let meta: Value = s.kv_get("usage_history_meta");
     json!({
         "fetched_at": meta.get("fetched_at").and_then(Value::as_i64),
@@ -137,6 +159,7 @@ pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
     // 序列化在事务外完成（闭包内仅做 rusqlite 操作）
     let mut metas: Vec<(String, String, Option<i64>)> = Vec::with_capacity(accounts.len());
     let mut day_rows: Vec<(String, String, String)> = Vec::new();
+    let mut session_rows: Vec<(String, String, String)> = Vec::new();
     for (uid, acc) in accounts {
         metas.push((
             uid.clone(),
@@ -152,9 +175,21 @@ pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
                 ));
             }
         }
+        // 会话行明细同事务落库（issue #82；缺键 = 旧调用方/旧缓存，视为无会话行）
+        if let Some(sessions) = acc.get("sessions").and_then(Value::as_object) {
+            for (date, list) in sessions {
+                session_rows.push((
+                    uid.clone(),
+                    date.clone(),
+                    serde_json::to_string(list).map_err(|e| format!("序列化失败: {e}"))?,
+                ));
+            }
+        }
     }
     s.with_conn(move |c| {
-        c.execute_batch("BEGIN; DELETE FROM usage_history_accounts; DELETE FROM usage_history_days;")?;
+        c.execute_batch(
+            "BEGIN; DELETE FROM usage_history_accounts; DELETE FROM usage_history_days; DELETE FROM usage_history_sessions;",
+        )?;
         {
             let mut meta = c.prepare(
                 "INSERT INTO usage_history_accounts(uid, name, last_fetch_end_ts, updated_at) VALUES(?1, ?2, ?3, datetime('now','localtime'))",
@@ -162,11 +197,17 @@ pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
             let mut day = c.prepare(
                 "INSERT INTO usage_history_days(uid, date, data) VALUES(?1, ?2, ?3)",
             )?;
+            let mut sess = c.prepare(
+                "INSERT INTO usage_history_sessions(uid, date, data) VALUES(?1, ?2, ?3)",
+            )?;
             for (uid, name, ts) in &metas {
                 meta.execute(rusqlite::params![uid, name, ts])?;
             }
             for (uid, date, text) in &day_rows {
                 day.execute(rusqlite::params![uid, date, text])?;
+            }
+            for (uid, date, text) in &session_rows {
+                sess.execute(rusqlite::params![uid, date, text])?;
             }
         }
         c.execute_batch("COMMIT;")?;
@@ -182,6 +223,7 @@ pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
         .to_string();
     s.with_conn(|c| {
         c.execute("DELETE FROM usage_history_days WHERE date < ?1", [cutoff.as_str()])?;
+        c.execute("DELETE FROM usage_history_sessions WHERE date < ?1", [cutoff.as_str()])?;
         Ok(())
     })?;
     // fetched_at 回写 kv（原文件顶层字段）
@@ -465,16 +507,43 @@ mod tests {
         wb_credits_history_prune(&s).unwrap();
 
         // usage_history：save/load 回环（含 365 天裁剪语义由 save 内执行）
+        // sessions 回环（issue #82）：会话行必须与 daily 同事务落库、同读回——
+        // 回归锚点：v3.7.7 曾只序列化 metas+day_rows 丢弃 sessions，重启后会话明细恒空
         let root = json!({
             "fetched_at": 12345,
             "accounts": {"u1": {"name": "甲", "last_fetch_end_ts": 999,
-                                "daily": {"2026-09-15": {"date": "2026-09-15", "credits": 1.5, "sessions": 2}}}}
+                                "daily": {"2026-09-15": {"date": "2026-09-15", "credits": 1.5, "sessions": 2}},
+                                "sessions": {"2026-09-15": [
+                                    {"session_id": "s1", "ts": 10, "model": "glm", "mode": "agent",
+                                     "credits": 1.0, "cost_money": 0.0, "input_tokens": 5,
+                                     "output_tokens": 6, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                     "preview": "你好"},
+                                    {"session_id": "s2", "ts": 20, "model": "kimi", "mode": "chat",
+                                     "credits": 0.5, "cost_money": 0.0, "input_tokens": 1,
+                                     "output_tokens": 2, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                     "preview": "第二会话"}
+                                ]}}}
         });
         usage_history_save(&s, &root).unwrap();
         let got = usage_history_load(&s);
         assert_eq!(got["fetched_at"], 12345);
         assert_eq!(got["accounts"]["u1"]["name"], "甲");
         assert_eq!(got["accounts"]["u1"]["daily"]["2026-09-15"]["credits"], 1.5);
+        let sess = got["accounts"]["u1"]["sessions"]["2026-09-15"].as_array().unwrap();
+        assert_eq!(sess.len(), 2, "会话行必须随 save 落库并随 load 回读");
+        assert_eq!(sess[0]["session_id"], "s1");
+        assert_eq!(sess[1]["model"], "kimi");
+        // 同日重拉（增量替换语义在调用方）：save 覆盖后不叠加
+        usage_history_save(&s, &root).unwrap();
+        let got2 = usage_history_load(&s);
+        assert_eq!(
+            got2["accounts"]["u1"]["sessions"]["2026-09-15"].as_array().unwrap().len(),
+            2,
+            "同日重存整行替换，不得叠加"
+        );
+        // typed 回环：load 输出必须能反序列化回 CacheFile（usage_history.rs 消费形态）
+        let cache: serde_json::Value = got;
+        assert!(cache["accounts"]["u1"]["sessions"].is_object());
 
         // sticky bindings：save/load 回环
         sticky_bindings_save(&s, &json!({"bindings": [

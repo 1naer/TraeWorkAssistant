@@ -786,23 +786,44 @@ export default function Accounts() {
         onClose={() => setTagsOpen(false)}
         tags={tagDefs}
         onCreate={async (name, color) => {
-          await api.tags.create(name, color);
-          await refreshTags();
+          try {
+            await api.tags.create(name, color);
+            await refreshTags();
+          } catch (err) {
+            // 审查 F5：异常兜底 toast（对齐 Buddy/Qoder 账号页），重抛由弹框保留输入便于重试
+            toast('error', `创建标签失败：${String(err)}`);
+            throw err;
+          }
         }}
         onRename={async (id, name) => {
-          await api.tags.update(id, { name });
-          await refreshTags();
-          toast('success', `标签已重命名为「${name}」`);
+          try {
+            await api.tags.update(id, { name });
+            await refreshTags();
+            toast('success', `标签已重命名为「${name}」`);
+          } catch (err) {
+            toast('error', `重命名标签失败：${String(err)}`);
+            throw err;
+          }
         }}
         onRecolor={async (id, color) => {
-          await api.tags.update(id, { color });
-          await refreshTags();
-          toast('success', '标签颜色已更新');
+          try {
+            await api.tags.update(id, { color });
+            await refreshTags();
+            toast('success', '标签颜色已更新');
+          } catch (err) {
+            toast('error', `修改标签颜色失败：${String(err)}`);
+            throw err;
+          }
         }}
         onDelete={async (id) => {
-          await api.tags.remove(id);
-          await refreshTags();
-          toast('success', '标签已删除，引用已清理');
+          try {
+            await api.tags.remove(id);
+            await refreshTags();
+            toast('success', '标签已删除，引用已清理');
+          } catch (err) {
+            toast('error', `删除标签失败：${String(err)}`);
+            throw err;
+          }
         }}
       />
       <AccountTagsEditModal

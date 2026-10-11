@@ -464,19 +464,27 @@ pub fn trae_expired_ents(state: State<AppState>) -> Result<TraeExpiredEntsResult
 /// 实现（本命令与调度器 `trae-usage-sync` / CLI `--task-run trae-usage-sync` 共用，issue #61）。
 /// 失败分流（对齐 qoder_credits::run_snapshot_task 惯例）：全部有凭证账号拉取失败 → Err
 /// （不覆盖 fetched_at，调度器 30 分钟冷却重试）；部分失败 → Ok（保留旧缓存逐账号注明错误）。
+/// 消耗明细表级读改写互斥（审查 P2-3）：调度器定时任务（scheduler.rs）、GUI 手动刷新、
+/// CLI `--task-run trae-usage-sync`（tasks/mod.rs）三路共用本实现，并发 fresh 拉取时
+/// 整表 load→save 互相覆盖丢增量（CHANGELOG 曾声称修复，但此前仅 Buddy 侧落实）。
+/// 持锁覆盖 fresh 路径 load→网络→save 全程；只读缓存路径不持锁，不被网络往返阻塞。
+/// 叶子锁：持锁期间不得再获取其他锁。跨进程并发由 SQLite 事务保证单次落库原子性，
+/// 极端场景最坏丢一次增量，下轮拉取按 last_fetch_end_ts 区间覆盖自愈。
+static USAGE_HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn usage_history_fetch_impl(
     state: &AppState,
     fresh: bool,
 ) -> Result<UsageHistoryResult, String> {
     let now_ts = chrono::Local::now().timestamp();
     let accounts = crate::vault::load_accounts(state);
-    let mut cache: CacheFile = serde_json::from_value(
-        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
-    )
-    .unwrap_or_default();
 
-    // 纯缓存读取（零网络；尚未拉取过的账号如实提示）
+    // 纯缓存读取（零网络；尚未拉取过的账号如实提示）——不持锁
     if !fresh {
+        let cache: CacheFile = serde_json::from_value(
+            crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
+        )
+        .unwrap_or_default();
         let mut out = Vec::new();
         for a in &accounts.accounts {
             let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
@@ -499,6 +507,13 @@ pub fn usage_history_fetch_impl(
             accounts: out,
         });
     }
+
+    // fresh 拉取：全程持表级互斥（load→网络→save；并发拉取串行化防丢增量）
+    let _guard = USAGE_HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache: CacheFile = serde_json::from_value(
+        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
+    )
+    .unwrap_or_default();
 
     // 增量拉取：无缓存账号全量近一年；已有账号从上次拉取日 00:00 重拉并替换该日及之后
     let full_start = now_ts - FULL_PULL_DAYS * 86400;

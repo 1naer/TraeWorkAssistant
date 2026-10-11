@@ -1775,6 +1775,7 @@ export default function QoderAccounts() {
             return;
           }
           reloadTags();
+          await refresh(); // 审查 No.15：绑定清理后账号列表标签徽标同步（对齐 Buddy 账号页）
           pushToast('success', '标签已删除，引用已清理');
         }}
       />

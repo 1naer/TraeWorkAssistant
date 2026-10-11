@@ -201,6 +201,15 @@ const DDL: &[&str] = &[
         PRIMARY KEY (uid, date)
     )",
     "CREATE INDEX IF NOT EXISTS idx_usage_history_days_date ON usage_history_days(date)",
+    // P6 流水迁出：消耗明细会话行（issue #82 会话明细 Tab；data = Vec<UsageSessionRow> JSON，
+    // 一行 = uid×date 整日会话列表，与 usage_history_days 同构）
+    "CREATE TABLE IF NOT EXISTS usage_history_sessions (
+        uid  TEXT NOT NULL,
+        date TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (uid, date)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_usage_history_sessions_date ON usage_history_sessions(date)",
     // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
     "CREATE TABLE IF NOT EXISTS sticky_bindings (
         key        TEXT PRIMARY KEY,

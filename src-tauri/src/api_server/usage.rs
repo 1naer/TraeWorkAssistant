@@ -198,11 +198,14 @@ impl DayStats {
     /// 记录一次积分测量（issue #82 T2：仅 Qoder 网关路径使用）。
     /// 任一值缺失（上游未下发 usage）则不入账——与「上游未下发 usage 不得伪造」口径一致；
     /// 负值防御性截断为 0；有值时按模型累加（T2.4 模型粒度排行数据源）。
+    /// 截断后为 0 的值不入模型榜（负值防御 + 上游真实 0 消耗都不产生 0 值假条目）。
     pub fn record_credits(&mut self, model: &str, credits: Option<f64>, original: Option<f64>) {
         if let Some(c) = credits {
             let c = c.max(0.0);
             self.credits += c;
-            *self.model_credits.entry(model.to_string()).or_default() += c;
+            if c > 0.0 {
+                *self.model_credits.entry(model.to_string()).or_default() += c;
+            }
         }
         if let Some(o) = original {
             self.original_credits += o.max(0.0);

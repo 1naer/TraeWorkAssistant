@@ -42,6 +42,14 @@ export function TagsModal({
     });
   }, [tags]);
 
+  // 审查 No.13：弹框复用同一组件实例，打开时重置新建表单，避免残留上次的名称/颜色
+  useEffect(() => {
+    if (open) {
+      setName('');
+      setColor(PRESET_COLORS[0]);
+    }
+  }, [open]);
+
   return (
     <>
       <Modal

@@ -1010,6 +1010,12 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
     workbuddy_token_stats_impl(&state, fresh.unwrap_or(false))
 }
 
+/// token_stats_files 表级读改写互斥（审查 P3-8）：GUI 同步重扫 / 调度器 Token 同步 /
+/// SWR 后台重扫线程三路并发时，kv load→scan→save 互相覆盖丢增量文件条目。
+/// 持锁覆盖全量重扫体（scan 可达秒级，重扫请求串行化；fresh=false 只读路径不持锁）。
+/// 叶子锁：持锁期间不得再获取其他锁。
+static TOKEN_STATS_FILES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 实现（本命令与调度器 wb-credits-snapshot Token 同步共用）：
 /// fresh=true（前端「重扫」/调度同步）跳过结果缓存强制重扫（仍享受增量缓存）；
 /// fresh=false 时除进程内 RESULT_CACHE 外还读落盘结果缓存（B2，issue #84）：
@@ -1063,6 +1069,10 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
             return stale;
         }
     }
+
+    // 全量重扫体持表级互斥（审查 P3-8）：load→scan→save 全程串行化，防三路并发
+    // 互相覆盖 kv 条目；fresh=false 只读路径（上方缓存命中分支）不进锁，不被阻塞。
+    let _guard = TOKEN_STATS_FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let now_ms = chrono::Utc::now().timestamp_millis();

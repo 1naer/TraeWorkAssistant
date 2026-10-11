@@ -48,11 +48,14 @@ export default function SessionsTab({
   const [page, setPage] = useState(1);
   const [data, setData] = useState<UsageSessionsResult | null>(null);
   const [loading, setLoading] = useState(false);
+  // 审查 No.11：查询失败持久错误态（toast 稍纵即逝；横幅保留至下次成功查询）
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (scope === 'qoder') return;
     let cancelled = false;
     setLoading(true);
+    setError(null);
     const fetchFn = scope === 'buddy' ? api.workbuddy.usageSessions : api.accounts.usageSessions;
     fetchFn({
       start,
@@ -66,8 +69,9 @@ export default function SessionsTab({
         if (!cancelled) setData(r);
       })
       .catch((err) => {
+        // 审查 No.11：失败保留上次成功结果（不清空已渲染表格），错误横幅持续可见
         if (!cancelled) {
-          setData(null);
+          setError(`会话明细查询失败：${String(err)}`);
           pushToast('error', `会话明细查询失败：${String(err)}`);
         }
       })
@@ -158,6 +162,13 @@ export default function SessionsTab({
         </select>
         {loading && <span className="text-xs text-slate-400">加载中…</span>}
       </div>
+
+      {error && (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-xs text-rose-600 dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-300">
+          {error}
+          {data ? '（下方为上次成功查询的结果，可调整筛选后重试）' : '（尚无已加载数据，可调整筛选后重试）'}
+        </div>
+      )}
 
       {data && data.total === 0 ? (
         // fetched_at > 0 表示已成功拉取过缓存：total===0 属筛选后无结果，不再引导刷新（审查 P4）
