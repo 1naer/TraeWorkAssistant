@@ -188,9 +188,12 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const [qoderCredits, setQoderCredits] = useState<QoderCreditsResult | null>(null);
   const [qoderSnapshots, setQoderSnapshots] = useState<QoderCreditsSnapshot[]>([]);
   const [qoderCheckin, setQoderCheckin] = useState<QoderCheckinRecord[]>([]);
-  // 各统计 Tab 独立数据源状态（§3.4）；默认源按平台选择（Trae/Buddy 官网优先；Qoder 官网无消耗明细 → 本地快照）
+  // 各统计 Tab 独立数据源状态（§3.4）；默认源按平台选择（Trae/Buddy 官网优先；Qoder 官网无消耗明细 → 本地快照；
+  // Qoder Token 仅网关源有实测数据 → 默认网关）
   const [creditsSource, setCreditsSource] = useState<BoardSource>(platform === 'qoder' ? 'local' : 'official');
-  const [tokensSource, setTokensSource] = useState<BoardSource>(platform === 'trae' ? 'official' : 'local');
+  const [tokensSource, setTokensSource] = useState<BoardSource>(
+    platform === 'trae' ? 'official' : platform === 'qoder' ? 'gateway' : 'local',
+  );
   // 会话明细 Tab 联动刷新键（refresh 完成后 +1 触发重查缓存，issue #82）
   const [sessionsRefreshKey, setSessionsRefreshKey] = useState(0);
 
@@ -252,24 +255,38 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     () => (usage ? { ...usage, accounts: filterByUid(usage.accounts) } : usage),
     [usage, filterByUid],
   );
-  // 账号多选候选（随分组筛选联动：勾选分组后仅列组内账号）
+  // 分组筛选生效 uid 集（仅分组，不含账号筛选；issue #82 问题4-2）
+  const groupUids = useMemo<Set<string> | null>(() => {
+    if (groupFilter.length === 0) return null;
+    const set = new Set<string>();
+    for (const g of poolGroups) {
+      if (groupFilter.includes(g.id)) g.uids.forEach((u) => set.add(u));
+    }
+    return set;
+  }, [poolGroups, groupFilter]);
+  // 账号多选候选（随分组筛选联动：勾选分组后仅列组内账号）。
+  // 审查修复（issue #82 问题4-2）：候选集必须只随分组收窄，不能取已按 accountFilter
+  // 过滤后的 visible* 集合——否则勾选任一账号后其余候选立即从下拉消失，多选无法叠加。
   const accountCandidates = useMemo<{ id: string; name: string }[]>(() => {
     const base =
       platform === 'trae'
-        ? visibleAccounts.map((a) => ({ id: a.user_id, name: a.name }))
+        ? accounts.map((a) => ({ id: a.user_id, name: a.name }))
         : platform === 'buddy'
-          ? visibleWbCredits?.accounts.map((a) => ({ id: a.user_id, name: a.name })) ?? []
-          : visibleQoderCredits?.accounts.map((a) => ({ id: a.user_id, name: a.name })) ?? [];
-    return base.filter((a) => a.id);
-  }, [platform, visibleAccounts, visibleWbCredits, visibleQoderCredits]);
-  // 会话明细账号下拉按平台切换（Trae=vault 账号；Buddy=积分接口账号清单；Qoder 无会话明细）。
+          ? (wbCredits?.accounts ?? []).map((a) => ({ id: a.user_id, name: a.name }))
+          : (qoderCredits?.accounts ?? []).map((a) => ({ id: a.user_id, name: a.name }));
+    return base.filter((a) => a.id && (!groupUids || groupUids.has(a.id)));
+  }, [platform, accounts, wbCredits, qoderCredits, groupUids]);
+  // 会话明细账号下拉按平台切换（Trae=vault 账号；Buddy/Qoder=积分接口账号清单；
+  // Qoder 数据源=网关请求级本地流水，issue #82 问题5）。
   // 跟随顶部分组/账号筛选（shared-groups-tags 合并集成：平台视图内全局生效契约）。
   const sessionAccountOptions = useMemo(
     () =>
       platform === 'buddy'
         ? filterByUid(wbCredits?.accounts ?? []).map((a) => ({ user_id: a.user_id, name: a.name }))
-        : filterByUid(accounts).map((a) => ({ user_id: a.user_id, name: a.name })),
-    [platform, wbCredits, accounts, filterByUid],
+        : platform === 'qoder'
+          ? filterByUid(qoderCredits?.accounts ?? []).map((a) => ({ user_id: a.user_id, name: a.name }))
+          : filterByUid(accounts).map((a) => ({ user_id: a.user_id, name: a.name })),
+    [platform, wbCredits, qoderCredits, accounts, filterByUid],
   );
   const filtersActive = groupFilter.length > 0 || accountFilter.length > 0;
 
@@ -853,7 +870,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           wbSnapshots={wbSnapshots}
           wbCheckin={wbCheckin}
           qoderSnapshots={qoderSnapshots}
+          qoderCheckin={qoderCheckin}
           gateway={gateway}
+          uidSet={visibleUids}
         />
       ) : (
         <TokensTab

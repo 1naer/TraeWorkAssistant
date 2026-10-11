@@ -12,7 +12,9 @@ import type { PlatformScope } from './KpiRow';
  * 展示会话级明细行——时间 / 账号 / 会话说明 / 模型 / 消耗积分 / 消耗 token 等。
  * Trae 数据源为官网 query_user_usage_group_by_session 会话行缓存（纯缓存零网络）；
  * Buddy 数据源为官网请求级计费明细落盘（get-user-request-usage，随官方用量拉取保鲜），
- * 上游无 token/会话说明字段 → 相应列显示 '—'；Qoder 官网未提供会话级明细 → 空态说明。
+ * 上游无 token/会话说明字段 → 相应列隐藏；
+ * Qoder 数据源为 API 网关请求级本地流水（issue #82 问题5：官网无会话明细接口，
+ * 由 record_usage_qoder 转发时逐请求落库），无费用/缓存 token 字段 → 相应列隐藏。
  */
 
 const PAGE_SIZE = 50;
@@ -52,11 +54,15 @@ export default function SessionsTab({
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (scope === 'qoder') return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    const fetchFn = scope === 'buddy' ? api.workbuddy.usageSessions : api.accounts.usageSessions;
+    const fetchFn =
+      scope === 'buddy'
+        ? api.workbuddy.usageSessions
+        : scope === 'qoder'
+          ? api.qoder.usageSessions
+          : api.accounts.usageSessions;
     fetchFn({
       start,
       end,
@@ -84,21 +90,16 @@ export default function SessionsTab({
   }, [scope, start, end, model, userId, page, refreshKey, pushToast]);
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
+  // issue #82 问题2：Buddy 官网请求级行仅有 时间/模型/积分，无会话说明、token、
+  // 费用字段 → 直接隐藏这四列（此前恒显示 '—' 空列无信息量）
+  const richColumns = scope !== 'buddy';
+  // issue #82 问题5：Qoder 网关流水无缓存 token/费用字段 → 隐藏这两列
+  const showCacheCost = scope === 'trae';
   const setRange = (days: number) => {
     setStart(fmtDate(new Date(Date.now() - days * 86400_000)));
     setEnd(fmtDate(new Date()));
     setPage(1);
   };
-
-  if (scope === 'qoder') {
-    return (
-      <EmptyState
-        icon={<MessagesSquare size={22} />}
-        title="该平台暂无会话明细数据源"
-        hint="Qoder 官网未提供会话级消耗明细接口；Trae / Buddy 页可查看明细（时间 / 账号 / 模型 / 消耗积分）。"
-      />
-    );
-  }
 
   return (
     <div className="space-y-4">
@@ -197,28 +198,34 @@ export default function SessionsTab({
                 <tr>
                   <th className="px-4 py-2 text-left">时间</th>
                   <th className="px-4 py-2 text-left">账号</th>
-                  <th className="px-4 py-2 text-left">会话说明</th>
+                  {richColumns && <th className="px-4 py-2 text-left">会话说明</th>}
                   <th className="px-4 py-2 text-left">模型</th>
                   <th className="px-4 py-2 text-right">消耗积分</th>
-                  <th
-                    className="px-4 py-2 text-right"
-                    title="输入 / 输出 token（悬停查看精确值）"
-                  >
-                    Token (入/出)
-                  </th>
-                  <th
-                    className="px-4 py-2 text-right"
-                    title="缓存读 / 缓存写 token（悬停查看精确值）"
-                  >
-                    缓存 (读/写)
-                  </th>
-                  <th className="px-4 py-2 text-right">费用</th>
+                  {richColumns && (
+                    <th
+                      className="px-4 py-2 text-right"
+                      title="输入 / 输出 token（悬停查看精确值）"
+                    >
+                      Token (入/出)
+                    </th>
+                  )}
+                  {showCacheCost && (
+                    <>
+                      <th
+                        className="px-4 py-2 text-right"
+                        title="缓存读 / 缓存写 token（悬停查看精确值）"
+                      >
+                        缓存 (读/写)
+                      </th>
+                      <th className="px-4 py-2 text-right">费用</th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody>
-                {(data?.rows ?? []).map((r) => (
+                {(data?.rows ?? []).map((r, idx) => (
                   <tr
-                    key={`${r.user_id}-${r.session_id}-${r.ts}`}
+                    key={`${r.user_id}-${r.session_id || 'x'}-${r.ts}-${idx}`}
                     className="row-hover border-t border-slate-200 dark:border-zinc-800"
                   >
                     <td className="whitespace-nowrap px-4 py-2 text-xs tabular-nums text-slate-500">
@@ -228,12 +235,14 @@ export default function SessionsTab({
                       {r.account_name || r.user_id}
                     </td>
                     {/* 概述开关关闭（T6.1）时仅隐藏展示（显示 '—'），不动缓存与查询 */}
-                    <td
-                      className="max-w-[260px] truncate px-4 py-2 text-xs"
-                      title={showPreview ? r.preview : undefined}
-                    >
-                      {showPreview ? r.preview || '—' : '—'}
-                    </td>
+                    {richColumns && (
+                      <td
+                        className="max-w-[260px] truncate px-4 py-2 text-xs"
+                        title={showPreview ? r.preview : undefined}
+                      >
+                        {showPreview ? r.preview || '—' : '—'}
+                      </td>
+                    )}
                     <td className="whitespace-nowrap px-4 py-2 text-xs">
                       <div className="flex items-center gap-1.5">
                         <span>{r.model}</span>
@@ -247,39 +256,47 @@ export default function SessionsTab({
                     <td className="px-4 py-2 text-right text-xs tabular-nums">
                       {fmtCredits(r.credits)}
                     </td>
-                    <td
-                      className="px-4 py-2 text-right text-xs tabular-nums text-slate-500"
-                      title={
-                        r.input_tokens || r.output_tokens
-                          ? `输入 ${r.input_tokens.toLocaleString()} / 输出 ${r.output_tokens.toLocaleString()}`
-                          : undefined
-                      }
-                    >
-                      {/* Buddy 官网行级明细无 token 字段 → 显示 '—'（无数据留空口径） */}
-                      {r.input_tokens || r.output_tokens
-                        ? `${fmtTokens(r.input_tokens)} / ${fmtTokens(r.output_tokens)}`
-                        : '—'}
-                    </td>
-                    <td
-                      className="px-4 py-2 text-right text-xs tabular-nums text-slate-400"
-                      title={
-                        r.cache_read_tokens || r.cache_write_tokens
-                          ? `缓存读 ${r.cache_read_tokens.toLocaleString()} / 缓存写 ${r.cache_write_tokens.toLocaleString()}`
-                          : undefined
-                      }
-                    >
-                      {r.cache_read_tokens || r.cache_write_tokens
-                        ? `${fmtTokens(r.cache_read_tokens)} / ${fmtTokens(r.cache_write_tokens)}`
-                        : '—'}
-                    </td>
-                    <td className="px-4 py-2 text-right text-xs tabular-nums text-slate-500">
-                      {r.cost_money > 0 ? `$${r.cost_money.toFixed(4)}` : '—'}
-                    </td>
+                    {richColumns && (
+                      <td
+                        className="px-4 py-2 text-right text-xs tabular-nums text-slate-500"
+                        title={
+                          r.input_tokens || r.output_tokens
+                            ? `输入 ${r.input_tokens.toLocaleString()} / 输出 ${r.output_tokens.toLocaleString()}`
+                            : undefined
+                        }
+                      >
+                        {r.input_tokens || r.output_tokens
+                          ? `${fmtTokens(r.input_tokens)} / ${fmtTokens(r.output_tokens)}`
+                          : '—'}
+                      </td>
+                    )}
+                    {showCacheCost && (
+                      <>
+                        <td
+                          className="px-4 py-2 text-right text-xs tabular-nums text-slate-400"
+                          title={
+                            r.cache_read_tokens || r.cache_write_tokens
+                              ? `缓存读 ${r.cache_read_tokens.toLocaleString()} / 缓存写 ${r.cache_write_tokens.toLocaleString()}`
+                              : undefined
+                          }
+                        >
+                          {r.cache_read_tokens || r.cache_write_tokens
+                            ? `${fmtTokens(r.cache_read_tokens)} / ${fmtTokens(r.cache_write_tokens)}`
+                            : '—'}
+                        </td>
+                        <td className="px-4 py-2 text-right text-xs tabular-nums text-slate-500">
+                          {r.cost_money > 0 ? `$${r.cost_money.toFixed(4)}` : '—'}
+                        </td>
+                      </>
+                    )}
                   </tr>
                 ))}
                 {data && data.rows.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="px-4 py-6 text-center text-xs text-slate-400">
+                    <td
+                      colSpan={4 + (richColumns ? 2 : 0) + (showCacheCost ? 2 : 0)}
+                      className="px-4 py-6 text-center text-xs text-slate-400"
+                    >
                       当前筛选条件下无会话记录
                     </td>
                   </tr>

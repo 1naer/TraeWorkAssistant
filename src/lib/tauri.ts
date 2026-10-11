@@ -593,6 +593,23 @@ export const api = {
       invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     creditsHistoryList: () =>
       invoke<{ snapshots: QoderCreditsSnapshot[] }>('qoder_credits_history_list'),
+    /** Qoder 会话明细（issue #82 问题5：官网无明细接口，数据源为网关请求级本地流水 qoder_sessions） */
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('qoder_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
     /**
      * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM
      * 加密为 AIWQENC1 信封后才写入导出文件，后端对无密码含凭证导出直接拒绝）

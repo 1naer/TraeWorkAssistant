@@ -529,16 +529,25 @@ pub fn usage_history_fetch_impl(
             continue;
         }
         attempted += 1;
+        // 旧缓存回填（issue #82）：会话级明细上线前的缓存只有 daily、sessions 为空
+        // （serde(default)），增量路径只重拉最近一天，历史会话行永不回填，前端
+        // 「会话明细」永远空白。检测「daily 有值但 sessions 无行」→ 该账号一次性
+        // 走全量重拉（refetch_from 置空整体替换），拉成功后 sessions 非空自然恢复增量。
+        let legacy_no_sessions = cache
+            .accounts
+            .get(&uid)
+            .map(|c| !c.daily.is_empty() && c.sessions.values().all(|v| v.is_empty()))
+            .unwrap_or(false);
         let (start_ts, refetch_from) =
             match cache.accounts.get(&uid).and_then(|c| c.last_fetch_end_ts) {
-                Some(last_end) => {
+                Some(last_end) if !legacy_no_sessions => {
                     let from_date = local_date_of(last_end)
                         .or_else(|| local_date_of(now_ts))
                         .unwrap_or_default();
                     let midnight = local_midnight_ts(&from_date).unwrap_or(now_ts - 86400);
                     (midnight, from_date)
                 }
-                None => (full_start, String::new()),
+                _ => (full_start, String::new()),
             };
         match fetch_account_usage(&a.jwt, start_ts, now_ts) {
             Ok((new_agg, new_sessions)) => {

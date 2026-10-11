@@ -408,14 +408,18 @@ export interface Settings {
   wb_growth_hhmm: string;
   /** WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改） */
   wb_checkin_hhmm: string;
-  /** Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认） */
+  /** Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认） */
   wb_credits_sync_mode: string;
   /** Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻） */
   wb_credits_sync_hhmm: string;
-  /** Trae 积分数据同步模式：off | hourly（默认）| daily */
+  /** Buddy 积分与 Token 同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  wb_credits_sync_hours: string;
+  /** Trae 积分数据同步模式：off | hourly | daily | every_hours（每N小时，默认） */
   trae_credits_sync_mode: string;
   /** Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻） */
   trae_credits_sync_hhmm: string;
+  /** Trae 积分同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  trae_credits_sync_hours: string;
   /** Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过） */
   wb_catalog_sync_enabled: boolean;
   /** Buddy 模型目录同步触发时刻 HH:MM（默认 05:45） */
@@ -507,6 +511,9 @@ export interface CreditsDailySnapshot {
   total: number;
   earned: number;
   consumed: number;
+  /** 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1）；
+   * 缺失/空 = 老快照行无账号明细（账号筛选时该日不计入过滤后合计） */
+  accounts?: Record<string, number>;
 }
 
 export interface ProxyLogEntry {

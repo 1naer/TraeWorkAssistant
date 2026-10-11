@@ -381,6 +381,28 @@ pub fn today_key() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// Qoder 请求级会话上下文（issue #82 问题5：qoder_sessions 流水行）。
+/// request_id 为幂等键——成功路径取自上游信封（converted JSON 顶层），
+/// 失败早退点（无 converted）以 uuid 占位；ts = Unix 秒；preview = 末条 user 消息截断。
+pub struct QoderSessionCtx {
+    pub request_id: String,
+    pub session_id: String,
+    pub ts: i64,
+    pub preview: String,
+}
+
+impl QoderSessionCtx {
+    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id）
+    pub fn placeholder(preview: String) -> Self {
+        Self {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            session_id: String::new(),
+            ts: chrono::Local::now().timestamp(),
+            preview,
+        }
+    }
+}
+
 /// 从存储加载用量数据（缺失/损坏回退空结构），并裁剪过期日期。
 /// SQLite 化 P3：api_usage 表；P7 修订：记账改为当日单行 upsert 后，
 /// 存储侧保留期裁剪在启动 load 时一次性执行。
@@ -388,6 +410,8 @@ pub fn load(data_dir: &Path) -> UsageFile {
     let mut f = crate::store::docs::api_usage_load(&crate::store::db(data_dir));
     f.trim(RETENTION_DAYS);
     let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
+    let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     f
 }
 

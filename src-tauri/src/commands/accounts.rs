@@ -1309,7 +1309,15 @@ pub fn refresh_remaining_credits_impl(
     let mut ok_count = 0usize;
     // (uid, 快照条目)：回写阶段仅移除与快照一致的条目，防扫描窗口内他方重写的新冷却被误清（见函数尾部）
     let mut thawed_uids: Vec<(String, crate::models::CooldownEntry)> = Vec::new();
-    let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
+    // issue #82 问题4-1：按账号保留 pack_earned_daily（uid → date → earned），
+    // 供 credits_daily 快照写入逐账号维度；跨账号合并由 record_daily_snapshot 完成
+    let mut pack_earned_by_uid: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =
+        Default::default();
+    // issue #82 审查修复 C：本轮成功扫描的 uid 集合（Err 分支缺席），
+    // 供今日快照区分「成功且无 earned」与「失败未见」，防误清上轮明细
+    let mut synced_uids: std::collections::BTreeSet<String> = Default::default();
+    // 本轮实际尝试过的全部 uid（含失败）：今日快照据此清掉已移除账号的残留明细
+    let mut attempted_uids: std::collections::BTreeSet<String> = Default::default();
     for a in &accounts.accounts {
         let uid = a
             .user_id
@@ -1319,6 +1327,7 @@ pub fn refresh_remaining_credits_impl(
         if uid.is_empty() {
             continue;
         }
+        attempted_uids.insert(uid.clone());
         let dev = resolve_device(&state, &uid);
         match calc_remaining_credits(&a.jwt, &dev) {
             Ok(stats) => {
@@ -1356,11 +1365,15 @@ pub fn refresh_remaining_credits_impl(
                         rc.membership_next_billing.remove(&uid);
                     }
                 }
-                // 各账号包起始日聚合合并（跨账号同日累加）
-                for (d, e) in &stats.pack_earned_daily {
-                    *pack_earned_daily.entry(d.clone()).or_insert(0.0) += e;
+                // 逐账号保留包起始日聚合（uid → date → earned，同日多包累加）
+                if !stats.pack_earned_daily.is_empty() {
+                    let per_uid = pack_earned_by_uid.entry(uid.clone()).or_default();
+                    for (d, e) in &stats.pack_earned_daily {
+                        *per_uid.entry(d.clone()).or_insert(0.0) += e;
+                    }
                 }
                 ok_count += 1;
+                synced_uids.insert(uid.clone());
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if stats.total > 0.0 {
                     let thaw = cd.cooldowns.get(&uid).and_then(|e| {
@@ -1396,8 +1409,8 @@ pub fn refresh_remaining_credits_impl(
         crate::commands::api_server::push_credits_if_running(state, rt);
     }
 
-    // 记录每日积分快照（total / earned / consumed）
-    record_daily_snapshot(state, &rc, &pack_earned_daily);
+    // 记录每日积分快照（total / earned / consumed + 逐账号 earned 维度）
+    record_daily_snapshot(state, &rc, &pack_earned_by_uid, &synced_uids, &attempted_uids);
 
     if !thawed_uids.is_empty() {
         // C4（审查）：解冻回写两阶段第二段——锁内重读最新表、仅移除本次解冻的
@@ -1438,8 +1451,21 @@ pub fn refresh_remaining_credits_impl(
 fn record_daily_snapshot(
     state: &AppState,
     rc: &RemainingCreditsFile,
-    pack_earned_daily: &std::collections::BTreeMap<String, f64>,
+    pack_earned_by_uid: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    synced_uids: &std::collections::BTreeSet<String>,
+    attempted_uids: &std::collections::BTreeSet<String>,
 ) {
+    // 逐账号 earned（uid → date → earned）展平为 date → uid → earned（供今日/历史 accounts 维度写入）
+    let mut pack_earned_by_date: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =
+        Default::default();
+    for (uid, per_date) in pack_earned_by_uid {
+        for (d, e) in per_date {
+            pack_earned_by_date
+                .entry(d.clone())
+                .or_default()
+                .insert(uid.clone(), *e);
+        }
+    }
     let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
@@ -1483,9 +1509,30 @@ fn record_daily_snapshot(
         if r == 0.0 { 0.0 } else { r }
     };
 
+    // 今日逐账号维度：按本轮成功集合合并旧值（issue #82 审查修复 C——失败/无可见包的
+    // 账号保留上轮明细，成功账号以本轮为准），全局 earned 取合并后求和，
+    // 保证今日行恒等式 Σaccounts = earned
+    let today_by_uid = {
+        let fresh = pack_earned_by_date.remove(&today).unwrap_or_default();
+        let mut merged: std::collections::BTreeMap<String, f64> = file
+            .snapshots
+            .iter()
+            .find(|s| s.date == today)
+            .map(|s| s.accounts.clone())
+            .unwrap_or_default();
+        for uid in synced_uids {
+            merged.remove(uid);
+        }
+        // 本轮不再尝试的账号（已移除）残留明细清掉，防止按账号筛选求和虚高
+        merged.retain(|uid, _| attempted_uids.contains(uid));
+        for (uid, e) in fresh {
+            merged.insert(uid, e);
+        }
+        merged
+    };
+
     // earned：今日新开积分包额度合计（CycleStartTime 归今日；今日无新包则为 0）
-    let earned = pack_earned_daily.get(&today).copied().unwrap_or(0.0);
-    let earned = r2(earned);
+    let earned = r2(today_by_uid.values().sum::<f64>());
 
     let consumed = match usage_consumed {
         Some(consumed) => consumed,
@@ -1501,24 +1548,32 @@ fn record_daily_snapshot(
         existing.total = total;
         existing.earned = earned;
         existing.consumed = consumed;
+        // 今日逐账号维度：上方已按成功集合合并（审查修复 C）
+        existing.accounts = today_by_uid;
     } else {
         file.snapshots.push(CreditsDailySnapshot {
             date: today.clone(),
             total,
             earned,
             consumed,
+            accounts: today_by_uid,
         });
     }
 
     // 历史修正：API 可见范围内的历史日期（如昨日已入账的签到/购买包），
     // 用 CycleStartTime 归日口径覆盖旧 earned（旧值多为恒等式反推的失真数据，
-    // 实测昨日 1300）；无快照的日期不补建（total/consumed 无数据源）
-    for (date, e) in pack_earned_daily {
-        if date == &today {
+    // 实测昨日 1300）；无快照的日期不补建（total/consumed 无数据源）。
+    // 逐账号维度仅在旧行缺失时补写、不覆盖（历史行可能只扫描到部分账号，
+    // 若把新 uid 加进 accounts 会让「Σaccounts > earned」，按账号筛选求和会超出全局 earned）
+    for (date, by_uid) in pack_earned_by_date {
+        if date == today {
             continue;
         }
-        if let Some(snap) = file.snapshots.iter_mut().find(|s| &s.date == date) {
-            snap.earned = r2(*e);
+        if let Some(snap) = file.snapshots.iter_mut().find(|s| s.date == date) {
+            snap.earned = r2(by_uid.values().sum::<f64>());
+            if snap.accounts.is_empty() {
+                snap.accounts = by_uid;
+            }
         }
     }
 

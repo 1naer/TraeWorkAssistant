@@ -170,6 +170,69 @@ fn extract_billing(usage: Option<&Value>) -> (Option<f64>, Option<f64>) {
     (credits, original)
 }
 
+/// issue #82 问题5：会话 preview——末条 user 消息文本（与 build_upstream_body
+/// last_user_text 同款逆序口径），截 200 字符。
+fn session_preview(peek: &Value) -> String {
+    let mut text = String::new();
+    if let Some(messages) = peek.get("messages").and_then(Value::as_array) {
+        for message in messages.iter().rev() {
+            if message.get("role").and_then(Value::as_str) == Some("user") {
+                text = qoder_upstream::content_to_text(
+                    message.get("content").unwrap_or(&Value::Null),
+                );
+                break;
+            }
+        }
+    }
+    text.chars().take(200).collect()
+}
+
+/// issue #82 问题5：记账会话上下文。成功路径从上游信封（prepare_qoder_body 产物）
+/// 顶层反解析 request_id/session_id；信封缺失或解析失败退化为 uuid 占位
+/// （request_id 仅幂等用途，占位不影响正确性）。
+fn session_ctx(peek: &Value, converted: Option<&[u8]>) -> super::usage::QoderSessionCtx {
+    match converted.and_then(extract_envelope_ids) {
+        Some((rid, sid)) => super::usage::QoderSessionCtx {
+            request_id: rid,
+            session_id: sid,
+            ts: chrono::Local::now().timestamp(),
+            preview: session_preview(peek),
+        },
+        None => super::usage::QoderSessionCtx::placeholder(session_preview(peek)),
+    }
+}
+
+/// issue #82 审查修复 K：信封顶层 request_id/session_id 提取。信封含完整对话历史
+/// （大 body），内层重试循环若每次记账都全量反序列化属热路径冗余；
+/// id 随信封恒定，应在信封生成后解析一次、循环内复用（本函数即一次解析的产物源）。
+fn extract_envelope_ids(body: &[u8]) -> Option<(String, String)> {
+    let v = serde_json::from_slice::<Value>(body).ok()?;
+    let get = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let (rid, sid) = (get("request_id"), get("session_id"));
+    (!rid.is_empty()).then_some((rid, sid))
+}
+
+/// 由预解析的信封 id 构造记账上下文（id 为 None = 无信封/解析失败 → uuid 占位）
+fn session_ctx_from_ids(
+    peek: &Value,
+    ids: Option<&(String, String)>,
+) -> super::usage::QoderSessionCtx {
+    match ids {
+        Some((rid, sid)) => super::usage::QoderSessionCtx {
+            request_id: rid.clone(),
+            session_id: sid.clone(),
+            ts: chrono::Local::now().timestamp(),
+            preview: session_preview(peek),
+        },
+        None => super::usage::QoderSessionCtx::placeholder(session_preview(peek)),
+    }
+}
+
 fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
     if id.is_empty() {
@@ -535,7 +598,7 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None);
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek, None));
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
@@ -637,6 +700,10 @@ fn run_qoder_stream(
             }
         };
 
+        // 审查修复 K：信封含完整对话历史（大 body），request_id/session_id 随信封恒定，
+        // 在外层换号循环内解析一次供内层各次尝试记账复用，避免热路径重复全量反序列化
+        let envelope_ids = extract_envelope_ids(&converted);
+
         let mut same_attempt: u32 = 0;
         // 对冲接管标记（本轮尝试内有效）：接管后排队同号退避不再适用——
         // 退避重试走主账号 creds/converted，与生效（对冲）账号不一致。
@@ -717,6 +784,7 @@ fn run_qoder_stream(
                         Some(ttfb_ms),
                         credits,
                         original_credits,
+                        &session_ctx_from_ids(&peek, envelope_ids.as_ref()),
                     );
                     match error_info {
                         Some((code, msg)) => {
@@ -1020,6 +1088,7 @@ pub async fn qoder_aggregate_chat(
                             None,
                             None,
                             None,
+                            &session_ctx(&peek, None),
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
@@ -1077,6 +1146,8 @@ pub async fn qoder_aggregate_chat(
                 Ok(b) => b,
                 Err(e) => return Err(e),
             };
+            // 审查修复 K：信封 id 在外层解析一次，内层记账复用（同流式路径）
+            let envelope_ids = extract_envelope_ids(&converted);
 
             let mut same_attempt: u32 = 0;
             // 对冲接管标记：接管后排队同号退避不适用（重试凭证/请求体属主账号）
@@ -1148,6 +1219,7 @@ pub async fn qoder_aggregate_chat(
                                     Some(ttfb_ms),
                                     credits,
                                     original_credits,
+                                    &session_ctx_from_ids(&peek, envelope_ids.as_ref()),
                                 );
                                 clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&win_uid);

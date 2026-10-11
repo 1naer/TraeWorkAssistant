@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Bar, Line, XAxis, YAxis, ComposedChart, ResponsiveContainer, Tooltip, CartesianGrid } from 'recharts';
+import { Line, XAxis, YAxis, ComposedChart, ResponsiveContainer, Tooltip, CartesianGrid } from 'recharts';
 import { Coins } from 'lucide-react';
 import ChartFilterBar, { SOURCE_LABELS, type BoardSource } from '../../components/ChartFilterBar';
 import ActivityHeatmap from '../../components/charts/ActivityHeatmap';
@@ -10,6 +10,7 @@ import { useIsDark } from '../../lib/useIsDark';
 import { fmtCredits } from '../../lib/format';
 import type {
   CreditsDailySnapshot,
+  QoderCheckinRecord,
   QoderCreditsSnapshot,
   UsageHistoryResult,
   WbCheckinRecord,
@@ -22,10 +23,13 @@ import type { GatewayDays } from './TokensTab';
 import {
   mergeEarned,
   qoderEarnedByDate,
+  qoderEarnedByDateFiltered,
   qoderSnapshotsToPoints,
   traeEarnedByDate,
+  traeEarnedByDateFiltered,
   traeUsageToPoints,
   wbCheckinEarnedByDate,
+  wbEarnedByDateFiltered,
   wbFallbackToPoints,
   wbOfficialAllToPoints,
   wbSnapshotEarnedByDate,
@@ -61,7 +65,9 @@ export default function CreditsTab({
   wbSnapshots,
   wbCheckin,
   qoderSnapshots,
+  qoderCheckin,
   gateway,
+  uidSet,
 }: {
   scope: PlatformScope;
   /** 激活数据源（源切换控件在页面第二层分类，Dashboard 承载） */
@@ -80,8 +86,12 @@ export default function CreditsTab({
   wbCheckin: WbCheckinRecord[];
   /** Qoder 积分快照时序（本地源消耗差分 + earned 获得口径） */
   qoderSnapshots: QoderCreditsSnapshot[];
+  /** Qoder 签到日志（账号筛选时 earned 按 uid 过滤 reward；与全局快照 earned 同源） */
+  qoderCheckin: QoderCheckinRecord[];
   /** API 网关 Trae/Buddy 池用量（90 天；网关源数据源） */
   gateway: GatewayDays | null;
+  /** 分组∩账号筛选生效 uid 集（null = 不限；issue #82 问题4-1：获得积分 KPI 跟随筛选） */
+  uidSet: Set<string> | null;
 }) {
   const isDark = useIsDark();
   const { range, setRange, startStr, todayStr, dateList } = useDateRange('7d');
@@ -139,6 +149,8 @@ export default function CreditsTab({
     let requests = 0;
     let okRequests = 0;
     let errRequests = 0;
+    // Trae 账号筛选时，老快照行无 accounts 明细被跳过的天数（KPI hint 如实标注）
+    let earnedSkippedDates = 0;
     const addConsume = (date: string, v: number) => {
       consumeByDate.set(date, (consumeByDate.get(date) ?? 0) + v);
     };
@@ -199,14 +211,26 @@ export default function CreditsTab({
         }
       }
       // 获得积分（与消耗同源：仅官网源计 Trae 快照 earned；本地/网关源无 Trae 获得数据，避免净消耗系统性偏负）
+      // issue #82 问题4-1：uidSet 非空时按账号维度取值（Trae 快照 accounts 明细 /
+      // Buddy 逐账号余额差分+签到 / Qoder 签到 reward 过滤），不再返回全局合并值
       if (traeActive && source === 'official') {
-        for (const [d, v] of traeEarnedByDate(creditsDaily)) {
-          if (inRange(d)) consumeEarned(d, v);
+        if (uidSet) {
+          const r = traeEarnedByDateFiltered(creditsDaily, uidSet);
+          earnedSkippedDates = r.skippedDates;
+          for (const [d, v] of r.byDate) {
+            if (inRange(d)) consumeEarned(d, v);
+          }
+        } else {
+          for (const [d, v] of traeEarnedByDate(creditsDaily)) {
+            if (inRange(d)) consumeEarned(d, v);
+          }
         }
       }
       // Buddy 获得（方案 B 快照 earned 优先，缺失日回退方案 A 签到）
       if (buddyActive) {
-        const earned = mergeEarned(wbCheckinEarnedByDate(wbCheckin), wbSnapshotEarnedByDate(wbSnapshots));
+        const earned = uidSet
+          ? wbEarnedByDateFiltered(wbSnapshots, wbCheckin, uidSet)
+          : mergeEarned(wbCheckinEarnedByDate(wbCheckin), wbSnapshotEarnedByDate(wbSnapshots));
         for (const [d, v] of earned) {
           if (inRange(d)) consumeEarned(d, v);
         }
@@ -220,7 +244,8 @@ export default function CreditsTab({
       }
       // Qoder 获得（快照 earned = 当日签到奖励合计；与 KPI 今日新增同源）
       if (qoderActive) {
-        for (const [d, v] of qoderEarnedByDate(qoderSnapshots)) {
+        const earned = uidSet ? qoderEarnedByDateFiltered(qoderCheckin, uidSet) : qoderEarnedByDate(qoderSnapshots);
+        for (const [d, v] of earned) {
           if (inRange(d)) consumeEarned(d, v);
         }
       }
@@ -229,7 +254,7 @@ export default function CreditsTab({
     for (const v of consumeByDate.values()) consumed += v;
     let earned = 0;
     for (const v of earnedByDate.values()) earned += v;
-    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests };
+    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates };
 
     function consumeEarned(date: string, v: number) {
       earnedByDate.set(date, (earnedByDate.get(date) ?? 0) + v);
@@ -237,7 +262,7 @@ export default function CreditsTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     isGateway, isGatewayCredits, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints,
-    modelFilter, creditsDaily, wbCheckin, wbSnapshots, wbOfficial, qoderSnapshots, startStr, todayStr,
+    modelFilter, creditsDaily, wbCheckin, wbSnapshots, wbOfficial, qoderSnapshots, qoderCheckin, uidSet, startStr, todayStr,
   ]);
 
   // ---- 趋势数据（消耗柱 + 获得线；网关源为请求数柱）----
@@ -405,9 +430,16 @@ export default function CreditsTab({
                     traeActive && source === 'official' ? 'Trae 积分包归日' : null,
                     buddyActive ? 'Buddy 快照 earned（缺失日回退签到口径）' : null,
                     qoderActive ? 'Qoder 快照 earned（签到合计）' : null,
+                    // issue #82 问题4-1：分组/账号筛选生效时按账号维度取值并标注口径
+                    uidSet
+                      ? `已按 ${uidSet.size} 个账号筛选` +
+                        (traeActive && source === 'official' && agg.earnedSkippedDates > 0
+                          ? `（${agg.earnedSkippedDates} 天历史快照无账号明细，未计入）`
+                          : '')
+                      : null,
                   ]
                     .filter(Boolean)
-                    .join(' + ')}
+                    .join(' · ')}
                   tone="green"
                 />
                 <StatCard
@@ -470,7 +502,16 @@ export default function CreditsTab({
                       contentStyle={tooltipStyle(isDark)}
                       formatter={(v: number, name: string) => [isGateway && !isGatewayCredits ? String(v) : fmtCredits(v), name]}
                     />
-                    <Bar dataKey="consumed" name={consumeLabel} fill="#f59e0b" maxBarSize={22} radius={[3, 3, 0, 0]} />
+                    <Line
+                      type="monotone"
+                      dataKey="consumed"
+                      name={consumeLabel}
+                      stroke="#f59e0b"
+                      strokeWidth={2}
+                      dot={showDots ? { r: 3, fill: '#f59e0b', strokeWidth: 0 } : false}
+                      activeDot={{ r: 5 }}
+                      connectNulls
+                    />
                     {!isGateway && (
                       <Line
                         type="monotone"

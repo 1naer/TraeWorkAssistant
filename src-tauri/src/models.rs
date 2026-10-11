@@ -220,18 +220,24 @@ pub struct Settings {
     #[serde(default = "default_wb_checkin_hhmm")]
     pub wb_checkin_hhmm: String,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
-    /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认）
+    /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认）
     #[serde(default = "default_credits_sync_mode")]
     pub wb_credits_sync_mode: String,
     /// Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻）
     #[serde(default = "default_wb_credits_sync_hhmm")]
     pub wb_credits_sync_hhmm: String,
-    /// Trae 积分数据同步模式：off | hourly（默认，issue #61 看板数据保持新鲜）| daily
+    /// Buddy 积分与 Token 同步间隔小时数（every_hours 模式生效，默认 2，合法范围 1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub wb_credits_sync_hours: String,
+    /// Trae 积分数据同步模式：off | hourly | daily | every_hours（每N小时，默认）
     #[serde(default = "default_trae_credits_sync_mode")]
     pub trae_credits_sync_mode: String,
     /// Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻）
     #[serde(default = "default_trae_credits_sync_hhmm")]
     pub trae_credits_sync_hhmm: String,
+    /// Trae 积分同步间隔小时数（every_hours 模式生效，默认 2，合法范围 1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub trae_credits_sync_hours: String,
     /// Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过）
     #[serde(default = "default_true")]
     pub wb_catalog_sync_enabled: bool,
@@ -387,12 +393,16 @@ fn default_qoder_checkin_hhmm() -> String {
 fn default_qoder_credits_sync_hhmm() -> String {
     "23:40".into()
 }
+/// 看板同步默认每 2 小时（会话明细需随账号定时落盘；issue #82）
 fn default_credits_sync_mode() -> String {
-    "daily".into()
+    "every_hours".into()
 }
-/// Trae 看板数据同步默认每小时（issue #61：积分快照 + 消耗明细随调度保持新鲜）
 fn default_trae_credits_sync_mode() -> String {
-    "hourly".into()
+    "every_hours".into()
+}
+/// every_hours 模式默认间隔（小时）
+fn default_credits_sync_hours() -> String {
+    "2".into()
 }
 fn default_wb_credits_sync_hhmm() -> String {
     "23:30".into()
@@ -509,6 +519,11 @@ pub struct CreditsDailySnapshot {
     pub total: f64,
     pub earned: f64,
     pub consumed: f64,
+    /// 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1：
+    /// 看板「区间总获得」按分组/账号筛选时用此维度求和）。
+    /// 空 map = 老快照行无账号明细（前端筛选时该日不计入过滤后合计并如实标注）。
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

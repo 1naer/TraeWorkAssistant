@@ -240,6 +240,8 @@ impl ApiSharedState {
     /// uid 用 Qoder 账号 uid，落盘策略与 record_usage 相同。
     /// `credits`/`original_credits`：上游 usage 中的积分测量（issue #82 T2），
     /// 上游未下发 usage 时传 (None, None) 不入账（不得伪造）
+    /// `session`：请求级会话上下文（issue #82 问题5）——同步直写 qoder_sessions 流水
+    /// （INSERT OR IGNORE 幂等；写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_qoder(
         &self,
@@ -256,6 +258,7 @@ impl ApiSharedState {
         ttfb_ms: Option<u64>,
         credits: Option<f64>,
         original_credits: Option<f64>,
+        session: &usage::QoderSessionCtx,
     ) {
         let day = usage::today_key();
         let mut guard = self
@@ -270,6 +273,22 @@ impl ApiSharedState {
         );
         // 批次 C 削峰：同 record_usage_custom，仅标脏不落盘
         drop(guard);
+        let _ = crate::store::docs::qoder_session_insert(
+            &crate::store::db(&self.data_dir),
+            &session.request_id,
+            &session.session_id,
+            uid,
+            &day,
+            session.ts,
+            model,
+            credits.unwrap_or(0.0),
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            duration_ms as i64,
+            is_stream,
+            ok,
+            &session.preview,
+        );
         self.usage_dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())

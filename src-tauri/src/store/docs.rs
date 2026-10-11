@@ -1416,6 +1416,58 @@ pub fn api_usage_prune(s: &Store, keep_days: i64) -> Result<(), String> {
     })
 }
 
+// ── Qoder 网关会话流水（issue #82 问题5：qoder_sessions 表）──────────────────
+
+/// 单请求会话行 UPSERT（request_id 主键幂等；记账热路径直写，失败由调用方静默）。
+/// issue #82 审查修复 A：同一信封重试（排队退避）复用同一 request_id，
+/// 若首尝试失败行已落库，后到的成功行须覆盖（按 ts 更新，旧覆盖新为 no-op）；
+/// 同 ts 重复记账（重放）不覆盖，保留首行口径。
+#[allow(clippy::too_many_arguments)]
+pub fn qoder_session_insert(
+    s: &Store,
+    request_id: &str,
+    session_id: &str,
+    uid: &str,
+    date: &str,
+    ts: i64,
+    model: &str,
+    credits: f64,
+    pt: i64,
+    ct: i64,
+    duration_ms: i64,
+    stream: bool,
+    ok: bool,
+    preview: &str,
+) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute(
+            "INSERT INTO qoder_sessions
+             (request_id, session_id, uid, date, ts, model, credits, pt, ct, duration_ms, stream, ok, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(request_id) DO UPDATE SET
+               uid = excluded.uid, date = excluded.date, ts = excluded.ts,
+               model = excluded.model, credits = excluded.credits,
+               pt = excluded.pt, ct = excluded.ct,
+               duration_ms = excluded.duration_ms, stream = excluded.stream,
+               ok = excluded.ok, preview = excluded.preview
+             WHERE excluded.ts > qoder_sessions.ts",
+            rusqlite::params![
+                request_id, session_id, uid, date, ts, model, credits, pt, ct,
+                duration_ms, stream as i64, ok as i64, preview
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// qoder_sessions 保留期裁剪（与 api_usage 同口径 90 天；低频附带执行）
+pub fn qoder_sessions_prune(s: &Store, keep_days: i64) -> Result<usize, String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| Ok(c.execute("DELETE FROM qoder_sessions WHERE date < ?1", [cutoff.as_str()])?))
+}
+
 // ── Trae 积分流水（credits_history.json → credits_history 表）────────────────
 
 pub fn credits_history_load(s: &Store) -> CreditsFile {
@@ -1475,14 +1527,21 @@ pub fn credits_history_save(s: &Store, f: &CreditsFile) -> Result<(), String> {
 pub fn credits_daily_load(s: &Store) -> CreditsDailyFile {
     let snapshots = s
         .with_conn(|c| {
-            let mut stmt = c.prepare("SELECT date, total, earned, consumed FROM credits_daily ORDER BY date")?;
+            let mut stmt =
+                c.prepare("SELECT date, total, earned, consumed, accounts FROM credits_daily ORDER BY date")?;
             let rows = stmt
                 .query_map([], |r| {
+                    let accounts_json: Option<String> = r.get(4)?;
+                    let accounts = accounts_json
+                        .as_deref()
+                        .and_then(|t| serde_json::from_str(t).ok())
+                        .unwrap_or_default();
                     Ok(crate::models::CreditsDailySnapshot {
                         date: r.get(0)?,
                         total: r.get(1)?,
                         earned: r.get(2)?,
                         consumed: r.get(3)?,
+                        accounts,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1496,10 +1555,12 @@ pub fn credits_daily_save(s: &Store, f: &CreditsDailyFile) -> Result<(), String>
     s.with_conn(|c| {
         c.execute_batch("BEGIN; DELETE FROM credits_daily;")?;
         {
-            let mut stmt = c
-                .prepare("INSERT INTO credits_daily(date, total, earned, consumed) VALUES(?1, ?2, ?3, ?4)")?;
+            let mut stmt = c.prepare(
+                "INSERT INTO credits_daily(date, total, earned, consumed, accounts) VALUES(?1, ?2, ?3, ?4, ?5)",
+            )?;
             for x in &f.snapshots {
-                stmt.execute(rusqlite::params![x.date, x.total, x.earned, x.consumed])?;
+                let accounts_json = serde_json::to_string(&x.accounts).unwrap_or_else(|_| "{}".to_string());
+                stmt.execute(rusqlite::params![x.date, x.total, x.earned, x.consumed, accounts_json])?;
             }
         }
         c.execute_batch("COMMIT;")?;

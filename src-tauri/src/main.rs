@@ -380,6 +380,7 @@ fn main() {
             commands::qoder::qoder_checkin_task_unregister,
             commands::qoder::qoder_credits_fetch,
             commands::qoder::qoder_credits_history_list,
+            commands::qoder::qoder_sessions_query,
             commands::qoder::qoder_accounts_export,
             commands::qoder::qoder_accounts_import,
             commands::qoder::qoder_env_reset_items,

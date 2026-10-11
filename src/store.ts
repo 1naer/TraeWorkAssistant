@@ -229,11 +229,14 @@ function defaultSettings(): Settings {
     wb_growth_hhmm: '09:00',
     // WorkBuddy 每日签到调度时刻（任务配置页可改，默认 09:10）
     wb_checkin_hhmm: '09:10',
-    // 积分/Token 同步与官网模型定时同步：Buddy 默认每日 23:30；Trae 默认每小时（issue #61）+每日时刻 23:40（daily 模式生效）；模型同步默认开（05:45 / 05:40）
-    wb_credits_sync_mode: 'daily',
+    // 积分/Token 同步：Buddy 与 Trae 默认每 2 小时（issue #82 会话明细定时落盘），
+    // 间隔可在环境配置页手工设置；daily 模式时刻 23:30 / 23:40；模型同步默认开（05:45 / 05:40）
+    wb_credits_sync_mode: 'every_hours',
     wb_credits_sync_hhmm: '23:30',
-    trae_credits_sync_mode: 'hourly',
+    wb_credits_sync_hours: '2',
+    trae_credits_sync_mode: 'every_hours',
     trae_credits_sync_hhmm: '23:40',
+    trae_credits_sync_hours: '2',
     wb_catalog_sync_enabled: true,
     wb_catalog_sync_hhmm: '05:45',
     qoder_catalog_sync_enabled: true,
