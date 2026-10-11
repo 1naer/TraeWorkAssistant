@@ -146,6 +146,30 @@ fn sleep_interruptible(
 ///    不同）。按 v1 恒 CN 执行的 fail-closed 策略判 Global 专属：Global 侧
 ///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
 ///    收上游诡异报错，拒绝则走明确的 404 提示通道。
+/// 从上游 usage JSON 提取 Qoder 积分测量（issue #82 T2）：
+/// 返回 (credits, original_credits)。credits 复数字段优先——单数 `credit` 是旧版
+/// 字段，读它恒为 0（qoder2api-hub issue #22 命门）；两字段均非负时与 Python
+/// `or` 链回退语义等价。usage 缺失或计费字段都取不到 → None（调用方传 None
+/// 不入账，与「上游未下发 usage 不得伪造」口径一致）
+fn extract_billing(usage: Option<&Value>) -> (Option<f64>, Option<f64>) {
+    let Some(u) = usage else {
+        return (None, None);
+    };
+    let num = |key: &str| -> Option<f64> {
+        u.get(key)
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite() && *n >= 0.0)
+    };
+    let pick = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    };
+    let credits = pick(num("credits"), num("credit"));
+    let original = pick(num("original_credits"), num("original_credit"));
+    (credits, original)
+}
+
 fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
     if id.is_empty() {
@@ -511,7 +535,7 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None);
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None);
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
@@ -680,6 +704,7 @@ fn run_qoder_stream(
                             )
                         })
                         .unwrap_or((0, 0));
+                    let (credits, original_credits) = extract_billing(usage.as_ref());
                     state.record_usage_qoder(
                         model,
                         &win_uid,
@@ -690,6 +715,8 @@ fn run_qoder_stream(
                         pt,
                         ct,
                         Some(ttfb_ms),
+                        credits,
+                        original_credits,
                     );
                     match error_info {
                         Some((code, msg)) => {
@@ -991,6 +1018,8 @@ pub async fn qoder_aggregate_chat(
                             0,
                             0,
                             None,
+                            None,
+                            None,
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
@@ -1112,9 +1141,13 @@ pub async fn qoder_aggregate_chat(
                                         )
                                     })
                                     .unwrap_or((0, 0));
+                                let (credits, original_credits) =
+                                    extract_billing(r.get("usage"));
                                 state.record_usage_qoder(
                                     &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
                                     Some(ttfb_ms),
+                                    credits,
+                                    original_credits,
                                 );
                                 clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&win_uid);
@@ -1382,6 +1415,41 @@ fn internal_error_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// issue #82 T2.3：credits 复数优先（新版字段），单数 credit 为旧版兜底
+    #[test]
+    fn extract_billing_prefers_plural_credits() {
+        let u = json!({"credits": 12.5, "credit": 0, "original_credits": 25.0});
+        let (c, o) = extract_billing(Some(&u));
+        assert_eq!(c, Some(12.5));
+        assert_eq!(o, Some(25.0));
+        // 仅有旧版单数字段时兜底可读（新调用方 None 缺省不再走此路）
+        let old = json!({"credit": 7});
+        let (c, o) = extract_billing(Some(&old));
+        assert_eq!(c, Some(7.0));
+        assert_eq!(o, None);
+    }
+
+    /// issue #82 T2.3：双字段均缺 → None（调用方不入账，不得伪造 0）
+    #[test]
+    fn extract_billing_missing_fields_yields_none() {
+        assert_eq!(extract_billing(None), (None, None));
+        let empty = json!({"prompt_tokens": 10, "completion_tokens": 5});
+        assert_eq!(extract_billing(Some(&empty)), (None, None));
+        let nulls = json!({"credits": null});
+        assert_eq!(extract_billing(Some(&nulls)), (None, None));
+    }
+
+    /// issue #82 T2.3：负值/非有限值视为不可信，整体不入账
+    #[test]
+    fn extract_billing_rejects_negative() {
+        let neg = json!({"credits": -3.0});
+        assert_eq!(extract_billing(Some(&neg)), (None, None));
+        let neg_pair = json!({"credits": 5.0, "original_credits": -1.0});
+        let (c, o) = extract_billing(Some(&neg_pair));
+        assert_eq!(c, Some(5.0));
+        assert_eq!(o, None);
+    }
 
     /// 远程目录测试条目（adopt_remote 接受的最小合法信封载荷）
     fn remote_entry(key: &str, display: &str, factor: f64) -> Value {

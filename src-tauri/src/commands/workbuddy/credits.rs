@@ -6,6 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, State};
 
+use crate::commands::usage_history::{UsageSessionView, UsageSessionsResult};
 use crate::fs_utils;
 use crate::state::AppState;
 
@@ -53,11 +54,31 @@ fn credits_refresh_now(
 
 /// 后台刷新（SWR 的「后台」半程）：概览页与顶栏可能连续触发，用进程内在途标记去重，
 /// 同一时刻只跑一轮；失败仅记日志（旧缓存仍在，页面无需感知，下次调用自然重试）。
+/// 另加最小间隔节流（issue #84，2026-10-10）：缓存 10min 过期后若页面 30s 轮询一次，
+/// 每次都会重新触发后台全量取数；节流窗口内直接跳过（调用方已回旧值，无感知），
+/// 待窗口过后下一次调用再真正刷新。上次刷新未完成时不记账（避免把在途轮误当已完成）。
 fn spawn_background_refresh(state: &State<AppState>) {
+    static LAST_BG_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+    const BG_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+    {
+        let last = LAST_BG_REFRESH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed() < BG_REFRESH_MIN_INTERVAL {
+                return;
+            }
+        }
+    }
     static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
+    // 通过在途检查后立即记账：本轮刷新被视为「正在进行」，节流窗口自此起算
+    *LAST_BG_REFRESH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     let st = state.inner().clone();
     std::thread::spawn(move || {
         // 复位兜底（2026-10-08 评审）：线程 panic 时 Drop 守卫仍复位 IN_FLIGHT，
@@ -70,18 +91,30 @@ fn spawn_background_refresh(state: &State<AppState>) {
         }
         let _reset = ResetInFlight;
         let started = std::time::Instant::now();
-        match credits_refresh_now(&st, None, true) {
-            Ok(_) => fs_utils::app_log(
+        // panic 兜底（审查 P6，同 scheduler.rs 调度线程先例）：任务体 panic 照常落日志；
+        // IN_FLIGHT 复位由上方 Drop 守卫保证，此处仅补可观测性
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            credits_refresh_now(&st, None, true)
+        }));
+        match outcome {
+            Ok(Ok(_)) => fs_utils::app_log(
                 &st.data_dir,
                 &format!(
                     "[wb-credits] 后台刷新完成，共 {}ms",
                     started.elapsed().as_millis()
                 ),
             ),
-            Err(e) => fs_utils::app_log(
+            Ok(Err(e)) => fs_utils::app_log(
                 &st.data_dir,
                 &format!(
                     "[wb-credits] 后台刷新失败（{}ms）：{e}",
+                    started.elapsed().as_millis()
+                ),
+            ),
+            Err(_) => fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "[wb-credits] 后台刷新线程 panic（已捕获，不影响下次触发）：{}ms",
                     started.elapsed().as_millis()
                 ),
             ),
@@ -520,6 +553,82 @@ fn usage_credit(item: &Value) -> Option<f64> {
     (n.is_finite() && n >= 0.0).then_some(n)
 }
 
+/// Buddy 请求级明细行（issue #82 会话明细 Tab；官网 get-user-request-usage
+/// 仅返回 requestTime/credit/model/requestId，无 token 与会话说明字段）
+#[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
+struct WbSessionRow {
+    /// requestTime（Unix 秒；date-only 行回退当日零点）
+    ts: i64,
+    /// requestId（缺失时 uuidless_key 兜底，仅用于去重与稳定排序）
+    request_id: String,
+    model: String,
+    credits: f64,
+}
+
+/// requestTime → Unix 秒（兼容 epoch 秒/毫秒、RFC3339、本地时间串；纯日期回退当日零点）
+fn usage_row_ts(item: &Value) -> Option<i64> {
+    use chrono::TimeZone;
+    let raw = item.get("requestTime").or_else(|| item.get("request_time"))?;
+    if let Some(n) = raw.as_f64() {
+        if !n.is_finite() {
+            return None;
+        }
+        let ms = if n.abs() < 10_000_000_000.0 { (n * 1000.0).round() as i64 } else { n.round() as i64 };
+        return chrono::DateTime::from_timestamp_millis(ms).map(|d| d.timestamp());
+    }
+    let text = raw.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(parsed.timestamp());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+            return chrono::Local
+                .from_local_datetime(&parsed)
+                .single()
+                .map(|d| d.timestamp());
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        // date-only 无法恢复精确时刻，回退当日零点（区间过滤/排序够用）
+        return chrono::Local
+            .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
+            .single()
+            .map(|dt| dt.timestamp());
+    }
+    None
+}
+
+/// 行级明细 kv 读-改-写的串行化锁（对齐 profile.rs STATS_KV_LOCK）：单账号拉取命令与
+/// 后台全账号刷新（单轮 20-53s）可并发，整对象覆盖写回会丢失对方刚写入的其他账号桶
+/// （lost-update，审查 P1）。
+static SESSIONS_KV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn sessions_kv_lock() -> &'static std::sync::Mutex<()> {
+    SESSIONS_KV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Buddy 行级明细落盘（kv 缓存；31 天滑动窗口全量替换该账号桶）。
+/// 结构：`{ fetched_at: i64, accounts: { <acct_id>: { name, rows: [WbSessionRow] } } }`
+/// 读-改-写经 SESSIONS_KV_LOCK 串行化（审查 P1）。
+fn save_account_session_rows(state: &AppState, acct_id: &str, name: &str, rows: &[WbSessionRow]) {
+    const KEY: &str = "workbuddy_usage_sessions_cache";
+    let _guard = sessions_kv_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let db = crate::store::db(&state.data_dir);
+    let mut cache: Value = db.kv_get(KEY);
+    if !cache.is_object() {
+        cache = serde_json::json!({ "fetched_at": 0, "accounts": {} });
+    }
+    if !cache.get("accounts").map(Value::is_object).unwrap_or(false) {
+        cache["accounts"] = serde_json::json!({});
+    }
+    cache["fetched_at"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+    cache["accounts"][acct_id] = serde_json::json!({ "name": name, "rows": rows });
+    let _ = db.kv_set(KEY, &cache);
+}
+
 /// 官方请求用量（F-25）：user_id 指定账号，缺省取 auth 文件当前账号或首个有凭证账号。
 #[tauri::command(async)]
 pub fn workbuddy_usage_official(
@@ -599,11 +708,19 @@ pub(crate) fn workbuddy_usage_official_impl(
     };
 
     // 核心：拉取 + 聚合（拆出供全账号聚合命令 workbuddy_usage_official_all 复用）
-    let payload = match usage_official_fetch(&acct_id, &token, &domain) {
+    let (payload, session_rows) = match usage_official_fetch(&acct_id, &token, &domain) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
     let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
+    // 行级明细落盘（issue #82 Buddy 会话明细 Tab；31 天窗口全量替换该账号桶）
+    let acct_name = pool
+        .accounts
+        .iter()
+        .find(|a| a.id == acct_id)
+        .map(|a| a.nickname.clone())
+        .unwrap_or_default();
+    save_account_session_rows(state, &acct_id, &acct_name, &session_rows);
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -617,7 +734,12 @@ pub(crate) fn workbuddy_usage_official_impl(
 /// 官方用量核心（拉取近 31 天分页明细 + 聚合，缓存逻辑留在命令层）。
 /// 拆出供单账号命令 `workbuddy_usage_official` 与全账号聚合命令
 /// `workbuddy_usage_official_all`（Buddy 积分看板近 7 日趋势数据源）复用。
-fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serde_json::Value, String> {
+/// 返回（聚合 payload, 请求级行列表）：行列表供会话明细落盘（issue #82）。
+fn usage_official_fetch(
+    acct_id: &str,
+    token: &str,
+    domain: &str,
+) -> Result<(serde_json::Value, Vec<WbSessionRow>), String> {
     // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
     // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
     let base = if domain.contains("workbuddy.ai") {
@@ -639,6 +761,7 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
 
     // 分页拉取（≤20 页 × 3000 行；requestId 去重；跳过 credit 缺失/负值/时间不可解析行）
     let mut rows: Vec<(String, f64, String)> = vec![]; // (date, credit, model)
+    let mut session_rows: Vec<WbSessionRow> = vec![]; // 请求级行（会话明细落盘）
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut reported_total: u64 = 0;
     for page in 1u64..=20 {
@@ -686,8 +809,11 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
                 .unwrap_or_else(|| "未知模型".into());
             let rid = as_str(fs_utils::dig(item, &["requestId", "request_id"]))
                 .unwrap_or_else(|| uuidless_key(&date, &model, &credit));
-            if seen.insert(rid) {
-                rows.push((date, credit, model));
+            if seen.insert(rid.clone()) {
+                rows.push((date, credit, model.clone()));
+                if let Some(ts) = usage_row_ts(item) {
+                    session_rows.push(WbSessionRow { ts, request_id: rid, model, credits: credit });
+                }
             }
         }
         if items.is_empty() || seen.len() as u64 >= reported_total {
@@ -765,7 +891,7 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
         }));
     }
 
-    Ok(serde_json::json!({
+    let payload = serde_json::json!({
         "status": "complete",
         "account_id": acct_id,
         "domain": base,
@@ -780,7 +906,8 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
         },
         "daily": daily_out,
         "models": models_out,
-    }))
+    });
+    Ok((payload, session_rows))
 }
 
 /// 全账号官方用量聚合（Buddy 积分看板「近 7 日积分消耗」主数据源）：
@@ -798,6 +925,9 @@ pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json
 /// 命中时写入，未打开应用的日子无快照，7 日趋势只剩「昨天」一格。
 /// 单账号失败跳过（accounts_ok 计数），全部失败才报错并回退过期缓存（stale）。
 /// 聚合结果缓存 10 分钟（跨账号全量拉取代价高，避免看板每次刷新都打满分页请求）。
+/// SWR（issue #84，2026-10-10）：有缓存但已过期时先回旧值并转后台全量刷新——
+/// 全量拉取为 7 账号×31 天分页串行请求，纯 CPU 20-53s（用户报告 25% 占用主项），
+/// 缓存过期后的看板打开/轮询不再同步扛这个耗时；后台完成后下次调用自然命中新缓存。
 pub(crate) fn workbuddy_usage_official_all_impl(
     state: &AppState,
     force: bool,
@@ -813,9 +943,20 @@ pub(crate) fn workbuddy_usage_official_all_impl(
             if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
                 return Ok(cached.clone());
             }
+            // SWR：转后台刷新并先回旧值（标记 stale，前端已兼容该字段——失败回退同款）
+            spawn_official_all_refresh(state);
+            let mut stale = cached.clone();
+            stale["stale"] = serde_json::json!(true);
+            stale["stale_reason"] = serde_json::json!("swr_background_refresh");
+            return Ok(stale);
         }
     }
     let fail = |msg: &str| -> Result<Value, String> {
+        // 失败落日志（issue #84）：stale-on-error 此前完全静默，排查无凭据
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("workbuddy: 全账号官方用量聚合失败，回退 stale/报错：{msg}"),
+        );
         if let Some(c) = &cached_val {
             let mut stale = c.clone();
             stale["stale"] = serde_json::json!(true);
@@ -864,21 +1005,30 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     let mut ok = 0usize;
     let mut req_total = 0u64;
     for (id, token, domain) in &list {
-        if let Ok(p) = usage_official_fetch(id, token, domain) {
-            ok += 1;
-            req_total += p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
-            for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
-                let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
-                let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
-                *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
-            }
-            // 按模型汇总（单账号接口 31 天全窗口口径，跨账号合并；此前丢弃导致看板模型排行无数据）
-            for m in p.get("models").and_then(Value::as_array).into_iter().flatten() {
-                let Some(model) = m.get("model").and_then(Value::as_str) else { continue };
-                let e = model_totals.entry(model.to_string()).or_insert((0, 0.0));
-                e.0 += m.get("request_count").and_then(Value::as_u64).unwrap_or(0);
-                e.1 += m.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
-            }
+        let Ok((p, session_rows)) = usage_official_fetch(id, token, domain) else {
+            continue;
+        };
+        ok += 1;
+        // 行级明细落盘（issue #82 Buddy 会话明细 Tab；31 天窗口全量替换该账号桶）
+        let acct_name = pool
+            .accounts
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| a.nickname.clone())
+            .unwrap_or_default();
+        save_account_session_rows(state, id, &acct_name, &session_rows);
+        req_total += p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
+        for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
+            let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
+            let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
+            *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
+        }
+        // 按模型汇总（单账号接口 31 天全窗口口径，跨账号合并；此前丢弃导致看板模型排行无数据）
+        for m in p.get("models").and_then(Value::as_array).into_iter().flatten() {
+            let Some(model) = m.get("model").and_then(Value::as_str) else { continue };
+            let e = model_totals.entry(model.to_string()).or_insert((0, 0.0));
+            e.0 += m.get("request_count").and_then(Value::as_u64).unwrap_or(0);
+            e.1 += m.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
         }
     }
     if ok == 0 {
@@ -944,6 +1094,177 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         &format!("workbuddy: 全账号官方用量聚合（{ok}/{} 账号，{} 行）", list.len(), req_total),
     );
     Ok(payload)
+}
+
+/// 官方用量全账号聚合的后台刷新（SWR 的「后台」半程，issue #84）：
+/// 最小间隔节流——失败时缓存仍过期，看板 30s 轮询会反复触发全量拉取，窗口内直接跳过；
+/// 在途去重——全量聚合单轮 20-53s，同一时刻只跑一轮；记账在通过在途检查后立即写入
+/// （失败重试节奏由节流窗口兜底）。成功/失败均落 app_log（此前后台路径零日志）。
+fn spawn_official_all_refresh(state: &AppState) {
+    static LAST_BG_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+    const BG_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+    {
+        let last = LAST_BG_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed() < BG_REFRESH_MIN_INTERVAL {
+                return;
+            }
+        }
+    }
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    *LAST_BG_REFRESH.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    let st = state.clone();
+    std::thread::spawn(move || {
+        struct ResetInFlight;
+        impl Drop for ResetInFlight {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetInFlight;
+        let started = std::time::Instant::now();
+        // panic 兜底（审查 P6，同 scheduler.rs 调度线程先例）：任务体 panic 照常落日志；
+        // IN_FLIGHT 复位由上方 Drop 守卫保证，此处仅补可观测性
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workbuddy_usage_official_all_impl(&st, true)
+        }));
+        match outcome {
+            Ok(Ok(v)) => {
+                // 全部账号失败时 fail 闭包带缓存回退返回 Ok(stale) 而非 Err，
+                // 须按 stale 标记区分日志——否则内层「失败」与本处「完成」并存，
+                // 语义矛盾误导排查（审查 P1）
+                if v.get("stale").and_then(Value::as_bool).unwrap_or(false) {
+                    let reason =
+                        v.get("stale_reason").and_then(Value::as_str).unwrap_or("未知原因");
+                    fs_utils::app_log(
+                        &st.data_dir,
+                        &format!(
+                            "workbuddy: 全账号官方用量后台刷新失败（{}ms），已回退旧缓存：{reason}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                } else {
+                    fs_utils::app_log(
+                        &st.data_dir,
+                        &format!(
+                            "workbuddy: 全账号官方用量后台刷新完成，共 {}ms",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                }
+            }
+            Ok(Err(e)) => fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "workbuddy: 全账号官方用量后台刷新失败（{}ms）：{e}",
+                    started.elapsed().as_millis()
+                ),
+            ),
+            Err(_) => fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "workbuddy: 全账号官方用量后台刷新线程 panic（已捕获，不影响下次触发）：{}ms",
+                    started.elapsed().as_millis()
+                ),
+            ),
+        }
+    });
+}
+
+/// Buddy 会话明细查询（issue #82；行级缓存纯读零网络）。
+/// 数据源为官网 get-user-request-usage 请求级明细落盘（随单账号/全账号官方用量
+/// 拉取及调度器预热保鲜）；上游无 token/会话说明字段 → 相应列前端留空。
+/// 账号清单以 token store 为准（已删除账号的残留桶不展示）。
+#[tauri::command(async)]
+pub fn workbuddy_sessions_query(
+    state: State<AppState>,
+    start: String,
+    end: String,
+    model: Option<String>,
+    user_id: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<UsageSessionsResult, String> {
+    let cache: Value = crate::store::db(&state.data_dir).kv_get("workbuddy_usage_sessions_cache");
+
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(50).clamp(1, 200);
+    let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
+
+    let store: Value = crate::tasks::wb_common::load_token_store(&state);
+    let token_ids: std::collections::BTreeSet<String> = store
+        .get("tokens")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    // 缓存 fetched_at 为毫秒；契约统一为 Unix 秒（与 Trae usage_sessions_query 一致，审查 P3）
+    let fetched_at = cache.get("fetched_at").and_then(Value::as_i64).unwrap_or(0) / 1000;
+
+    let mut rows: Vec<UsageSessionView> = Vec::new();
+    let mut models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (acct_id, bucket) in cache.get("accounts").and_then(Value::as_object).into_iter().flatten() {
+        if !token_ids.contains(acct_id) || uid_filter.is_some_and(|f| acct_id != f) {
+            continue;
+        }
+        let name = bucket.get("name").and_then(Value::as_str).unwrap_or("");
+        for r in bucket.get("rows").and_then(Value::as_array).into_iter().flatten() {
+            let ts = r.get("ts").and_then(Value::as_i64).unwrap_or(0);
+            // ts → 本地自然日，与 Trae 命令同口径（YYYY-MM-DD 字典序即时间序）
+            let date = chrono::DateTime::from_timestamp(ts, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            if date.as_str() < start.as_str() || date.as_str() > end.as_str() {
+                continue;
+            }
+            let m = r.get("model").and_then(Value::as_str).unwrap_or("未知模型");
+            models.insert(m.to_string());
+            if model_filter.is_some_and(|f| m != f) {
+                continue;
+            }
+            rows.push(UsageSessionView {
+                user_id: acct_id.clone(),
+                account_name: name.to_string(),
+                session_id: r.get("request_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                ts,
+                date,
+                model: m.to_string(),
+                // Buddy 官网行级明细无 mode/cost/token/会话说明字段 → 全空（前端显示 —）
+                mode: String::new(),
+                credits: r.get("credits").and_then(Value::as_f64).unwrap_or(0.0),
+                cost_money: 0.0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                preview: String::new(),
+            });
+        }
+    }
+
+    rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.session_id.cmp(&a.session_id)));
+    let total = rows.len() as u64;
+    let credits_total = rows.iter().map(|r| r.credits).sum();
+    let begin = ((page - 1) * page_size) as usize;
+    let rows: Vec<UsageSessionView> = rows
+        .into_iter()
+        .skip(begin)
+        .take(page_size as usize)
+        .collect();
+
+    Ok(UsageSessionsResult {
+        fetched_at,
+        total,
+        credits_total,
+        page,
+        page_size,
+        rows,
+        models: models.into_iter().collect(),
+    })
 }
 
 /// requestId 缺失时的稳定兜底 key（不含任何敏感字段）
@@ -1122,6 +1443,44 @@ mod credits_tests {
         assert_eq!(parse_reward_plus("签到成功"), None);
         assert_eq!(parse_reward_plus("已签到"), None);
         assert_eq!(parse_reward_plus("签到成功 +0"), None);
+    }
+
+    // ── usage_row_ts（issue #82 Buddy 会话明细：requestTime → Unix 秒）────────
+
+    #[test]
+    fn usage_row_ts_parses_epoch_rfc3339_and_local_formats() {
+        use chrono::TimeZone;
+        let local = |h: u32, m: u32, s: u32| -> i64 {
+            chrono::Local
+                .from_local_datetime(
+                    &chrono::NaiveDate::from_ymd_opt(2026, 10, 11)
+                        .unwrap()
+                        .and_hms_opt(h, m, s)
+                        .unwrap(),
+                )
+                .single()
+                .unwrap()
+                .timestamp()
+        };
+
+        // epoch 秒 / 毫秒
+        assert_eq!(usage_row_ts(&serde_json::json!({ "requestTime": local(8, 30, 0) })), Some(local(8, 30, 0)));
+        assert_eq!(
+            usage_row_ts(&serde_json::json!({ "requestTime": local(8, 30, 0) * 1000 })),
+            Some(local(8, 30, 0))
+        );
+        // RFC3339
+        assert_eq!(
+            usage_row_ts(&serde_json::json!({ "request_time": "2026-10-11T00:30:00Z" })),
+            Some(chrono::DateTime::parse_from_rfc3339("2026-10-11T00:30:00Z").unwrap().timestamp())
+        );
+        // 本地时间串
+        assert_eq!(usage_row_ts(&serde_json::json!({ "requestTime": "2026-10-11 08:30:00" })), Some(local(8, 30, 0)));
+        // date-only 回退当日零点
+        assert_eq!(usage_row_ts(&serde_json::json!({ "requestTime": "2026-10-11" })), Some(local(0, 0, 0)));
+        // 不可解析 / 缺字段
+        assert_eq!(usage_row_ts(&serde_json::json!({ "requestTime": "nonsense" })), None);
+        assert_eq!(usage_row_ts(&serde_json::json!({})), None);
     }
 
     // ── earliest_pack_expire（issue #28：Buddy 调度到期派生）────────────────

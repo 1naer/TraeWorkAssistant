@@ -256,6 +256,9 @@ pub struct Settings {
     /// Server酱 SendKey（空 = 关闭）
     #[serde(default)]
     pub notify_serverchan_sendkey: Option<String>,
+    /// 会话明细概述显示开关（issue #82 T6.1，默认开；关闭仅隐藏 UI 展示，不删存量缓存）
+    #[serde(default = "default_true")]
+    pub sessions_preview_enabled: bool,
     /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；环境配置页持久化）
     #[serde(default)]
     pub workbuddy_path: Option<String>,

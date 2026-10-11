@@ -287,6 +287,8 @@ fn main() {
             commands::trae_apps::refresh_pay_status,
             commands::trae_apps::accounts_backfill_dc_ids,
             commands::usage_history::usage_history_fetch,
+            commands::usage_history::usage_sessions_query,
+            commands::usage_history::trae_expired_ents,
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,
@@ -335,6 +337,7 @@ fn main() {
             commands::workbuddy::workbuddy_usage_official,
             commands::workbuddy::workbuddy_usage_fallback,
             commands::workbuddy::workbuddy_usage_official_all,
+            commands::workbuddy::workbuddy_sessions_query,
             commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
             // Qoder（F-80 M1：签到 MVP 闭环 + 最小积分通道）

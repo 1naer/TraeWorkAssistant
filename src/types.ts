@@ -131,6 +131,68 @@ export interface UsageHistoryResult {
   accounts: UsageHistoryAccount[];
 }
 
+// ---- Trae 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包；credit_packs 只含未过期可用包） ----
+export interface TraeExpiredEnt {
+  /** 包名（与 AccountView.credit_packs[].source 同源口径，前端按「包名+到期时间」去重） */
+  name: string;
+  /** 包总额度（credits_limit） */
+  credits_limit: number;
+  /** 过期时间（Unix 毫秒，上游原值） */
+  expire_time_ms: number;
+}
+
+export interface TraeExpiredEntsAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  /** 单账号查询失败原因（其余账号不受影响） */
+  error: string | null;
+  expired: TraeExpiredEnt[];
+}
+
+export interface TraeExpiredEntsResult {
+  fetched_at: number;
+  accounts: TraeExpiredEntsAccount[];
+}
+
+// ---- 会话明细（Trae query_user_usage_group_by_session 会话级行，issue #82 会话明细 Tab） ----
+export interface UsageSessionView {
+  user_id: string;
+  account_name: string;
+  session_id: string;
+  /** usage_time（Unix 秒） */
+  ts: number;
+  /** 本地自然日 YYYY-MM-DD */
+  date: string;
+  model: string;
+  /** 会话模式（agent/chat 等；上游缺失为空串） */
+  mode: string;
+  /** 消耗积分（credits_float，兜底 amount_float） */
+  credits: number;
+  /** 消耗金额（cost_money_float；上游缺失为 0） */
+  cost_money: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  /** 会话说明（user_input_preview，后端已截断 200 字符） */
+  preview: string;
+}
+
+export interface UsageSessionsResult {
+  /** 缓存拉取时间（Unix 秒；0 = 从未成功拉取。Trae/Buddy 两来源已统一为秒） */
+  fetched_at: number;
+  /** 过滤后总行数（分页前） */
+  total: number;
+  /** 过滤后区间总积分（分页前） */
+  credits_total: number;
+  page: number;
+  page_size: number;
+  rows: UsageSessionView[];
+  /** 区间内出现过的模型清单（筛选下拉用） */
+  models: string[];
+}
+
 // ---- F-08 双应用账号自动发现 ----
 /** 账号导入结果报告 */
 export interface ImportReport {
@@ -298,6 +360,8 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** issue #82 T6.1：会话明细显示首条消息概述（默认开；关闭仅隐藏 UI 展示，不删存量缓存） */
+  sessions_preview_enabled: boolean;
   /** Qoder CN IDE 桌面版 exe 手动路径（环境配置页；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe） */
   qoder_ide_path: string | null;
   /** QoderWork 桌面版 exe 手动路径（R-1 布局裁决后接入；M1 仅持久化预留） */
@@ -653,6 +717,8 @@ export interface UsageCounterView {
   requests: number;
   ok: number;
   errors: number;
+  /** 网关测量的累计消耗积分（issue #82 T2.4：仅 Qoder 桶 models 非零） */
+  credits: number;
 }
 
 /** 按 Key 的 token 用量 */
@@ -671,6 +737,10 @@ export interface UsageDayView {
   stream_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /** 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零；上游未下发 usage 的请求不计入） */
+  credits: number;
+  /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */
+  original_credits: number;
   avg_duration_ms: number;
   /** 总耗时 P50/P95/最大值（F-76；样本不足时缺省） */
   p50_duration_ms?: number;

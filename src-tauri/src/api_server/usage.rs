@@ -139,6 +139,16 @@ pub struct DayStats {
     /// 按模型延迟样本（F-76：按模型分桶的分位数统计）
     #[serde(default)]
     pub model_latency: HashMap<String, LatencyAgg>,
+    /// 网关测量的累计消耗积分（issue #82 T2：Qoder 上游 usage.credits 求和；
+    /// 上游未下发 usage 的请求不入账）
+    #[serde(default)]
+    pub credits: f64,
+    /// 上游计费原值（original_credits，峰谷折扣前），用于对账
+    #[serde(default)]
+    pub original_credits: f64,
+    /// 按模型的积分测量（issue #82 T2.4：仅 Qoder 桶非零，供积分页模型排行）
+    #[serde(default)]
+    pub model_credits: HashMap<String, f64>,
 }
 
 impl DayStats {
@@ -182,6 +192,20 @@ impl DayStats {
             let kt = self.key_tokens.entry(key_id.to_string()).or_insert((0, 0));
             kt.0 += prompt_tokens;
             kt.1 += completion_tokens;
+        }
+    }
+
+    /// 记录一次积分测量（issue #82 T2：仅 Qoder 网关路径使用）。
+    /// 任一值缺失（上游未下发 usage）则不入账——与「上游未下发 usage 不得伪造」口径一致；
+    /// 负值防御性截断为 0；有值时按模型累加（T2.4 模型粒度排行数据源）。
+    pub fn record_credits(&mut self, model: &str, credits: Option<f64>, original: Option<f64>) {
+        if let Some(c) = credits {
+            let c = c.max(0.0);
+            self.credits += c;
+            *self.model_credits.entry(model.to_string()).or_default() += c;
+        }
+        if let Some(o) = original {
+            self.original_credits += o.max(0.0);
         }
     }
 }
@@ -318,6 +342,13 @@ impl UsageFile {
         );
     }
 
+    /// 记录一次积分测量到 Qoder 桶当日 entry（issue #82 T2；
+    /// `day` 由调用方在持有 usage 锁期间取定，保证与请求统计落同一 entry）
+    pub fn record_credits_qoder(&mut self, model: &str, day: &str, credits: Option<f64>, original: Option<f64>) {
+        let d = self.qoder_days.entry(day.to_string()).or_default();
+        d.record_credits(model, credits, original);
+    }
+
     /// 裁剪保留期之外的历史日期（各桶同规则）
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
@@ -383,6 +414,8 @@ pub struct CounterView {
     pub requests: u64,
     pub ok: u64,
     pub errors: u64,
+    /// 网关测量的累计消耗积分（issue #82 T2.4：仅 Qoder 桶 models 非零）
+    pub credits: f64,
 }
 
 /// 按 Key 的 token 用量视图
@@ -434,6 +467,10 @@ pub struct UsageDayView {
     pub stream_requests: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零）
+    pub credits: f64,
+    /// 上游计费原值（original_credits，峰谷折扣前）
+    pub original_credits: f64,
     /// 平均耗时（毫秒），无请求时为 0
     pub avg_duration_ms: u64,
     /// 总耗时 P50/P95/最大值（F-76；样本不足时为 None）
@@ -458,12 +495,25 @@ impl UsageDayView {
         let mut models: Vec<CounterView> = d
             .models
             .iter()
-            .map(|(k, c)| view(k, c))
+            .map(|(k, c)| view(k, c, d.model_credits.get(k).copied().unwrap_or(0.0)))
             .collect();
+        // 仅记积分、无请求计数的模型（record_credits_qoder 不写 models 计数）也并入视图，
+        // 前端模型粒度积分才能取到（issue #82 T2.4）
+        for (k, credits) in &d.model_credits {
+            if !d.models.contains_key(k) {
+                models.push(CounterView {
+                    name: k.clone(),
+                    requests: 0,
+                    ok: 0,
+                    errors: 0,
+                    credits: *credits,
+                });
+            }
+        }
         models.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.name.cmp(&b.name)));
-        let mut accounts: Vec<CounterView> = d.accounts.iter().map(|(k, c)| view(k, c)).collect();
+        let mut accounts: Vec<CounterView> = d.accounts.iter().map(|(k, c)| view(k, c, 0.0)).collect();
         accounts.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.name.cmp(&b.name)));
-        let mut keys: Vec<CounterView> = d.keys.iter().map(|(k, c)| view(k, c)).collect();
+        let mut keys: Vec<CounterView> = d.keys.iter().map(|(k, c)| view(k, c, 0.0)).collect();
         keys.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.name.cmp(&b.name)));
         let mut key_tokens: Vec<KeyTokenView> = d
             .key_tokens
@@ -493,6 +543,8 @@ impl UsageDayView {
             stream_requests: d.stream.requests,
             prompt_tokens: d.prompt_tokens,
             completion_tokens: d.completion_tokens,
+            credits: d.credits,
+            original_credits: d.original_credits,
             avg_duration_ms: if d.total.requests > 0 {
                 d.duration_ms_total / d.total.requests as u64
             } else {
@@ -517,12 +569,13 @@ impl UsageDayView {
     }
 }
 
-fn view(name: &str, c: &Counter) -> CounterView {
+fn view(name: &str, c: &Counter, credits: f64) -> CounterView {
     CounterView {
         name: name.to_string(),
         requests: c.requests,
         ok: c.ok,
         errors: c.errors,
+        credits,
     }
 }
 
@@ -578,6 +631,27 @@ mod tests {
         // 平均耗时 = (100+300+50)/3 = 150
         let view = UsageDayView::from_day(&today, d);
         assert_eq!(view.avg_duration_ms, 150);
+    }
+
+    #[test]
+    fn record_credits_by_model_aggregates() {
+        let mut f = UsageFile::default();
+        let day = today_key();
+        // 同模型累加 + 不同模型分账；None（上游未下发 usage）不入账；负值截断
+        f.record_credits_qoder("m1", &day, Some(2.5), Some(3.0));
+        f.record_credits_qoder("m1", &day, Some(1.5), None);
+        f.record_credits_qoder("m2", &day, Some(4.0), Some(5.0));
+        f.record_credits_qoder("m2", &day, None, None);
+        f.record_credits_qoder("m2", &day, Some(-1.0), Some(-2.0));
+        let d = f.qoder_days.get(&day).expect("当日统计应存在");
+        assert!((d.credits - 8.0).abs() < 1e-9, "credits 日合计 = 2.5+1.5+4.0");
+        assert!((d.original_credits - 8.0).abs() < 1e-9, "original_credits = 3.0+5.0（None/负值不入账）");
+        assert!((d.model_credits.get("m1").copied().unwrap_or(0.0) - 4.0).abs() < 1e-9);
+        assert!((d.model_credits.get("m2").copied().unwrap_or(0.0) - 4.0).abs() < 1e-9);
+        // 视图层：models[].credits 透出模型粒度积分
+        let v = UsageDayView::from_day(&day, d);
+        let m1 = v.models.iter().find(|m| m.name == "m1").expect("m1 应在视图");
+        assert!((m1.credits - 4.0).abs() < 1e-9);
     }
 
     #[test]

@@ -37,8 +37,8 @@ import {
  * 三源口径（§8 页面内诚实标注，不做静默合并）：
  * 官网 = Trae usage_history（365 天，日×模型）+ Buddy usage_official（31 天，日合计；模型排行另含 Buddy 31 天全窗口汇总）；
  * 本地 = WB 快照差分（365 天，日合计）+ Qoder 快照差分（365 天，日合计；官网无按日明细）；
- * API 网关 = Trae/Buddy 池 usage_stats（90 天；Qoder 池阶段 3 接入）——
- * api_usage 仅记 tokens 不记积分扣减，**决策落地：以请求数为主要口径、积分数不估算**（§3.1 推荐项）。
+ * API 网关 = Trae/Buddy 池 usage_stats（90 天，请求数口径——api_usage 仅记 tokens 不记积分扣减，§3.1 决策）+
+ * Qoder 池（90 天，积分测量口径——网关从上游 usage.credits 提取实测值，issue #82 T2，仅覆盖走网关流量）。
  */
 
 const tooltipStyle = (isDark: boolean) => ({
@@ -95,6 +95,9 @@ export default function CreditsTab({
   // 本地自然日 ISO 字符串可直接比较；作为 memo 依赖以 startStr/todayStr 表达
   const inRange = (date: string) => date >= startStr && date <= todayStr;
   const isGateway = source === 'gateway';
+  // Qoder 网关源 = 积分测量口径（issue #82 T2.4）：网关从上游 usage.credits 提取实测值，
+  // 含模型粒度（DayStats.model_credits）；Trae/Buddy 网关仍为请求数口径（api_usage 不记积分扣减）
+  const isGatewayCredits = isGateway && qoderActive;
 
   // ---- 各源 → BoardPoint ----
   const traePoints = useMemo(() => (source === 'official' ? traeUsageToPoints(usage) : []), [source, usage]);
@@ -121,10 +124,11 @@ export default function CreditsTab({
     }
     if (source === 'gateway') {
       const pools = scope === 'trae' ? (gateway?.trae ?? []) : scope === 'buddy' ? (gateway?.buddy ?? []) : (gateway?.qoder ?? []);
-      return [...new Set(pools.flatMap((d) => d.models.map((m) => m.name)))].sort();
+      // Qoder 网关积分口径：按测量积分排序模型清单；其余池按请求数
+      return [...new Set(pools.flatMap((d) => (isGatewayCredits ? d.models.filter((m) => m.credits > 0) : d.models).map((m) => m.name)))].sort();
     }
     return [];
-  }, [source, traeActive, traePoints, gateway, scope]);
+  }, [source, traeActive, traePoints, gateway, scope, isGatewayCredits]);
 
   // ---- 范围 × 模型 × 平台 聚合 ----
   const agg = useMemo(() => {
@@ -139,16 +143,22 @@ export default function CreditsTab({
       consumeByDate.set(date, (consumeByDate.get(date) ?? 0) + v);
     };
     if (isGateway) {
-      // 网关源：请求数口径（api_usage 仅记 tokens，不估算积分，§3.1 决策落地）
+      // 网关源。Qoder = 积分测量口径（issue #82 T2.4：上游 usage.credits 实测值，
+      // 上游未下发 usage 的请求不计入，模型粒度可用）；
+      // Trae/Buddy = 请求数口径（api_usage 仅记 tokens，不估算积分，§3.1 决策落地）
       const pools = scope === 'trae' ? (gateway?.trae ?? []) : scope === 'buddy' ? (gateway?.buddy ?? []) : (gateway?.qoder ?? []);
       for (const day of pools) {
         if (!inRange(day.date)) continue;
         sessions += day.total_requests;
-        // 模型筛选时趋势/总量/成功/失败均按匹配模型过滤（网关按模型计数含 ok/errors，口径一致）
+        // 模型筛选时趋势/总量/成功/失败均按匹配模型过滤（口径一致）
         const matched = modelFilter ? day.models.filter((m) => m.name === modelFilter) : null;
-        const dayConsume = matched
-          ? matched.reduce((s, m) => s + m.requests, 0)
-          : day.total_requests;
+        const dayConsume = isGatewayCredits
+          ? matched
+            ? matched.reduce((s, m) => s + m.credits, 0)
+            : day.credits
+          : matched
+            ? matched.reduce((s, m) => s + m.requests, 0)
+            : day.total_requests;
         okRequests += matched
           ? matched.reduce((s, m) => s + m.ok, 0)
           : day.ok;
@@ -159,7 +169,7 @@ export default function CreditsTab({
         requests += dayConsume;
         for (const m of day.models) {
           if (modelFilter && m.name !== modelFilter) continue;
-          modelTotals.set(m.name, (modelTotals.get(m.name) ?? 0) + m.requests);
+          modelTotals.set(m.name, (modelTotals.get(m.name) ?? 0) + (isGatewayCredits ? m.credits : m.requests));
         }
       }
     } else {
@@ -226,7 +236,7 @@ export default function CreditsTab({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    isGateway, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints,
+    isGateway, isGatewayCredits, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints,
     modelFilter, creditsDaily, wbCheckin, wbSnapshots, wbOfficial, qoderSnapshots, startStr, todayStr,
   ]);
 
@@ -245,14 +255,15 @@ export default function CreditsTab({
   );
   const hasTrend = trend.some((d) => d.consumed != null || d.earned != null);
   const showDots = range === 'today' || range === '7d';
-  const consumeLabel = isGateway ? '请求数' : '消耗积分';
+  const consumeLabel = isGateway ? (isGatewayCredits ? '消耗积分（测量）' : '请求数') : '消耗积分';
 
   // ---- 年度热力图（全量历史，不受区间/模型筛选影响；按平台维度过滤）----
   const heatValues = useMemo(() => {
     const m = new Map<string, number>();
     if (isGateway) {
       const pools = scope === 'trae' ? (gateway?.trae ?? []) : scope === 'buddy' ? (gateway?.buddy ?? []) : (gateway?.qoder ?? []);
-      for (const d of pools) m.set(d.date, (m.get(d.date) ?? 0) + d.total_requests);
+      const pick = (d: (typeof pools)[number]) => (isGatewayCredits ? d.credits : d.total_requests);
+      for (const d of pools) m.set(d.date, (m.get(d.date) ?? 0) + pick(d));
       return m;
     }
     const pts = [
@@ -262,13 +273,13 @@ export default function CreditsTab({
     ];
     for (const p of pts) m.set(p.date, (m.get(p.date) ?? 0) + (p.credits ?? 0));
     return m;
-  }, [isGateway, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints]);
+  }, [isGateway, isGatewayCredits, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints]);
 
   // ---- 覆盖窗口标注（§8.1）----
   const coverage = useMemo(() => {
     const parts: string[] = [];
     if (isGateway) {
-      parts.push(scope === 'trae' ? 'Trae 池 90 天' : 'Buddy 池 90 天');
+      parts.push(scope === 'trae' ? 'Trae 池 90 天' : scope === 'buddy' ? 'Buddy 池 90 天' : 'Qoder 池 90 天（测量值）');
     } else {
       if (traeActive && source === 'official') parts.push('Trae 365 天');
       if (buddyActive) {
@@ -296,7 +307,15 @@ export default function CreditsTab({
         badges={
           <>
             <Badge tone="slate">{SOURCE_LABELS[source]}源</Badge>
-            {isGateway && (
+            {isGatewayCredits && (
+              <Badge
+                tone="amber"
+                title="网关从上游 usage.credits 提取的实测值（非估算）；仅覆盖走本地网关的流量，直连官方的流量不在内；上游未下发 usage 的请求不计入。"
+              >
+                口径 = 网关测量值 · 仅覆盖走网关流量
+              </Badge>
+            )}
+            {isGateway && !isGatewayCredits && (
               <Badge tone="amber" title="api_usage 仅记录 tokens，不记录积分扣减；按倍率估算易失真，故以请求数为主要口径（§3.1 决策）。">
                 口径 = 请求数（不估算积分）
               </Badge>
@@ -349,12 +368,21 @@ export default function CreditsTab({
           <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
             {isGateway ? (
               <>
-                <StatCard
-                  label="区间总请求"
-                  value={agg.requests.toLocaleString()}
-                  hint={`${SOURCE_LABELS[source]}源（90 天保留窗口）${modelFilter ? ` · 已筛选 ${modelFilter}` : ''}`}
-                  tone="amber"
-                />
+                {isGatewayCredits ? (
+                  <StatCard
+                    label="区间总消耗"
+                    value={fmtCredits(agg.requests)}
+                    hint={`网关测量值（90 天保留窗口）${modelFilter ? ` · 已筛选 ${modelFilter}` : ''}`}
+                    tone="amber"
+                  />
+                ) : (
+                  <StatCard
+                    label="区间总请求"
+                    value={agg.requests.toLocaleString()}
+                    hint={`${SOURCE_LABELS[source]}源（90 天保留窗口）${modelFilter ? ` · 已筛选 ${modelFilter}` : ''}`}
+                    tone="amber"
+                  />
+                )}
                 <StatCard
                   label="成功请求"
                   value={agg.okRequests.toLocaleString()}
@@ -401,7 +429,7 @@ export default function CreditsTab({
           {/* ② 积分趋势图（消耗柱 + 获得线；网关源仅请求数柱） */}
           <div className="mt-5">
             <div className="mb-2 flex items-center gap-3">
-              <h4 className="text-sm font-medium">{isGateway ? '请求趋势图' : '积分趋势图'}</h4>
+              <h4 className="text-sm font-medium">{isGateway && !isGatewayCredits ? '请求趋势图' : '积分趋势图'}</h4>
               <div className="flex items-center gap-3 text-xs text-slate-400">
                 <span className="flex items-center gap-1">
                   <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
@@ -421,11 +449,13 @@ export default function CreditsTab({
                 icon={<Coins size={22} />}
                 title="暂无趋势数据"
                 hint={
-                  isGateway
+                  isGateway && !isGatewayCredits
                     ? '网关代理转发产生请求后展示（保留 90 天）。'
-                    : qoderActive
-                      ? '本地快照出现消耗差分后展示；Qoder 官网无按日明细接口。'
-                      : '点击右上角「刷新数据」拉取消耗明细；Buddy 官网源仅覆盖近 31 天。'
+                    : isGatewayCredits
+                      ? '网关从上游 usage 提取到积分测量值后展示（上游未下发 usage 的请求不计入）。'
+                      : qoderActive
+                        ? '本地快照出现消耗差分后展示；Qoder 官网无按日明细接口。'
+                        : '点击右上角「刷新数据」拉取消耗明细；Buddy 官网源仅覆盖近 31 天。'
                 }
               />
             ) : (
@@ -438,7 +468,7 @@ export default function CreditsTab({
                     <Tooltip
                       cursor={{ stroke: isDark ? '#52525b' : '#cbd5e1', strokeWidth: 1, strokeDasharray: '3 3' }}
                       contentStyle={tooltipStyle(isDark)}
-                      formatter={(v: number, name: string) => [isGateway ? String(v) : fmtCredits(v), name]}
+                      formatter={(v: number, name: string) => [isGateway && !isGatewayCredits ? String(v) : fmtCredits(v), name]}
                     />
                     <Bar dataKey="consumed" name={consumeLabel} fill="#f59e0b" maxBarSize={22} radius={[3, 3, 0, 0]} />
                     {!isGateway && (
@@ -479,8 +509,8 @@ export default function CreditsTab({
             </div>
             <ModelRanking
               items={[...agg.modelTotals.entries()].map(([model, value]) => ({ model, value }))}
-              fmtValue={isGateway ? (n: number) => n.toLocaleString('zh-CN') : fmtCredits}
-              unit={isGateway ? '次请求' : '积分'}
+              fmtValue={isGateway && !isGatewayCredits ? (n: number) => n.toLocaleString('zh-CN') : fmtCredits}
+              unit={isGateway && !isGatewayCredits ? '次请求' : '积分'}
               emptyHint={
                 source === 'official'
                   ? scope === 'buddy'
@@ -490,7 +520,9 @@ export default function CreditsTab({
                     ? qoderActive
                       ? 'Qoder 快照仅有日合计，无模型明细；官网也未提供消耗明细接口。'
                       : '本地源仅有日合计（快照差分），无模型明细；切「官网」查看模型排行。'
-                    : '该区间暂无网关请求记录。'
+                    : isGatewayCredits
+                      ? '该区间暂无积分测量记录：上游下发 usage 后按模型展示实测消耗。'
+                      : '该区间暂无网关请求记录。'
               }
             />
           </div>
@@ -503,12 +535,14 @@ export default function CreditsTab({
             </div>
             <ActivityHeatmap
               values={heatValues}
-              unit={isGateway ? '次请求' : '积分'}
-              fmtValue={isGateway ? (n: number) => n.toLocaleString('zh-CN') : fmtCredits}
+              unit={isGateway && !isGatewayCredits ? '次请求' : '积分'}
+              fmtValue={isGateway && !isGatewayCredits ? (n: number) => n.toLocaleString('zh-CN') : fmtCredits}
               emptyHint={
-                isGateway
+                isGateway && !isGatewayCredits
                   ? '网关用量仅保留 90 天，热力图仅覆盖该窗口。'
-                  : '暂无消耗记录：点击右上角「刷新数据」拉取后展示。'
+                  : isGatewayCredits
+                    ? '网关积分测量仅保留 90 天，热力图仅覆盖该窗口。'
+                    : '暂无消耗记录：点击右上角「刷新数据」拉取后展示。'
               }
             />
           </div>

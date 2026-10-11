@@ -107,6 +107,10 @@ pub fn start(app: AppHandle) {
 
 /// 失败重试冷却基数：失败后按连续失败次数指数退避（30 分钟起步 ×2 封顶 120 分钟）
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
+/// 单轮 tick 内多个到期任务（典型为启动补跑积压）之间的错峰间隔（issue #84 C1）：
+/// 重任务（快照/用量同步）背靠背连跑会形成分钟级 CPU 爆发（实测 103s），任务间
+/// 睡眠错开峰值，给系统留出处理其他负载的余量。
+const TICK_STAGGER_SECS: u64 = 30;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走退避冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// qoder-refresh 档位：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
@@ -173,6 +177,7 @@ fn tick(app: &AppHandle, st: &AppState) {
     // 网关运行态句柄（main.rs manage；积分类任务运行中回写池快照用，issue #67）
     let api_runtime = app
         .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    let mut ran_this_tick: usize = 0;
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
@@ -210,6 +215,14 @@ fn tick(app: &AppHandle, st: &AppState) {
                 continue;
             }
         }
+        // 错峰（issue #84 C1）：本轮此前已有任务执行（典型为启动补跑积压的多个到期
+        // 任务单 tick 连跑，实测 103s CPU 爆发），先隔一个间隔再跑下一个。睡眠只
+        // 发生在后台调度线程自身；触发判定用的 now_hm 取自 tick 起点，「已过 HH:MM」
+        // 语义不受影响，仅执行时刻顺延。
+        if ran_this_tick > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(TICK_STAGGER_SECS));
+        }
+        ran_this_tick += 1;
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_task(t.key, st, Some(api_runtime.inner()))
         })) {

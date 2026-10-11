@@ -188,6 +188,8 @@ function defaultSettings(): Settings {
     theme: 'system',
     launch_minimized: false,
     silent_checkin: false,
+    /** issue #82 T6.1：会话明细概述显示开关（默认开） */
+    sessions_preview_enabled: true,
     auto_start_proxy: true,
     auto_start_api: false,
     tray: true,

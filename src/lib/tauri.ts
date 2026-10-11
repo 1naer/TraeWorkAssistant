@@ -75,6 +75,8 @@ import type {
   WbPoolImportResult,
   WbModelInfo,
   UsageHistoryResult,
+  UsageSessionsResult,
+  TraeExpiredEntsResult,
   QoderAccountView,
   QoderCheckinRecord,
   QoderCliStatus,
@@ -217,6 +219,25 @@ export const api = {
     // 积分消耗历史（Trae Work query_user_usage_group_by_session；fresh=true 增量拉取，false 纯缓存）
     usageHistory: (fresh?: boolean) =>
       invoke<UsageHistoryResult>('usage_history_fetch', { fresh: fresh ?? null }),
+    // 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包；credit_packs 只含未过期可用包）
+    traeExpiredEnts: () => invoke<TraeExpiredEntsResult>('trae_expired_ents'),
+    // 会话明细（会话级行缓存查询：区间/模型/账号过滤 + 分页，纯缓存零网络）
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('usage_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
   },
   traeApps: {
     localEntitlement: () => invoke<LocalEntitlement>('apps_entitlement_read'),
@@ -473,6 +494,23 @@ export const api = {
       invoke<WbTokenStats>('workbuddy_token_stats', { fresh: fresh ?? null }),
     activityInfo: (userId?: string, fresh?: boolean) =>
       invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
+    // Buddy 会话明细（官网请求级明细行缓存查询；上游无 token/会话说明字段 → 前端留空）
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('workbuddy_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
   },
   // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
   qoder: {
