@@ -787,6 +787,139 @@ pub fn groups_save(s: &Store, f: &GroupsFile) -> Result<(), String> {
     })
 }
 
+// ── 共享分组定义（groups 表仅定义行；跨应用统一存储出口）──────────────────────
+
+/// 读统一分组定义（仅 groups 表定义行，不附带 membership）。
+/// 迁移器、三池 list 命令与共享分组命令共用。
+pub fn group_defs_load(s: &Store) -> Vec<crate::models::Group> {
+    s.rows_all("groups")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, data)| serde_json::from_value(data).ok())
+        .collect()
+}
+
+/// 全删全写定义行（不触碰 group_members 表——成员关系属各池机制，D1）
+pub fn group_defs_save(s: &Store, defs: &[crate::models::Group]) -> Result<(), String> {
+    let rows: Vec<(String, String)> = defs
+        .iter()
+        .map(|g| serde_json::to_string(g).map(|text| (g.id.clone(), text)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("序列化失败: {e}"))?;
+    s.with_conn(move |c| {
+        c.execute_batch("BEGIN; DELETE FROM groups;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO groups(pk, data, updated_at) VALUES(?1, ?2, datetime('now','localtime'))",
+            )?;
+            for (pk, data) in &rows {
+                stmt.execute(rusqlite::params![pk, data])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+// ── 共享标签（tags 定义行 + account_tags 绑定行，跨池一张表）─────────────────
+
+pub fn tags_load(s: &Store) -> Vec<crate::models::Tag> {
+    s.rows_all("tags")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, data)| serde_json::from_value(data).ok())
+        .collect()
+}
+
+pub fn tags_save(s: &Store, defs: &[crate::models::Tag]) -> Result<(), String> {
+    let rows: Vec<(String, String)> = defs
+        .iter()
+        .map(|t| serde_json::to_string(t).map(|text| (t.id.clone(), text)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("序列化失败: {e}"))?;
+    s.with_conn(move |c| {
+        c.execute_batch("BEGIN; DELETE FROM tags;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO tags(pk, data, updated_at) VALUES(?1, ?2, datetime('now','localtime'))",
+            )?;
+            for (pk, data) in &rows {
+                stmt.execute(rusqlite::params![pk, data])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+/// 一次拉全量 uid → tag_ids 映射（各池账号列表组装联表用，避免 N+1）
+pub fn account_tags_map(s: &Store) -> std::collections::HashMap<String, Vec<String>> {
+    s.rows_all("account_tags")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(uid, data)| {
+            let ids: Vec<String> = serde_json::from_value(data).ok()?;
+            Some((uid, ids))
+        })
+        .collect()
+}
+
+/// 全量覆盖式设置某账号的标签绑定（校验 tag_id 存在由命令层负责）
+pub fn account_tags_set(s: &Store, uid: &str, tag_ids: &[String]) -> Result<(), String> {
+    let data = serde_json::to_string(&tag_ids).map_err(|e| format!("序列化失败: {e}"))?;
+    s.with_conn(move |c| {
+        c.execute(
+            "INSERT INTO account_tags(pk, data, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+             ON CONFLICT(pk) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            rusqlite::params![uid, data],
+        )?;
+        Ok(())
+    })
+}
+
+/// 删除某账号的全部标签绑定（账号删除路径调用，防幽灵绑定污染
+/// 标签计数 / 组标签展开 / Key 覆盖预览）
+pub fn account_tags_remove_account(s: &Store, uid: &str) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute("DELETE FROM account_tags WHERE pk = ?1", [uid])?;
+        Ok(())
+    })
+}
+
+/// 删除某标签的全部绑定（标签定义删除时清理引用）
+pub fn account_tags_remove_tag(s: &Store, tag_id: &str) -> Result<usize, String> {
+    let map = account_tags_map(s);
+    let mut affected = 0usize;
+    for (uid, ids) in map {
+        if !ids.iter().any(|t| t == tag_id) {
+            continue;
+        }
+        affected += 1;
+        let remaining: Vec<&String> = ids.iter().filter(|t| t.as_str() != tag_id).collect();
+        if remaining.is_empty() {
+            s.with_conn(|c| c.execute("DELETE FROM account_tags WHERE pk = ?1", [&uid]))?;
+        } else {
+            let data = serde_json::to_string(&remaining).map_err(|e| format!("序列化失败: {e}"))?;
+            s.with_conn(move |c| {
+                c.execute(
+                    "UPDATE account_tags SET data = ?1, updated_at = datetime('now','localtime') WHERE pk = ?2",
+                    rusqlite::params![data, uid],
+                )?;
+                Ok(())
+            })?;
+        }
+    }
+    Ok(affected)
+}
+
 // ── 剩余积分缓存（remaining_credits.json → remaining_credits 表，8 平行 map 合并行）──
 
 pub fn remaining_credits_load(s: &Store) -> RemainingCreditsFile {

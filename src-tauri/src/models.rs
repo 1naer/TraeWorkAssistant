@@ -65,6 +65,9 @@ pub struct AccountView {
     /// 必为空（earliest_expire 仅统计剩余 > 0 的包），回退分支不会虚增展示，两条路径等价
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credit_packs: Vec<CreditPackDetail>,
+    /// 共享标签 tag id 列表（从 account_tags 表联表填充，不落账号持久化结构，D3）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -103,7 +106,7 @@ pub struct AccountsFile {
     pub accounts: Vec<RawAccount>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Group {
     pub id: String,
     pub name: String,
@@ -117,6 +120,16 @@ pub struct GroupsFile {
     pub groups: Vec<Group>,
     #[serde(default)]
     pub membership: HashMap<String, String>,
+}
+
+/// 共享标签定义（跨池一张表，与 Group 同构；id 前缀 tag_）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub order: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -624,9 +637,17 @@ pub struct ApiPoolFile {
     /// Qoder 池入池白名单（qd- 前缀账号 id）；空 = fail-open 全部含凭证账号入池
     #[serde(default)]
     pub qoder_enabled_uids: Vec<String>,
-    /// Qoder 池分组筛选（Qoder 账号 group_id，qoder_groups 分组体系）；空 = 不限分组
+    /// Qoder 池分组筛选（Qoder 账号 group_id，共享分组体系）；空 = 不限分组
     #[serde(default)]
     pub qoder_group_ids: Vec<String>,
+    /// 各池标签筛选（共享标签 tag id；空 = 不限）。与分组筛选取交集（D5：
+    /// 均空 = 不限；仅一方非空 = 该维度成员集）
+    #[serde(default)]
+    pub trae_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub wb_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub qoder_tag_ids: Vec<String>,
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
@@ -772,6 +793,9 @@ impl Default for ApiPoolFile {
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),
             qoder_group_ids: Vec::new(),
+            trae_tag_ids: Vec::new(),
+            wb_tag_ids: Vec::new(),
+            qoder_tag_ids: Vec::new(),
         }
     }
 }

@@ -58,6 +58,8 @@ export interface AccountView {
   user_id: string;
   name: string;
   group_id: string | null;
+  /** 共享标签 tag id 列表（account_tags 表联表填充；老后端缺省 undefined） */
+  tags?: string[];
   jwt: string;
   jwt_exp_hours: number | null;
   jwt_exp_timestamp: number | null;
@@ -206,6 +208,10 @@ export interface ImportReport {
   skipped_names: string[];
   /** 新增分组数量 */
   groups_added: number;
+  /** 恢复的标签绑定条数（仅本机已存在的 tag id；老后端缺省 0） */
+  tags_restored?: number;
+  /** 导入文件中本机不存在的 tag id 数量（忽略不自动创建） */
+  tags_ignored?: number;
 }
 
 // ---- F-46 导入预览（按索引导入）----
@@ -303,6 +309,16 @@ export interface GroupView {
   order: number;
   count: number;
   /** 组内账号 uid 列表（账号池分组筛选实时预览用，T10） */
+  uids: string[];
+}
+
+/** 共享标签视图（跨池一张表；uids = 绑定该标签的账号 uid） */
+export interface TagView {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+  count: number;
   uids: string[];
 }
 
@@ -696,8 +712,14 @@ export interface ApiPoolFile {
   qoder_strategy?: string;
   /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
   qoder_enabled_uids?: string[];
-  /** Qoder 池分组筛选（qoder_groups 分组 id）；空 = 不限分组 */
+  /** Qoder 池分组筛选（共享分组 id）；空 = 不限分组 */
   qoder_group_ids?: string[];
+  /** Trae 池标签筛选（共享标签 id）；空 = 不限。与分组筛选取交集（D5） */
+  trae_tag_ids?: string[];
+  /** Buddy 池标签筛选；空 = 不限 */
+  wb_tag_ids?: string[];
+  /** Qoder 池标签筛选；空 = 不限 */
+  qoder_tag_ids?: string[];
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */
@@ -792,8 +814,13 @@ export interface ApiKeyEntry {
    * 可带 `trae:`/`buddy:` 池前缀（专一锁定其归属池）
    */
   dedicated_account: string;
-  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" */
+  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" | "qoder" */
   bind_pool: string;
+  /** 共享分组 id 白名单（shg_ 前缀）；空 = 不通过该维度限制。运行时实时展开并入
+   * 白名单，与 allowed_tags 同时勾选时取交集（D5） */
+  allowed_groups?: string[];
+  /** 共享标签 id 白名单（tag_ 前缀）；空 = 不通过该维度限制 */
+  allowed_tags?: string[];
   /** 按日请求统计（升序，保留最近 90 天） */
   daily_stats: ApiKeyDailyStat[];
 }
@@ -1047,6 +1074,8 @@ export interface WorkBuddyAccountView {
   note: string;
   credits_balance: number | null;
   credits_fetched_at: string | null;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
   /** 在线 = 本机 auth 文件当前生效账号 */
   is_current: boolean;
   has_credential: boolean;
@@ -1389,6 +1418,8 @@ export interface QoderAccountView {
   credits_balance: number | null;
   credits_fetched_at: string | null;
   has_credential: boolean;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
   /** token 种类徽标：pat | client | unknown（脱敏） */
   token_kind: string;
   /** 设备指纹徽标（machine_id 前 8 位；null = 尚未回填） */
