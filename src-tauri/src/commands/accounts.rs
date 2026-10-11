@@ -4,7 +4,7 @@ use tauri::State;
 use crate::fs_utils;
 use crate::jwt;
 use crate::models::{
-    AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
+    AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, RawAccount,
     CreditsFile, CreditsDailyFile, CreditsDailySnapshot, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
     CreditDetail, CreditPackDetail,
 };
@@ -206,6 +206,9 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "hasRefreshToken": v.has_refresh_token,
                 "jwtAutoRefresh": v.jwt_auto_refresh,
                 "creditsExpireAt": v.credits_expire_at,
+                // 共享标签绑定（tag id 数组；导出文件不携带标签定义本身——
+                // 标签定义属全局数据，导入方以本机标签体系为准）
+                "tags": v.tags,
             })
         })
         .collect();
@@ -270,6 +273,12 @@ pub struct ImportReport {
     pub skipped_names: Vec<String>,
     /// 新增分组数量
     pub groups_added: usize,
+    /// 恢复的标签绑定条数（仅本机已存在的 tag id）
+    #[serde(default)]
+    pub tags_restored: usize,
+    /// 导入文件中本机不存在的 tag id 数量（忽略不自动创建，提示用户）
+    #[serde(default)]
+    pub tags_ignored: usize,
 }
 
 /// 从字段取第一个非空字符串值（兼容导出格式与原始格式两套键名）
@@ -343,6 +352,8 @@ pub fn accounts_import(
         skipped: 0,
         skipped_names: Vec::new(),
         groups_added,
+        tags_restored: 0,
+        tags_ignored: 0,
     };
 
     for (_, entry) in selected {
@@ -381,6 +392,41 @@ pub fn accounts_import(
         if let Some(gid) = &group_id {
             groups.membership.insert(uid.clone(), gid.clone());
         }
+        // 标签绑定恢复（P2 需求③）：仅恢复本机已存在的 tag id，未知 id 忽略
+        // （不自动创建标签，避免导入方标签体系污染本机；忽略数量记 app_log）
+        let tags_in: Vec<String> = entry
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !tags_in.is_empty() {
+            let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+            let mut ignored = 0usize;
+            let valid: Vec<String> = tags_in
+                .into_iter()
+                .filter(|t| {
+                    if tag_defs.iter().any(|d| &d.id == t) {
+                        true
+                    } else {
+                        ignored += 1;
+                        false
+                    }
+                })
+                .collect();
+            if !valid.is_empty() {
+                crate::store::docs::account_tags_set(
+                    &crate::store::db(&state.data_dir),
+                    &uid,
+                    &valid,
+                )?;
+                report.tags_restored += valid.len();
+            }
+            report.tags_ignored += ignored;
+        }
         accounts.accounts.push(RawAccount {
             name,
             user_id: Some(uid),
@@ -404,10 +450,11 @@ pub fn accounts_import(
         fs_utils::app_log(
             &state.data_dir,
             &format!(
-                "导入账号: 新增 {} 跳过 {} 新增分组 {}",
-                report.added, report.skipped, report.groups_added
+                "导入账号: 新增 {} 跳过 {} 新增分组 {}；标签绑定恢复 {}（未知标签忽略 {}）",
+                report.added, report.skipped, report.groups_added, report.tags_restored, report.tags_ignored
             ),
         );
+        crate::api_server::org_index::invalidate(&state.data_dir);
         // 凭据变更联动：运行中 API 池热重载（导入账号已在池白名单内时立即生效）
         if report.added > 0 {
             crate::commands::api_server::reload_pools_if_running(&state, &runtime);
@@ -551,6 +598,10 @@ pub fn accounts_import_preview(
 #[tauri::command]
 pub fn account_add_manual(
     state: State<AppState>,
+    runtime: State<
+        '_,
+        std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>,
+    >,
     name: String,
     jwt: String,
     group_id: Option<String>,
@@ -583,7 +634,11 @@ pub fn account_add_manual(
         let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐）
+        crate::api_server::org_index::invalidate(&state.data_dir);
     }
+    // 新增账号影响池装配 → 运行中热重载（服务未运行时 no-op）
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
 }
 
@@ -604,6 +659,13 @@ pub fn account_delete(
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.membership.remove(&user_id);
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+
+    // 共享标签绑定清理（审查修复）：防幽灵绑定污染标签计数与 Key 组/标签展开；
+    // 失败不阻断删除（数据卫生问题，落日志可重试）
+    if let Err(e) = crate::store::docs::account_tags_remove_account(&crate::store::db(&state.data_dir), &user_id) {
+        fs_utils::app_log(&state.data_dir, &format!("账号 {user_id} 标签绑定清理失败: {e}"));
+    }
+    crate::api_server::org_index::invalidate(&state.data_dir);
 
     if delete_profile {
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
@@ -714,21 +776,13 @@ pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
         .collect()
 }
 
+/// 创建分组（薄封装转发统一共享分组命令：shg_ 新 ID + 全局重名校验，P0 需求①）
 #[tauri::command]
 pub fn group_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let id = format!("g_{}", chrono::Local::now().timestamp_millis());
-    let order = (groups.groups.len() as i32) + 1;
-    groups.groups.push(Group {
-        id: id.clone(),
-        name,
-        color,
-        order,
-    });
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    Ok(id)
+    super::shared_groups::create_inner(&state, name, color)
 }
 
+/// 更新分组（薄封装转发统一共享分组命令）
 #[tauri::command]
 pub fn group_update(
     state: State<AppState>,
@@ -737,40 +791,37 @@ pub fn group_update(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let g = groups
-        .groups
-        .iter_mut()
-        .find(|g| g.id == id)
-        .ok_or("分组不存在")?;
-    if let Some(n) = name {
-        g.name = n;
-    }
-    if let Some(c) = color {
-        g.color = c;
-    }
-    if let Some(o) = order {
-        g.order = o;
-    }
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    Ok(())
+    super::shared_groups::update_inner(&state, id, name, color, order)
 }
 
+/// 删除分组（薄封装转发统一共享分组命令：三池成员回落 + 清 api_pool/api_keys
+/// 引用 + 热重载；旧实现仅删 Trae 侧定义与 membership）
 #[tauri::command]
-pub fn group_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    groups.groups.retain(|g| g.id != id);
-    groups.membership.retain(|_, v| *v != id);
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    Ok(())
+pub fn group_delete(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    id: String,
+) -> Result<(), String> {
+    super::shared_groups::delete_inner(&state, runtime.inner(), &id)
 }
 
+/// 移动 Trae 账号到分组（成员关系保持 group_members 表机制，D1）。
+/// 联动网关池热重载（对齐 qoder_account_move 惯例）：api_pool.group_ids 按组过滤，
+/// 运行时移动跨组不重载则网关仍按旧组过滤调度。
 #[tauri::command]
 pub fn group_move(
     state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
+    // 目标分组校验：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
+    // （对齐 workbuddy_account_move / qoder_account_move 语义）
+    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+        if !super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
+            return Err(format!("目标分组不存在: {gid}"));
+        }
+    }
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     match group_id {
         Some(g) => {
@@ -781,6 +832,8 @@ pub fn group_move(
         }
     }
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    crate::api_server::org_index::invalidate(&state.data_dir);
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
 }
 
@@ -2056,6 +2109,7 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
     }
 
     let now_ts = chrono::Local::now().timestamp();
+    let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let mut out = Vec::new();
     for a in &accounts.accounts {
         let uid = a
@@ -2168,6 +2222,8 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             auth_saved_at: a.auth_saved_at.clone(),
             jwt_uid_mismatch,
             jwt_uid,
+            // 共享标签（account_tags 表联表填充，不落账号持久化结构，D3）
+            tags: tag_map.get(&uid).cloned().unwrap_or_default(),
         });
     }
     out

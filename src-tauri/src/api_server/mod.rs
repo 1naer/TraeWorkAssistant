@@ -8,6 +8,7 @@ pub mod dispatch;
 pub mod efforts;
 pub mod gateway_settings;
 pub mod models_sync;
+pub mod org_index;
 pub mod pool;
 pub mod payload;
 pub mod qoder_route;

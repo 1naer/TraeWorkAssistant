@@ -462,6 +462,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         /* 静默失败：状态栏保持未启动，用户可手动启动 */
       }
     }
+    // 待取启动通知（一次性）：后端启动期消息（如分组统一迁移结果）toast 告知用户，
+    // 拉取即清不会重复弹出；失败静默（通知不阻塞启动）
+    try {
+      const notice = await api.misc.startupNoticeTake();
+      if (notice) get().pushToast('info', notice);
+    } catch {
+      /* 静默失败 */
+    }
   },
 
   setView: (v) => set({ view: v }),
@@ -897,6 +905,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       await api.groups.update(id, patch);
       await get().refreshGroups();
+      // 写操作可见反馈（对齐 createGroup/removeGroup）
+      get().pushToast(
+        'success',
+        patch.name ? `分组已重命名为「${patch.name}」` : '分组颜色已更新',
+      );
     } catch (err) {
       get().pushToast('error', `更新分组失败：${String(err)}`);
       throw err;

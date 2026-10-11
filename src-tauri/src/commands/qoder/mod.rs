@@ -11,8 +11,8 @@
 //! - `data_io`：账号池导出/导入（M4，对照 WorkBuddy F-46 扩展同语义；
 //!   含凭证导出走 AES-256-GCM 加密信封，kdf 字段记录派生轮数）
 //! - `env_reset`：环境重置/彻底登出（M4，对照 WorkBuddy F-14 同语义）
-//! - `groups`：账号分组（定义存 kv("qoder_groups")，成员落账号 group_id；
-//!   defs 读改写持 qoder_pool_lock 互斥，与导入的分组合并互斥）
+//! - `groups`：账号分组（P0 需求①：定义读共享 groups 表 shg_ 前缀，成员落账号
+//!   group_id；账号读改写持 qoder_pool_lock 互斥，与导入互斥）
 //! - `ide_store`：IDE/Work 客户端本地存储发现导入（含 WAL 残留检测）
 //! - `oauth`：设备授权登录（浏览器授权 + 轮询导入；qoder-oauth-progress/done 事件）
 

@@ -9,12 +9,14 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// 行文档表白名单（rows_* 原语允许操作的表，防表名拼接注入）
 pub const ROW_TABLES: &[&str] = &[
     "device_map",
     "groups",
+    "tags",
+    "account_tags",
     "remaining_credits",
     "account_cooldowns",
     "pay_status",
@@ -118,6 +120,17 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS group_members (
         uid        TEXT PRIMARY KEY,
         group_id   TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    // 共享标签：定义行（Tag JSON）+ 账号绑定（pk = 跨池 uid，data = [tag_id, ...] 多对多）
+    "CREATE TABLE IF NOT EXISTS tags (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS account_tags (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     // API 用量：(bucket, day) 行文档，data = DayStats 全量 JSON（含 latency 样本）
