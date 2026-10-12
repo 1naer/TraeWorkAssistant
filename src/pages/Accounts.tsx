@@ -105,6 +105,8 @@ export default function Accounts() {
   const [jwtTarget, setJwtTarget] = useState<AccountView | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
+  // 行内「重新登录」目标账号（无/失效 refresh_token 的账号定向 OAuth）
+  const [reloginTarget, setReloginTarget] = useState<AccountView | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   // F-08 自动发现：扫描本机两个 Trae 应用 storage.json 的登录账号
   const [scanOpen, setScanOpen] = useState(false);
@@ -647,6 +649,24 @@ export default function Accounts() {
                             {rowOpUid === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
                           </button>
                         )}
+                        {/* 重新 OAuth 登录：无 refresh_token / RT 失效 / RT 已过期
+                            的账号无法自动续期，定向重新授权更新凭证（后端按 uid 校验防登错）。
+                            地球图标语义=打开浏览器授权；sky 配色在全部 6 个主题（含暗夜紫/
+                            琥珀暖夜）上均有足够对比 */}
+                        {(!a.has_refresh_token ||
+                          a.refresh_token_invalid ||
+                          (a.refresh_token_expires_at != null &&
+                            a.refresh_token_expires_at > 0 &&
+                            a.refresh_token_expires_at <= Math.floor(Date.now() / 1000))) && (
+                          <button
+                            title="重新 OAuth 登录（浏览器授权，为该账号重新获取 JWT / refresh_token）"
+                            onClick={() => setReloginTarget(a)}
+                            disabled={busy || rowOpUid != null}
+                            className="btn-ghost !p-2 text-sky-600 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-40 dark:text-sky-400 dark:hover:bg-sky-500/10"
+                          >
+                            <Globe size={14} />
+                          </button>
+                        )}
                         {a.cooldown_type && (
                           <button
                             title={rowOpUid ? '行内操作进行中' : '解除冷却'}
@@ -889,13 +909,22 @@ export default function Accounts() {
         </div>
       </Modal>
       <OAuthLoginModal
-        open={oauthOpen}
-        onClose={() => setOAuthOpen(false)}
+        open={oauthOpen || reloginTarget !== null}
+        relogin={
+          reloginTarget
+            ? { userId: reloginTarget.user_id, accountName: reloginTarget.name }
+            : null
+        }
+        onClose={() => {
+          setOAuthOpen(false);
+          setReloginTarget(null);
+        }}
         groups={groups}
-        onLogin={async (callbackUrl, accountName, groupId) => {
+        onLogin={async (callbackUrl, accountName, groupId, expectUid) => {
           try {
-            await oauthLogin(callbackUrl, accountName, groupId);
+            await oauthLogin(callbackUrl, accountName, groupId, expectUid);
             setOAuthOpen(false);
+            setReloginTarget(null);
           } catch {
             /* toast 已发出 */
           }

@@ -1387,6 +1387,9 @@ pub fn oauth_login(
     callback_url: String,
     account_name: Option<String>,
     group_id: Option<String>,
+    // 重新登录模式：指定目标账号 uid。授权账号 uid 与之不一致时拒绝落库，
+    // 防止浏览器里登错账号导致凭证合到其他账号/误新增
+    expect_uid: Option<String>,
 ) -> Result<OAuthLoginResult, String> {
     // 1. 解析回调 URL
     let callback_info = oauth_parse_callback(state.clone(), callback_url)?;
@@ -1427,6 +1430,21 @@ pub fn oauth_login(
         .clone()
         .or_else(|| jwt_info.user_id.clone())
         .ok_or_else(|| "无法从回调或 JWT 中获取 user_id".to_string())?;
+
+    // 重新登录防呆：行内「重新登录」携带目标账号 uid，
+    // 浏览器误登其他账号时直接拒绝——此刻尚未做任何落库/设备回写，零副作用。
+    // 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中
+    if let Some(expected) = expect_uid.as_deref() {
+        if expected != user_id {
+            let tail = |s: &str| s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+            return Err(format!(
+                "登录账号与目标账号不一致：本次授权的账号 uid 尾号 {}，目标账号 uid 尾号 {}。\
+                 已取消且未改动任何数据，请确认浏览器中登录的是同一账号后重试（若浏览器当前为其他账号，请先退出登录）",
+                tail(&user_id),
+                tail(expected)
+            ));
+        }
+    }
 
     // 4.5 issue #76 次因修复：新 JWT 绑定本次登录设备，立即回写 device_map——
     // 签到/积分查询经 get_device_for/resolve_device 取该设备，x-device-id 与 JWT

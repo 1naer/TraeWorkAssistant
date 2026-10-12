@@ -26,7 +26,7 @@ export function RefreshTokenBadge({
     return (
       <Badge
         tone="slate"
-        title="该账号无 refresh_token，无法自动刷新/续期，JWT 过期后签到与查询将失败。恢复：走「添加账号」重新 OAuth 登录该账号，登录会按账号 id 自动更新既有账号的凭证"
+        title="该账号无 refresh_token，无法自动刷新/续期，JWT 过期后签到与查询将失败。恢复：点该行操作区的「重新 OAuth 登录」按钮（蓝色地球图标）重新授权，会按账号 id 自动更新凭证且不新增账号；也可走「添加账号」登录同一账号"
       >
         <KeyRound size={12} /> 无 Refresh
       </Badge>
