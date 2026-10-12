@@ -292,6 +292,12 @@ impl AppState {
             s.qoder_credits_sync_enabled = true;
             s.qoder_credits_sync_hhmm = "23:40".into();
         }
+        // Qoder 会话流水定时合并（qoder-sessions-compact）：同款零值回填
+        //（kv 完全缺失走派生 Default bool=false 会漏开；时刻为空视为从未配置，回填默认开）
+        if s.qoder_sessions_compact_hhmm.trim().is_empty() {
+            s.qoder_sessions_compact_enabled = true;
+            s.qoder_sessions_compact_hhmm = "04:30".into();
+        }
         // Qoder 积分数据同步模式零值归一：mode 为空视为旧数据（只有 enabled 布尔），
         // 按旧开关派生保持语义：true→every_hours（对齐 Buddy/Trae 默认）、false→off；
         // 间隔小时数并入下方 clamp 循环

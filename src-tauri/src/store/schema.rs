@@ -228,7 +228,8 @@ const DDL: &[&str] = &[
         duration_ms INTEGER NOT NULL DEFAULT 0,
         stream      INTEGER NOT NULL DEFAULT 0,
         ok          INTEGER NOT NULL DEFAULT 1,
-        preview     TEXT NOT NULL DEFAULT ''
+        preview     TEXT NOT NULL DEFAULT '',
+        record_id   TEXT NOT NULL DEFAULT ''
     )",
     "CREATE INDEX IF NOT EXISTS idx_qoder_sessions_date ON qoder_sessions(date)",
     // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
@@ -257,6 +258,9 @@ pub fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "wb_credits_history", "earned", "REAL")?;
     // issue #82 问题4-1：credits_daily 补逐账号 earned 维度列（JSON：uid → 当日获得积分）
     ensure_column(conn, "credits_daily", "accounts", "TEXT NOT NULL DEFAULT '{}'")?;
+    // 会话聚合（轮键落账）：chat_record_id = 同一段消息+模型+输出上限的确定性
+    // 派生值，「展开会话看各轮明细」分组用；老库幂等补列（存量行空值回落 preview 口径）
+    ensure_column(conn, "qoder_sessions", "record_id", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }
 

@@ -666,6 +666,9 @@ pub struct UsageSessionView {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub preview: String,
+    /// 轮键（Qoder 侧 chat_record_id；Trae/Buddy 上游无此字段恒空）。
+    /// 同一段消息 + 同一模型 + 同一输出上限派生同值——「展开会话看各轮」分组用
+    pub record_id: String,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -743,6 +746,7 @@ pub fn usage_sessions_query(
                     cache_read_tokens: r.cache_read_tokens,
                     cache_write_tokens: r.cache_write_tokens,
                     preview: r.preview.clone(),
+                    record_id: String::new(),
                 });
             }
         }

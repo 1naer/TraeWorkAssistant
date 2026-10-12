@@ -381,6 +381,7 @@ fn main() {
             commands::qoder::qoder_credits_fetch,
             commands::qoder::qoder_credits_history_list,
             commands::qoder::qoder_sessions_query,
+            commands::qoder::qoder_session_detail_query,
             commands::qoder::qoder_accounts_export,
             commands::qoder::qoder_accounts_import,
             commands::qoder::qoder_env_reset_items,

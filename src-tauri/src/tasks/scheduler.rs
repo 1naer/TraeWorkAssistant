@@ -85,6 +85,13 @@ const TASKS: &[SchedTask] = &[
     // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
     // 空池空转；开关独立（settings.qoder_token_renew_enabled，默认开，环境配置页可关）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
+    // Qoder 会话流水定时合并（kind "compact" → EveryHours(6)；hhmm 不参与判定）：
+    // 每 6 小时把「7 天前」的请求级流水按 (date, uid, preview) 合并为单行
+    // （幂等自愈，积分/token 合计不变；历史行 session_id 为随机值，按 preview
+    // 归并才对旧行生效）。展示层另有读时聚合（qoder_sessions_query 两遍归并），
+    // 本任务只负责压缩历史行体积；开关独立（settings.qoder_sessions_compact_enabled，
+    // 默认开，环境配置页可改）
+    SchedTask { key: "qoder-sessions-compact", name: "Qoder 会话流水定时合并", hhmm: "04:30", kind: "compact" },
     // 模型同步（每日 HH:MM，默认开；无账号时静默跳过不计失败，对齐 models-sync 惯例）
     SchedTask { key: "trae-models-sync", name: "Trae 模型列表同步", hhmm: "05:40", kind: "models" },
     SchedTask { key: "wb-catalog-sync", name: "WorkBuddy 模型目录同步", hhmm: "05:45", kind: "models" },
@@ -117,6 +124,9 @@ const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// qoder-refresh 档位：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
 /// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
 const REFRESH_INTERVAL_HOURS: i64 = 6;
+/// qoder-sessions-compact 档位：每 6 小时合并一次「当天之前」的会话流水
+/// （当天数据由查询层读时聚合即时呈现，无等待诉求）
+const COMPACT_INTERVAL_HOURS: i64 = 6;
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -171,6 +181,8 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
         },
         // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
         "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
+        // Qoder 会话流水合并：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_sessions_compact_enabled）
+        "compact" => SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
     }
 }
@@ -363,6 +375,8 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
         // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
+        // Qoder 会话流水定时合并（环境配置页可关；默认开，每日 04:30）
+        "qoder-sessions-compact" => st.settings().qoder_sessions_compact_enabled,
         // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（hourly/daily 均视为启用）
         "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot" => {
             credits_sync_mode(st, key) != "off"
@@ -504,6 +518,23 @@ fn run_task(
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
         "qoder-refresh" => super::qoder_refresh::run_task(st),
+        // Qoder 会话流水定时合并：早于保留窗（settings.qoder_sessions_compact_days，
+        // 默认 3 天，非法/越界回退 clamp 1..=90）的请求行按 (date, uid, preview)
+        // 合并单行（幂等自愈；纯本地 SQLite 无网络依赖，失败返 Err 交 30 分钟冷却重试）
+        "qoder-sessions-compact" => {
+            let days = st
+                .settings()
+                .qoder_sessions_compact_days
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS)
+                .clamp(1, 90);
+            let (merged, deleted) = crate::store::docs::qoder_sessions_compact(
+                &crate::store::db(&st.data_dir),
+                days,
+            )?;
+            Ok(json!({ "ok": true, "merged": merged, "deleted": deleted, "days": days }))
+        }
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => super::qoder_catalog::run_task(st),
@@ -833,6 +864,20 @@ mod tests {
         let st = temp_state("wgoff");
         seed_growth_settings(&st, false, "09:00");
         assert!(!enabled(&st, "wb-growth"));
+    }
+
+    /// Qoder 会话流水定时合并：默认开 + 每 6 小时（compact 档，hhmm 不参与判定）；
+    /// 显式关闭后 Skip
+    #[test]
+    fn qoder_sessions_compact_plan() {
+        let st = temp_state("qcompact");
+        let t = || TASKS.iter().find(|t| t.key == "qoder-sessions-compact").unwrap();
+        assert!(matches!(sched_plan(&st, t()), SchedPlan::EveryHours(6)));
+        let set = |v: Value| crate::store::db(&st.data_dir).kv_set("app_settings", &v).unwrap();
+        set(json!({ "qoder_sessions_compact_enabled": false }));
+        assert!(matches!(sched_plan(&st, t()), SchedPlan::Skip));
+        set(json!({ "qoder_sessions_compact_enabled": true, "qoder_sessions_compact_hhmm": "03:10" }));
+        assert!(matches!(sched_plan(&st, t()), SchedPlan::EveryHours(6)), "hhmm 不参与 EveryHours 判定");
     }
 
     /// 显式关闭：enabled() 返回 false（环境配置页开关关闭后调度器跳过）

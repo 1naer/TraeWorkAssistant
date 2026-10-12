@@ -408,16 +408,20 @@ pub fn today_key() -> String {
 pub struct QoderSessionCtx {
     pub request_id: String,
     pub session_id: String,
+    /// 轮键（信封 chat_record_id；同一段消息+模型+输出上限派生同值，
+    /// 「展开会话看各轮明细」分组用；失败占位恒空）
+    pub record_id: String,
     pub ts: i64,
     pub preview: String,
 }
 
 impl QoderSessionCtx {
-    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id）
+    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id/record_id）
     pub fn placeholder(preview: String) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             session_id: String::new(),
+            record_id: String::new(),
             ts: chrono::Local::now().timestamp(),
             preview,
         }

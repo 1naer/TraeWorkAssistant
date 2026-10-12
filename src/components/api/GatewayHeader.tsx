@@ -150,9 +150,17 @@ export default function GatewayHeader() {
       </div>
 
       {status?.last_error && (
-        <p className="mt-2 break-all text-xs text-rose-600 dark:text-rose-400">
-          最近错误：{status.last_error}
-        </p>
+        <>
+          <p className="mt-2 break-all text-xs text-rose-600 dark:text-rose-400">
+            最近错误：{status.last_error}
+          </p>
+          {status.last_error.startsWith('qoder ') && (
+            <p className="mt-1 text-xs text-slate-400 dark:text-zinc-500">
+              qoder 池 5xx/504 为上游服务端异常（gateway.qoder.com.cn），与本机配置、模型切换无关；
+              同模型连续失败时网关会自动对该模型做渐进冷却并回退其他池（issue #90）。
+            </p>
+          )}
+        </>
       )}
 
       <GatewayHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />

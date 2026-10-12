@@ -32,6 +32,9 @@ export default function QoderSettings() {
   // 积分数据同步（对齐 BuddySettings 四模式）：mode + daily 时刻 + every_hours 间隔
   const [creditsForm, setCreditsForm] = useState({ mode: 'every_hours', hhmm: '23:40', hours: '2' });
   const [tokenRenewEnabled, setTokenRenewEnabled] = useState(true);
+  // 会话流水定时合并（qoder-sessions-compact：每 6 小时合并早于保留窗的流水为会话行）
+  const [compactEnabled, setCompactEnabled] = useState(true);
+  const [compactDays, setCompactDays] = useState('3');
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   // 计划任务注册/卸载互斥（防连点重复提交）
@@ -83,6 +86,8 @@ export default function QoderSettings() {
     checkinGap: 3,
     creditsForm: { mode: 'every_hours', hhmm: '23:40', hours: '2' },
     tokenRenewEnabled: true,
+    compactEnabled: true,
+    compactDays: '3',
   });
 
   useEffect(() => {
@@ -96,7 +101,9 @@ export default function QoderSettings() {
       creditsForm.mode === s.creditsForm.mode &&
       creditsForm.hhmm === s.creditsForm.hhmm &&
       creditsForm.hours === s.creditsForm.hours &&
-      tokenRenewEnabled === s.tokenRenewEnabled;
+      tokenRenewEnabled === s.tokenRenewEnabled &&
+      compactEnabled === s.compactEnabled &&
+      compactDays === s.compactDays;
     if (!untouched) return;
     const next = {
       idePath: settings.qoder_ide_path ?? '',
@@ -109,6 +116,8 @@ export default function QoderSettings() {
         hours: settings.qoder_credits_sync_hours || '2',
       },
       tokenRenewEnabled: settings.qoder_token_renew_enabled ?? true,
+      compactEnabled: settings.qoder_sessions_compact_enabled ?? true,
+      compactDays: settings.qoder_sessions_compact_days || '3',
     };
     setIdePath(next.idePath);
     setWorkPath(next.workPath);
@@ -116,6 +125,8 @@ export default function QoderSettings() {
     setCheckinGap(next.checkinGap);
     setCreditsForm(next.creditsForm);
     setTokenRenewEnabled(next.tokenRenewEnabled);
+    setCompactEnabled(next.compactEnabled);
+    setCompactDays(next.compactDays);
     lastSynced.current = next;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings]);
@@ -136,6 +147,13 @@ export default function QoderSettings() {
       pushToast('error', `同步时刻格式无效：${creditsForm.hhmm}（应为 HH:MM）`);
       return;
     }
+    const compactDaysNum = String(
+      Math.min(90, Math.max(1, Math.round(Number(compactDays) || 3))),
+    );
+    if (compactEnabled && !/^\d+$/.test(compactDays.trim())) {
+      pushToast('error', `合并保留窗天数无效：${compactDays}（应为 1-90 的整数）`);
+      return;
+    }
     const creditsHours = String(
       Math.min(24, Math.max(1, Math.round(Number(creditsForm.hours) || 2))),
     );
@@ -154,6 +172,8 @@ export default function QoderSettings() {
             // 旧两态开关双写兼容：mode≠off 即启用（调度器已改按 mode 判定，此处仅保历史读取方）
             qoder_credits_sync_enabled: creditsForm.mode !== 'off',
             qoder_token_renew_enabled: tokenRenewEnabled,
+            qoder_sessions_compact_enabled: compactEnabled,
+            qoder_sessions_compact_days: compactDaysNum,
           }),
           api.qoder.settingsSet(qoderSettings),
         ]),
@@ -169,6 +189,8 @@ export default function QoderSettings() {
         checkinGap,
         creditsForm: { mode: creditsForm.mode, hhmm: creditsForm.hhmm.trim(), hours: creditsHours },
         tokenRenewEnabled,
+        compactEnabled,
+        compactDays: compactDaysNum,
       };
       await refresh();
     } catch (err) {
@@ -493,6 +515,49 @@ export default function QoderSettings() {
             {creditsForm.mode === 'hourly' && (
               <span className="text-xs text-slate-400">应用运行期间每小时同步一次</span>
             )}
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 会话流水定时合并：每 6 小时把「当天之前」的请求级流水按会话合并为单行 */}
+          <div className="flex items-center justify-between">
+            <h3 className="font-medium">会话流水定时合并</h3>
+            <span className="text-xs text-slate-400">开关随右上角「保存配置」生效</span>
+          </div>
+          <p className="mb-3 mt-1 text-xs text-slate-400">
+            会话明细按请求级落库（一个会话会产生数十条请求记录）。应用内调度器每 6 小时将
+            早于保留窗的流水按「日期 + 账号 + 会话说明」合并为单行（积分与 token 合计不变），
+            压缩流水表体积；保留窗内保留请求级明细，看板展示由查询即时聚合，无需等待合并。
+            合并幂等，重复执行不会重复累计。
+          </p>
+          <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={compactEnabled}
+                onChange={(e) => setCompactEnabled(e.target.checked)}
+              />
+              启用
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-slate-500">保留窗</span>
+              <input
+                type="number"
+                min={1}
+                max={90}
+                value={compactDays}
+                onChange={(e) => setCompactDays(e.target.value)}
+                onBlur={() => {
+                  const n = Math.min(90, Math.max(1, Math.round(Number(compactDays) || 3)));
+                  setCompactDays(String(n));
+                }}
+                className="input h-9 !w-20 text-sm"
+              />
+              <span className="text-xs text-slate-400">
+                天（1-90）；近 {compactDays || '3'} 天保留请求级明细，更早的合并为会话行
+              </span>
+            </div>
+            <span className="text-xs text-slate-400">内置任务 · 每 6 小时 · 无需注册计划任务</span>
           </div>
         </div>
       </div>

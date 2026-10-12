@@ -269,6 +269,9 @@ function defaultSettings(): Settings {
     qoder_credits_sync_mode: 'every_hours',
     qoder_credits_sync_hours: '2',
     qoder_token_renew_enabled: true,
+    qoder_sessions_compact_enabled: true,
+    qoder_sessions_compact_days: '3',
+    qoder_sessions_compact_hhmm: '04:30',
   };
 }
 

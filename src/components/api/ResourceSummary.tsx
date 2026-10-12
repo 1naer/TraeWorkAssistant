@@ -91,6 +91,8 @@ function DispatchCenterCard({
   // per_model 新增绑定行（本地输入态，添加时才落 policy）
   const [newPerModelName, setNewPerModelName] = useState('');
   const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
+  // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），onBlur 才落盘
+  const [reserveDraft, setReserveDraft] = useState<number | null>(null);
   // F2：保存请求序号守卫（仅最新一次响应可写状态）
   const saveSeqRef = useRef(0);
 
@@ -273,9 +275,37 @@ function DispatchCenterCard({
             />
             首选池不可用时跨池回退
           </label>
+          <label
+            className="flex items-center gap-2"
+            title="剩余积分低于或等于该值的账号暂停调度（切换其他账号），防止积分被耗尽后免费模型也不可用；0 = 关闭"
+          >
+            <span className="text-slate-400 dark:text-zinc-500">账号保留剩余积分</span>
+            <input
+              type="number"
+              className={`${selectCls} w-20`}
+              min={0}
+              step={1}
+              value={reserveDraft ?? policy.reserve_credits}
+              disabled={saving}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setReserveDraft(Number.isFinite(v) ? v : 0);
+              }}
+              onBlur={() => {
+                if (reserveDraft != null && reserveDraft !== policy.reserve_credits) {
+                  void savePolicy({ reserve_credits: Math.max(0, reserveDraft) });
+                }
+                setReserveDraft(null);
+              }}
+            />
+            <span className="text-slate-400 dark:text-zinc-500">积分</span>
+          </label>
         </div>
         <p className="mt-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
           智能调度按请求模型对可用池排序：积分先到期优先 → 免费 / 倍率小优先 → 剩余积分多优先；全并列时按上方优先级序。
+        </p>
+        <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
+          账号保留剩余积分：剩余 ≤ 阈值的账号暂停调度（默认 50，0 = 关闭），防止积分被调度耗尽后免费模型也不可用。
         </p>
 
         {/* ②+ per_model 模型绑定池（DispatchPolicy.per_model）：显式为单个模型固定

@@ -467,8 +467,42 @@ pub fn list() -> Vec<Value> {
 /// 再另一地区、最后兜底表双区——「国际版账号请求中国版专属模型」会拿到
 /// 明确的解析结果，由上游报出真实原因，而不是网关谎报「模型不存在」。
 #[allow(dead_code)] // p3-3-wire（dispatch/routes）消费
+/// 跨池命名差异别名表（issue #90 修复③b）：三家池对同一模型命名不一
+/// （DeepSeek 4.1 Flash 在 Trae 侧叫 `deepseek4.1flash`、在 Qoder/Buddy 侧叫
+/// `DeepSeek-Flash`），用户切池时沿用旧名会 404。命中键 → Qoder 目录内
+/// canonical 名（小写比对形态），resolve 入口归一后再查目录。
+/// 键统一小写、去空白形态匹配（normalize_model_alias 内统一处理变体）。
+const MODEL_ALIASES: &[(&str, &str)] = &[
+    // Trae 侧命名（含无分隔/点分/空格变体）→ Qoder DeepSeek-Flash
+    ("deepseek4.1flash", "deepseek-flash"),
+    ("deepseek-4.1-flash", "deepseek-flash"),
+    ("deepseek4.1-flash", "deepseek-flash"),
+    ("deepseek-4.1flash", "deepseek-flash"),
+    // Qoder/目录命名已在表内自洽（deepseek-flash 即 DeepSeek-Flash 小写），
+    // 无需条目；此处不收录 workbuddy 侧 "deepseek flash"——空格变体在
+    // normalize_model_alias 中统一归一为连字符后自然命中
+];
+
+/// 模型名别名归一（issue #90 修复③b）：
+/// ① 空格 → 连字符（"deepseek flash" → "deepseek-flash"，跨池空格变体统一）；
+/// ② 显式别名表（MODEL_ALIASES）精确替换；未命中返回原文。
+/// 只做无损归一，不猜测未收录模型，避免误路由。
+fn normalize_model_alias(model_id: &str) -> String {
+    let lowered = model_id.trim().to_lowercase();
+    let dashed = if lowered.contains(' ') {
+        lowered.replace(' ', "-")
+    } else {
+        lowered
+    };
+    MODEL_ALIASES
+        .iter()
+        .find(|(from, _)| *from == dashed)
+        .map(|(_, to)| to.to_string())
+        .unwrap_or(dashed)
+}
+
 pub fn resolve(model_id: &str, region: QoderRegion) -> Option<Value> {
-    let wanted = model_id.trim().to_lowercase();
+    let wanted = normalize_model_alias(model_id);
     if wanted.is_empty() {
         return None;
     }
@@ -2104,6 +2138,29 @@ fn session_id_for(user_id: &str, upstream_key: &str, seed: Option<&str>) -> Stri
     }
 }
 
+/// 会话种子兜底（会话聚合修复）：客户端未提供 session_id/user 字段时
+/// （OpenAI 兼容客户端常态），以**首条 user 消息**派生确定性指纹——
+/// 同一会话的 messages 为追加式（历史恒保留），首条 user 恒定 →
+/// 同会话同 seed → session_id_for 派生同一上游 session_id（官方
+/// 「同段对话复用 session」语义，兼得上游会话侧缓存复用）；跨会话不同。
+/// 修复前：seed 为 None → 每请求一次性会话（session_id 全随机），
+/// 流水表会话键失效（页面不聚合、定时合并无效的根因）。
+fn first_user_fingerprint(messages: &[Value]) -> Option<String> {
+    let first = messages
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))?;
+    let text = content_to_text(first.get("content").unwrap_or(&Value::Null));
+    if text.is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"qoder-seed-fp");
+    hasher.update([0u8]);
+    hasher.update(text.as_bytes());
+    Some(format!("{:x}", hasher.finalize()).chars().take(32).collect())
+}
+
 /// 请求指纹（源实现 recordIdFor）：进 chat_record_id / request_set_id。
 /// 同一段消息 + 同一个模型 + 同一个输出上限 → 同一个记录 id，
 /// 上游据此识别「这是同一次对话的延续」。
@@ -2174,12 +2231,16 @@ pub fn prepare_qoder_body(
         .or_else(|| peek.get("max_completion_tokens"))
         .and_then(Value::as_i64);
     // 审查 P3：session_seed 进上游请求体，超长值放大请求体积——限长 128 字符
-    //（按字符截断，防非 ASCII 字节切片 panic）
+    //（按字符截断，防非 ASCII 字节切片 panic）。
+    // 会话聚合修复：客户端未携带 session_id/user（OpenAI 兼容客户端常态）时
+    // 兜底首条 user 消息指纹——同会话同 seed（此前每请求一次性会话，
+    // 流水 session_id 全随机导致会话明细无法聚合）
     let session_seed = peek
         .get("session_id")
         .and_then(Value::as_str)
         .or_else(|| peek.get("user").and_then(Value::as_str))
-        .map(|s| s.chars().take(128).collect::<String>());
+        .map(|s| s.chars().take(128).collect::<String>())
+        .or_else(|| first_user_fingerprint(&messages));
     let body = build_upstream_body(
         model_key,
         &config,
@@ -2991,5 +3052,25 @@ mod tests {
         let x = session_id_for("u", "qfmodel", None);
         let y = session_id_for("u", "qfmodel", None);
         assert_ne!(x, y, "空种子 = 一次性会话");
+    }
+
+    #[test]
+    fn first_user_fingerprint_stable_and_distinct() {
+        // 同会话追加式 messages：首条 user 恒定 → 指纹稳定（跨轮一致）
+        let round1 = vec![json!({"role": "user", "content": "q1"})];
+        let round2 = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+        ];
+        let f1 = first_user_fingerprint(&round1).unwrap();
+        let f2 = first_user_fingerprint(&round2).unwrap();
+        assert_eq!(f1, f2, "同会话跨轮指纹一致");
+        // 无 user 消息 / 空 content → None（回落一次性会话语义）
+        assert!(first_user_fingerprint(&[json!({"role": "system", "content": "s"})]).is_none());
+        assert!(first_user_fingerprint(&[json!({"role": "user", "content": ""})]).is_none());
+        // 跨会话不同
+        let other = first_user_fingerprint(&[json!({"role": "user", "content": "q2"})]).unwrap();
+        assert_ne!(f1, other);
     }
 }

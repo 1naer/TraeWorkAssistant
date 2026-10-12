@@ -1299,6 +1299,7 @@ pub fn workbuddy_sessions_query(
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 preview: r.get("preview").and_then(Value::as_str).unwrap_or("").to_string(),
+                record_id: String::new(),
             });
         }
     }

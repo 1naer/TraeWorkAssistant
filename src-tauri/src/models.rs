@@ -333,6 +333,19 @@ pub struct Settings {
     /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
     #[serde(default = "default_true")]
     pub qoder_token_renew_enabled: bool,
+    /// Qoder 会话流水定时合并开关（默认开）：qoder-sessions-compact 任务每 6 小时将
+    /// 早于保留窗的请求级流水按 (date, uid, preview) 合并为单行（幂等，积分合计不变；
+    /// 看板展示由查询层读时聚合即时呈现，无需等待合并）
+    #[serde(default = "default_true")]
+    pub qoder_sessions_compact_enabled: bool,
+    /// Qoder 会话流水合并保留窗天数（默认 3，合法 1..=90）：近 N 天保留请求级明细，
+    /// 更早的合并为会话行；非法/越界由读取侧回退默认并 clamp
+    #[serde(default = "default_qoder_sessions_compact_days")]
+    pub qoder_sessions_compact_days: String,
+    /// Qoder 会话流水合并触发时刻 HH:MM（保留兼容字段；调度已改 EveryHours(6) 档，
+    /// 时刻不参与判定，字段仅保历史持久化可读）
+    #[serde(default = "default_qoder_sessions_compact_hhmm")]
+    pub qoder_sessions_compact_hhmm: String,
     // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
     /// 固定应用：始终显示在侧边栏且不可隐藏（radio 单选，默认 trae）
     #[serde(default = "default_pinned_app")]
@@ -425,6 +438,14 @@ fn default_wb_catalog_sync_hhmm() -> String {
 /// Qoder 模型目录同步默认时刻（错峰 Buddy 05:45 / Trae 05:40）
 fn default_qoder_catalog_sync_hhmm() -> String {
     "05:50".to_string()
+}
+/// Qoder 会话流水合并默认时刻（低峰时段，错峰积分同步 23:40 / 凭证刷新 06:00）
+fn default_qoder_sessions_compact_hhmm() -> String {
+    "04:30".to_string()
+}
+/// Qoder 会话流水合并保留窗默认天数（与 docs::QODER_SESSIONS_COMPACT_AFTER_DAYS 对齐）
+fn default_qoder_sessions_compact_days() -> String {
+    "3".to_string()
 }
 fn default_trae_models_sync_hhmm() -> String {
     "05:40".into()

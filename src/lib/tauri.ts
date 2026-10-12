@@ -76,6 +76,7 @@ import type {
   WbPoolImportResult,
   WbModelInfo,
   UsageHistoryResult,
+  UsageSessionView,
   UsageSessionsResult,
   TraeExpiredEntsResult,
   QoderAccountView,
@@ -609,6 +610,14 @@ export const api = {
         userId: opts.userId ?? null,
         page: opts.page ?? null,
         pageSize: opts.pageSize ?? null,
+      }),
+    /** Qoder 会话展开明细（按会话行代表键查请求级行；键口径 = session_id ∪ preview） */
+    sessionDetail: (opts: { date: string; uid: string; sessionId: string; preview: string }) =>
+      invoke<UsageSessionView[]>('qoder_session_detail_query', {
+        date: opts.date,
+        uid: opts.uid,
+        sessionId: opts.sessionId,
+        preview: opts.preview,
       }),
     /**
      * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM

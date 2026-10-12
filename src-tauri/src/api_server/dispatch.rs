@@ -100,12 +100,20 @@ pub struct DispatchPolicy {
     /// 双源模型首选池不可用时按序回退；关闭后仅用首选池
     #[serde(default = "default_true")]
     pub fallback: bool,
+    /// 账号保留剩余积分（issue #91）：剩余 ≤ 该值的账号暂停调度（0 = 关闭），
+    /// 默认 50——防止账号积分被调度耗尽后连免费模型也不可用
+    #[serde(default = "default_reserve_credits")]
+    pub reserve_credits: f64,
     #[serde(default)]
     pub updated_at: i64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_reserve_credits() -> f64 {
+    50.0
 }
 
 impl Default for DispatchPolicy {
@@ -115,6 +123,7 @@ impl Default for DispatchPolicy {
             priority: default_priority(),
             per_model: HashMap::new(),
             fallback: true,
+            reserve_credits: default_reserve_credits(),
             updated_at: 0,
         }
     }
@@ -136,6 +145,8 @@ fn load_policy_uncached(data_dir: &Path) -> DispatchPolicy {
         .filter_map(|s| TargetPool::parse(s).map(|t| t.as_str().to_string()))
         .collect();
     p.priority = if valid.is_empty() { default_priority() } else { valid };
+    // 防御：保留积分阈值负值归零（0 = 关闭过滤）
+    p.reserve_credits = p.reserve_credits.max(0.0);
     // per_model 键统一 canonical_id（与目录归并/元数据覆盖层同语义），
     // 值过滤非法池名
     p.per_model = p
@@ -1011,6 +1022,7 @@ mod tests {
                     global_region: false,
                     credits: Some(10.0),
                     credits_expire_at: None,
+                    credits_fetched_at: None,
                     needs_relogin: false,
                     group_id: String::new(),
                 }],

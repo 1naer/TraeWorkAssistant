@@ -177,6 +177,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                     .map(|r| serde_json::json!({ "ok": true, "accounts": r.accounts.len() }))
             }
         }
+        // Qoder 会话流水定时合并（调度器/CLI 共用；纯本地 SQLite 无网络，幂等）。
+        // 不注册 schtasks——本地任务无「应用未启动也要跑」诉求，CLI 入口仅供手工触发/排查
+        "qoder-sessions-compact" => crate::store::docs::qoder_sessions_compact(
+            &crate::store::db(&state.data_dir),
+            crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS,
+        )
+        .map(|(merged, deleted)| serde_json::json!({ "ok": true, "merged": merged, "deleted": deleted })),
         other => {
             eprintln!("未知任务: {other}");
             println!("{}", serde_json::json!({"ok": false, "error": format!("未知任务: {other}")}));

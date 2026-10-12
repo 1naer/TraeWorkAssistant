@@ -63,28 +63,67 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 
 // ==================== 模型级冷却（审查修复，镜像 wb_route::model_cooldowns） ====================
 
-/// Qoder 模型级冷却表：model → 冷却截止时刻。排队/超限类错误（ErrMeta 分类
-/// Queued）是模型级现象（换账号同样排队），与账号无关，故进程级静态表语义
-/// 等价；挂 ApiSharedState 需改 server.rs（他人负责），静态 OnceLock 最小改动。
+/// Qoder 模型级冷却表：model → (冷却截止时刻, 连续失败次数)。排队/超限类错误
+/// （ErrMeta 分类 Queued）是模型级现象（换账号同样排队），与账号无关，故进程级
+/// 静态表语义等价；挂 ApiSharedState 需改 server.rs（他人负责），静态 OnceLock
+/// 最小改动。失败次数仅由 Server 渐进冷却维护（issue #90 修复①），成功即随
+/// 条目清除。
 /// 备忘（审查 G6）：键为裸 model 名、无区域前缀，v1 恒 CN 区解析无歧义；
 /// 接线 Global 区时需加区域前缀（如 "global:{model}"）。表不做主动回收，
-/// 残留条目随冷却窗口（≤30s，QUEUE_BACKOFF_MAX_SECS 钳制）自然过期，重启即清零。
-static QODER_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+/// 残留条目随冷却窗口自然过期，重启即清零。
+static QODER_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
 
-fn cooldown_map() -> &'static Mutex<HashMap<String, Instant>> {
+fn cooldown_map() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
     QODER_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 记录模型级冷却：按本次排队退避时长（已钳制）设定截止时刻。冷却窗口内
-/// 后续请求由 dispatch 健康预检快速回退（多源）/显式 429（单源），执行路径
-/// 跳过同号退避，不再每请求空转 5s×3~30s×3。
+/// Server 类（5xx/业务 504「上游服务异常」）渐进冷却参数（issue #90 修复①）：
+/// 30s 起、连续失败翻倍（30/60/120/240/480），上限 10 分钟。模型级冷却窗口内
+/// dispatch 健康预检（dispatch.rs pool_health）快速回退多源模型到 Trae/Buddy 池，
+/// 不再每请求硬打已知 504 的 qoder 上游；成功即清（clear_model_cooldown）。
+const SERVER_COOLDOWN_BASE_SECS: u64 = 30;
+const SERVER_COOLDOWN_MAX_SECS: u64 = 600;
+
+/// 记录模型级冷却：按本次排队退避时长（已钳制）设定截止时刻，保留既有连续
+/// 失败计数（排队退避与 Server 渐进冷却共用一张表）。冷却窗口内后续请求由
+/// dispatch 健康预检快速回退（多源）/显式 429（单源），执行路径跳过同号退避，
+/// 不再每请求空转 5s×3~30s×3。
 /// 备忘（审查 G6）：键为裸 model 名、无区域前缀（v1 恒 CN 区）；接线 Global
 /// 区时需加区域前缀，见 QODER_MODEL_COOLDOWNS 定义处备忘。
 fn note_model_cooldown(model: &str, secs: u64) {
     cooldown_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(model.to_string(), Instant::now() + Duration::from_secs(secs));
+        .entry(model.to_string())
+        .and_modify(|(until, _)| *until = Instant::now() + Duration::from_secs(secs))
+        .or_insert_with(|| (Instant::now() + Duration::from_secs(secs), 0));
+}
+
+/// Server 类错误（上游 5xx / 业务 504「上游服务异常」）模型级渐进冷却
+/// （issue #90 修复①）：连续失败次数 +1，冷却窗口 = min(30s × 2^(n-1), 600s)，
+/// 且不缩短既有冷却截止（并发请求刚记录过更长窗口时取较大者）。此前 504 只
+/// 做账号级 note_error + 换号，模型级冷却永不变热 → dispatch 预检永不触发
+/// 跨池回退，多源模型持续硬打已知 504 的上游（issue #90 主诉）。
+fn note_model_server_cooldown(model: &str) {
+    cooldown_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(model.to_string())
+        .and_modify(|(until, fails)| {
+            *fails = fails.saturating_add(1);
+            let delay = (SERVER_COOLDOWN_BASE_SECS << (*fails - 1).min(4))
+                .min(SERVER_COOLDOWN_MAX_SECS);
+            let candidate = Instant::now() + Duration::from_secs(delay);
+            if candidate > *until {
+                *until = candidate;
+            }
+        })
+        .or_insert_with(|| {
+            (
+                Instant::now() + Duration::from_secs(SERVER_COOLDOWN_BASE_SECS),
+                1,
+            )
+        });
 }
 
 /// 模型冷却剩余秒数；None = 无冷却（过期残留条目同 wb 版语义按无冷却处理）
@@ -99,12 +138,25 @@ pub fn model_cooling_remaining_secs(model: &str) -> Option<u64> {
     }
 }
 
-/// 请求成功后清除该模型冷却（同 wb_route::clear_model_failure 语义）
+/// 请求成功后清除该模型冷却（同 wb_route::clear_model_failure 语义）；连续
+/// 失败计数随条目一并清除（成功 = 该模型恢复服务，渐进冷却重新从基准值起步）
 fn clear_model_cooldown(model: &str) {
     cooldown_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(model);
+}
+
+/// last_error 时间戳（UTC+8，与 app 日志时间线同区，issue #90 修复②）：
+/// 504 类上游异常是否持续、何时开始，用户此前只能靠猜（正是「切换模型导致」
+/// 误解的成因），带时刻后可与日志逐行对照
+fn now_cn_timestamp() -> String {
+    use chrono::FixedOffset;
+    let cn = FixedOffset::east_opt(8 * 3600).expect("UTC+8 offset is valid");
+    chrono::Utc::now()
+        .with_timezone(&cn)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// 排队/退避分段等待（审查修复）：长 sleep 切成 ≤500ms 片段逐段睡，每段后
@@ -222,7 +274,8 @@ fn session_ctx(peek: &Value) -> super::usage::QoderSessionCtx {
 /// issue #82 审查修复 K：信封顶层 request_id/session_id 提取。信封含完整对话历史
 /// （大 body），内层重试循环若每次记账都全量反序列化属热路径冗余；
 /// id 随信封恒定，应在信封生成后解析一次、循环内复用（本函数即一次解析的产物源）。
-fn extract_envelope_ids(body: &[u8]) -> Option<(String, String)> {
+/// 会话聚合扩展：三元组带 chat_record_id（轮键，「展开会话看各轮明细」分组用）。
+fn extract_envelope_ids(body: &[u8]) -> Option<(String, String, String)> {
     let v = serde_json::from_slice::<Value>(body).ok()?;
     let get = |k: &str| {
         v.get(k)
@@ -230,19 +283,20 @@ fn extract_envelope_ids(body: &[u8]) -> Option<(String, String)> {
             .unwrap_or("")
             .to_string()
     };
-    let (rid, sid) = (get("request_id"), get("session_id"));
-    (!rid.is_empty()).then_some((rid, sid))
+    let (rid, sid, rec) = (get("request_id"), get("session_id"), get("chat_record_id"));
+    (!rid.is_empty()).then_some((rid, sid, rec))
 }
 
 /// 由预解析的信封 id 构造记账上下文（id 为 None = 无信封/解析失败 → uuid 占位）
 fn session_ctx_from_ids(
     peek: &Value,
-    ids: Option<&(String, String)>,
+    ids: Option<&(String, String, String)>,
 ) -> super::usage::QoderSessionCtx {
     match ids {
-        Some((rid, sid)) => super::usage::QoderSessionCtx {
+        Some((rid, sid, rec)) => super::usage::QoderSessionCtx {
             request_id: rid.clone(),
             session_id: sid.clone(),
+            record_id: rec.clone(),
             ts: chrono::Local::now().timestamp(),
             preview: session_preview(peek),
         },
@@ -311,14 +365,14 @@ fn safe_slice(s: &str, n: usize) -> &str {
 struct QoderHedgeLease {
     uid: String,
     counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// 对冲账号信封的 (request_id, session_id)（G4）：对冲请求按对冲账号 uid
+    /// 对冲账号信封的 (request_id, session_id, record_id)（G4）：对冲请求按对冲账号 uid
     /// 重建信封，两账号信封 id 不同——接管记账必须落对冲账号信封的 id，
     /// 否则行 uid=对冲账号而会话键属主账号信封，归属错位
-    session_ids: Option<(String, String)>,
+    session_ids: Option<(String, String, String)>,
 }
 
 impl QoderHedgeLease {
-    fn acquire(state: &ApiSharedState, uid: &str, session_ids: Option<(String, String)>) -> Self {
+    fn acquire(state: &ApiSharedState, uid: &str, session_ids: Option<(String, String, String)>) -> Self {
         let counter = state.qoder_pool.inflight_handle(uid);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self { uid: uid.to_string(), counter, session_ids }
@@ -338,9 +392,9 @@ struct QoderRaceWin {
     uid: String,
     hedge: Option<QoderHedgeLease>,
     takeover: bool,
-    /// 胜者信封的 (request_id, session_id)（G4）：主账号胜 = 主信封 id，
+    /// 胜者信封的 (request_id, session_id, record_id)（G4）：主账号胜 = 主信封 id，
     /// 对冲接管 = 对冲信封 id；记账按胜者落定，与会话行 uid 同源
-    session_ids: Option<(String, String)>,
+    session_ids: Option<(String, String, String)>,
 }
 
 /// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -360,7 +414,7 @@ fn race_qoder_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
-    primary_session_ids: &Option<(String, String)>,
+    primary_session_ids: &Option<(String, String, String)>,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
@@ -889,9 +943,21 @@ fn run_qoder_stream(
                                             state.qoder_sticky.unbind_uid(&win_uid);
                                         }
                                     }
+                                    // issue #90 修复①：上游服务端异常（5xx/业务 504）纳入
+                                    // 模型级渐进冷却——仅在内容未流出时记账（sent_any=true
+                                    // 说明模型实际在服务，尾部错误帧不代表模型故障）
+                                    if kind == UpstreamKind::Server && !sent_any {
+                                        note_model_server_cooldown(model);
+                                    }
+                                    // issue #90 修复②：last_error 带模型名 + 时刻（此前只有
+                                    // uid/code/msg，无法定位是哪个模型、故障从何时开始）
                                     *safe_lock(&state.last_error) = Some(format!(
-                                        "qoder uid={} code={} msg={}",
-                                        win_uid, code, msg
+                                        "qoder uid={} model={} code={} msg={} at {}",
+                                        win_uid,
+                                        model,
+                                        code,
+                                        msg,
+                                        now_cn_timestamp()
                                     ));
                                 }
                                 None => {
@@ -997,11 +1063,19 @@ fn run_qoder_stream(
                                     state.qoder_sticky.unbind_uid(&picked.uid);
                                 }
                             }
+                            // issue #90 修复①：HTTP 层 5xx（含 504）换号前记模型级
+                            // 渐进冷却——否则 504 只逐账号轮换硬打，dispatch 预检
+                            // 永不触发跨池回退（issue #90 主诉场景）
+                            if classified.kind == UpstreamKind::Server {
+                                note_model_server_cooldown(model);
+                            }
                             *safe_lock(&state.last_error) = Some(format!(
-                                "qoder uid={} status={} body={}",
+                                "qoder uid={} model={} status={} body={} at {}",
                                 picked.uid,
+                                model,
                                 status,
-                                safe_slice(&resp_body, 200)
+                                safe_slice(&resp_body, 200),
+                                now_cn_timestamp()
                             ));
                             state.logger.log_request(
                                 "qoder", "POST", "/v1/chat/completions", model, true, status,
@@ -1339,14 +1413,22 @@ pub async fn qoder_aggregate_chat(
                                                 state.qoder_sticky.unbind_uid(&win_uid);
                                             }
                                         }
+                                        // issue #90 修复①：同流式分支（非流式无部分流出概念）
+                                        if kind == UpstreamKind::Server {
+                                            note_model_server_cooldown(&model);
+                                        }
                                     }
                                     None => {
                                         state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                     }
                                 }
                                 *safe_lock(&state.last_error) = Some(format!(
-                                    "qoder uid={} code={} msg={}",
-                                    win_uid, code, msg
+                                    "qoder uid={} model={} code={} msg={} at {}",
+                                    win_uid,
+                                    model,
+                                    code,
+                                    msg,
+                                    now_cn_timestamp()
                                 ));
                                 state.logger.log_request_ttfb(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
@@ -1407,9 +1489,17 @@ pub async fn qoder_aggregate_chat(
                                         state.qoder_sticky.unbind_uid(&picked.uid);
                                     }
                                 }
+                                // issue #90 修复①：同流式 HTTP 分支（5xx 换号前记模型级冷却）
+                                if classified.kind == UpstreamKind::Server {
+                                    note_model_server_cooldown(&model);
+                                }
                                 *safe_lock(&state.last_error) = Some(format!(
-                                    "qoder uid={} status={}",
-                                    picked.uid, status
+                                    "qoder uid={} model={} status={} body={} at {}",
+                                    picked.uid,
+                                    model,
+                                    status,
+                                    safe_slice(&resp_body, 200),
+                                    now_cn_timestamp()
                                 ));
                                 // 记账口径对齐流式路径（每请求一行）：换号中间态不记
                                 // usage（原聚合路径每次换号多记一条失败，qoder 桶
@@ -1550,6 +1640,61 @@ fn internal_error_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== issue #90 修复①：Server 渐进模型级冷却 ====================
+
+    /// Server 冷却渐进递增且封顶；成功清除后归零。冷却表是进程级共享静态，
+    /// 用独占模型名（前缀 + 计数器）避免并行测试互扰。
+    #[test]
+    fn server_cooldown_progressive_capped_and_cleared() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t90-prog-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(model_cooling_remaining_secs(&model).is_none());
+        // 第 1 次失败：基准 30s
+        note_model_server_cooldown(&model);
+        let r1 = model_cooling_remaining_secs(&model).unwrap();
+        assert!(r1 > 28 && r1 <= 30, "首次失败应为 30s 基准，实际 {r1}");
+        // 第 2 次：翻倍至 60s（不缩短既有窗口 → 剩余必增）
+        std::thread::sleep(Duration::from_millis(1100));
+        note_model_server_cooldown(&model);
+        let r2 = model_cooling_remaining_secs(&model).unwrap();
+        assert!(r2 > r1, "连续失败冷却窗口应递增（{r1} → {r2}）");
+        // 连续失败至封顶：窗口恒 ≤ 600s
+        for _ in 0..8 {
+            note_model_server_cooldown(&model);
+        }
+        let capped = model_cooling_remaining_secs(&model).unwrap();
+        assert!(capped <= SERVER_COOLDOWN_MAX_SECS, "冷却窗口应封顶 600s，实际 {capped}");
+        // 成功清除 → 无冷却（渐进计数随之归零）
+        clear_model_cooldown(&model);
+        assert!(model_cooling_remaining_secs(&model).is_none());
+    }
+
+    /// 排队退避（note_model_cooldown）不缩短既有 Server 冷却窗口：排队建议值
+    /// （钳制 ≤30s）到达时若并发请求刚记了更长的 Server 窗口，应取较大者。
+    #[test]
+    fn queued_cooldown_does_not_shorten_server_window() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t90-queue-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        // 两次 Server 失败 → 窗口 60s
+        note_model_server_cooldown(&model);
+        note_model_server_cooldown(&model);
+        let before = model_cooling_remaining_secs(&model).unwrap();
+        // 排队退避建议 5s：不得把 60s 窗口缩短
+        note_model_cooldown(&model, 5);
+        let after = model_cooling_remaining_secs(&model).unwrap();
+        assert!(
+            after >= before.saturating_sub(1),
+            "排队建议值不得缩短既有 Server 窗口（{before} → {after}）"
+        );
+        clear_model_cooldown(&model);
+    }
 
     /// issue #82 T2.3：credits 复数优先（新版字段），单数 credit 为旧版兜底
     #[test]

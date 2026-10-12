@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { MessagesSquare } from 'lucide-react';
-import { Badge, EmptyState } from '../../components/ui';
+import { ChevronDown, ChevronRight, MessagesSquare } from 'lucide-react';
+import { Badge, EmptyState, Spinner } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { fmtCredits, fmtTokens } from '../../lib/format';
 import { useAppStore } from '../../store';
-import type { UsageSessionsResult } from '../../types';
+import type { UsageSessionView, UsageSessionsResult } from '../../types';
 import type { PlatformScope } from './KpiRow';
 
 /**
@@ -15,6 +15,8 @@ import type { PlatformScope } from './KpiRow';
  * 上游无 token/会话说明字段 → 相应列隐藏；
  * Qoder 数据源为 API 网关请求级本地流水（issue #82 问题5：官网无会话明细接口，
  * 由 record_usage_qoder 转发时逐请求落库），无费用/缓存 token 字段 → 相应列隐藏。
+ * Qoder 行支持展开看各轮请求级明细（键口径 session_id ∪ preview，纯本地零网络；
+ * 已被定时合并的历史区间展开仅返回聚合行）。
  */
 
 const PAGE_SIZE = 50;
@@ -56,6 +58,31 @@ export default function SessionsTab({
   // 选中某模型后下拉只剩该模型，无法直接切回其它模型（需先清筛选）。
   // 改为跨查询累计并集（切换平台时重置），下拉始终可选全部出现过的模型
   const [modelsUnion, setModelsUnion] = useState<string[]>([]);
+  // 会话展开明细（Qoder 专属）：expandedKey = 当前展开行 key；查询失败保留上次结果
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [detail, setDetail] = useState<UsageSessionView[] | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
+  const toggleDetail = (key: string, r: UsageSessionView) => {
+    if (expandedKey === key) {
+      setExpandedKey(null);
+      setDetail(null);
+      return;
+    }
+    setExpandedKey(key);
+    setDetail(null);
+    setDetailError(null);
+    setDetailLoading(true);
+    api.qoder
+      .sessionDetail({ date: r.date, uid: r.user_id, sessionId: r.session_id, preview: r.preview })
+      .then((rows) => {
+        setDetail(rows);
+        setDetailError(null);
+      })
+      .catch((err) => setDetailError(String(err)))
+      .finally(() => setDetailLoading(false));
+  };
 
   useEffect(() => {
     setModelsUnion([]);
@@ -220,6 +247,7 @@ export default function SessionsTab({
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
                 <tr>
+                  {scope === 'qoder' && <th className="w-8" />}
                   <th className="px-4 py-2 text-left">时间</th>
                   <th className="px-4 py-2 text-left">账号</th>
                   <th className="px-4 py-2 text-left">会话说明</th>
@@ -247,76 +275,30 @@ export default function SessionsTab({
                 </tr>
               </thead>
               <tbody>
-                {(data?.rows ?? []).map((r, idx) => (
-                  <tr
-                    key={`${r.user_id}-${r.session_id || 'x'}-${r.ts}-${idx}`}
-                    className="row-hover border-t border-slate-200 dark:border-zinc-800"
-                  >
-                    <td className="whitespace-nowrap px-4 py-2 text-xs tabular-nums text-slate-500">
-                      {fmtTime(r.ts)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-xs">
-                      {r.account_name || r.user_id}
-                    </td>
-                    {/* 概述开关关闭（T6.1）时仅隐藏展示（显示 '—'），不动缓存与查询 */}
-                    <td
-                      className="max-w-[260px] truncate px-4 py-2 text-xs"
-                      title={showPreview ? r.preview : undefined}
-                    >
-                      {showPreview ? r.preview || '—' : '—'}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-2 text-xs">
-                      <div className="flex items-center gap-1.5">
-                        <span>{r.model}</span>
-                        {r.mode && (
-                          <Badge tone="slate" title="会话模式">
-                            {r.mode}
-                          </Badge>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-2 text-right text-xs tabular-nums">
-                      {fmtCredits(r.credits)}
-                    </td>
-                    {richColumns && (
-                      <td
-                        className="px-4 py-2 text-right text-xs tabular-nums text-slate-500"
-                        title={
-                          r.input_tokens || r.output_tokens
-                            ? `输入 ${r.input_tokens.toLocaleString()} / 输出 ${r.output_tokens.toLocaleString()}`
-                            : undefined
-                        }
-                      >
-                        {r.input_tokens || r.output_tokens
-                          ? `${fmtTokens(r.input_tokens)} / ${fmtTokens(r.output_tokens)}`
-                          : '—'}
-                      </td>
-                    )}
-                    {showCacheCost && (
-                      <>
-                        <td
-                          className="px-4 py-2 text-right text-xs tabular-nums text-slate-400"
-                          title={
-                            r.cache_read_tokens || r.cache_write_tokens
-                              ? `缓存读 ${r.cache_read_tokens.toLocaleString()} / 缓存写 ${r.cache_write_tokens.toLocaleString()}`
-                              : undefined
-                          }
-                        >
-                          {r.cache_read_tokens || r.cache_write_tokens
-                            ? `${fmtTokens(r.cache_read_tokens)} / ${fmtTokens(r.cache_write_tokens)}`
-                            : '—'}
-                        </td>
-                        <td className="px-4 py-2 text-right text-xs tabular-nums text-slate-500">
-                          {r.cost_money > 0 ? `$${r.cost_money.toFixed(4)}` : '—'}
-                        </td>
-                      </>
-                    )}
-                  </tr>
-                ))}
+                {(data?.rows ?? []).map((r, idx) => {
+                  const rowKey = `${r.user_id}-${r.session_id || 'x'}-${r.ts}-${idx}`;
+                  return (
+                    <RowWithDetail
+                      key={rowKey}
+                      rowKey={rowKey}
+                      r={r}
+                      idx={idx}
+                      scope={scope}
+                      richColumns={richColumns}
+                      showCacheCost={showCacheCost}
+                      showPreview={showPreview}
+                      expanded={expandedKey === rowKey}
+                      detail={detail}
+                      detailLoading={detailLoading}
+                      detailError={detailError}
+                      onToggle={() => toggleDetail(rowKey, r)}
+                    />
+                  );
+                })}
                 {data && data.rows.length === 0 && (
                   <tr>
                     <td
-                      colSpan={5 + (richColumns ? 1 : 0) + (showCacheCost ? 2 : 0)}
+                      colSpan={5 + (richColumns ? 1 : 0) + (showCacheCost ? 2 : 0) + (scope === 'qoder' ? 1 : 0)}
                       className="px-4 py-6 text-center text-xs text-slate-400"
                     >
                       当前筛选条件下无会话记录
@@ -351,5 +333,165 @@ export default function SessionsTab({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * 单会话行 + Qoder 展开子行（「展开会话看各轮明细」）：
+ * 主行与原实现同列结构；qoder 作用域行首加展开 chevron，展开后请求级行
+ * 以子表渲染（时间 / 模型 / 积分 / Token / 轮 id）。非 qoder 平台无展开能力
+ * （Trae/Buddy 上游缓存无逐请求明细），直渲染主行。
+ */
+function RowWithDetail({
+  rowKey,
+  r,
+  idx,
+  scope,
+  richColumns,
+  showCacheCost,
+  showPreview,
+  expanded,
+  detail,
+  detailLoading,
+  detailError,
+  onToggle,
+}: {
+  rowKey: string;
+  r: UsageSessionView;
+  idx: number;
+  scope: PlatformScope;
+  richColumns: boolean;
+  showCacheCost: boolean;
+  showPreview: boolean;
+  expanded: boolean;
+  detail: UsageSessionView[] | null;
+  detailLoading: boolean;
+  detailError: string | null;
+  onToggle: () => void;
+}) {
+  const expandable = scope === 'qoder';
+  const span = 5 + (richColumns ? 1 : 0) + (showCacheCost ? 2 : 0) + (expandable ? 1 : 0);
+  return (
+    <>
+      <tr className="row-hover border-t border-slate-200 dark:border-zinc-800">
+        {expandable && (
+          <td className="px-2 py-2 text-center">
+            <button
+              className="btn-ghost !p-1 text-slate-400"
+              title={expanded ? '收起各轮明细' : '展开各轮请求明细'}
+              onClick={onToggle}
+            >
+              {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            </button>
+          </td>
+        )}
+        <td className="whitespace-nowrap px-4 py-2 text-xs tabular-nums text-slate-500">
+          {fmtTime(r.ts)}
+        </td>
+        <td className="whitespace-nowrap px-4 py-2 text-xs">
+          {r.account_name || r.user_id}
+        </td>
+        {/* 概述开关关闭（T6.1）时仅隐藏展示（显示 '—'），不动缓存与查询 */}
+        <td
+          className="max-w-[260px] truncate px-4 py-2 text-xs"
+          title={showPreview ? r.preview : undefined}
+        >
+          {showPreview ? r.preview || '—' : '—'}
+        </td>
+        <td className="whitespace-nowrap px-4 py-2 text-xs">
+          <div className="flex items-center gap-1.5">
+            <span>{r.model}</span>
+            {r.mode && (
+              <Badge tone="slate" title="会话模式">
+                {r.mode}
+              </Badge>
+            )}
+          </div>
+        </td>
+        <td className="px-4 py-2 text-right text-xs tabular-nums">
+          {fmtCredits(r.credits)}
+        </td>
+        {richColumns && (
+          <td
+            className="px-4 py-2 text-right text-xs tabular-nums text-slate-500"
+            title={
+              r.input_tokens || r.output_tokens
+                ? `输入 ${r.input_tokens.toLocaleString()} / 输出 ${r.output_tokens.toLocaleString()}`
+                : undefined
+            }
+          >
+            {r.input_tokens || r.output_tokens
+              ? `${fmtTokens(r.input_tokens)} / ${fmtTokens(r.output_tokens)}`
+              : '—'}
+          </td>
+        )}
+        {showCacheCost && (
+          <>
+            <td
+              className="px-4 py-2 text-right text-xs tabular-nums text-slate-400"
+              title={
+                r.cache_read_tokens || r.cache_write_tokens
+                  ? `缓存读 ${r.cache_read_tokens.toLocaleString()} / 缓存写 ${r.cache_write_tokens.toLocaleString()}`
+                  : undefined
+              }
+            >
+              {r.cache_read_tokens || r.cache_write_tokens
+                ? `${fmtTokens(r.cache_read_tokens)} / ${fmtTokens(r.cache_write_tokens)}`
+                : '—'}
+            </td>
+            <td className="px-4 py-2 text-right text-xs tabular-nums text-slate-500">
+              {r.cost_money > 0 ? `$${r.cost_money.toFixed(4)}` : '—'}
+            </td>
+          </>
+        )}
+      </tr>
+      {expandable && expanded && (
+        <tr key={`${rowKey}-detail`} className="border-t border-slate-100 bg-slate-50/60 dark:border-zinc-800 dark:bg-zinc-900/60">
+          <td colSpan={span} className="px-6 py-2">
+            {detailLoading && (
+              <div className="flex items-center gap-2 py-1 text-xs text-slate-400">
+                <Spinner /> 加载各轮明细…
+              </div>
+            )}
+            {detailError && (
+              <div className="py-1 text-xs text-rose-500">各轮明细查询失败：{detailError}</div>
+            )}
+            {!detailLoading && !detailError && (
+              <div className="space-y-1">
+                <div className="text-xs text-slate-400">
+                  共 {detail?.length ?? 0} 条请求（键口径：会话 ∪ 同说明；已被定时合并的历史区间仅剩聚合行）
+                </div>
+                {(detail ?? []).map((d, i) => (
+                  <div
+                    key={`${rowKey}-d-${i}`}
+                    className="flex flex-wrap items-center gap-x-4 gap-y-0.5 text-xs tabular-nums"
+                  >
+                    <span className="text-slate-500">{fmtTime(d.ts)}</span>
+                    <span>{d.model}</span>
+                    <span className="text-slate-500">
+                      {fmtCredits(d.credits)} 积分 ·{' '}
+                      {d.input_tokens || d.output_tokens
+                        ? `${fmtTokens(d.input_tokens)} / ${fmtTokens(d.output_tokens)}`
+                        : '—'}{' '}
+                      token
+                    </span>
+                    {d.preview && (
+                      <span className="max-w-[240px] truncate text-slate-400" title={d.preview}>
+                        {d.preview}
+                      </span>
+                    )}
+                    {d.record_id && (
+                      <span className="font-mono text-slate-300 dark:text-zinc-600" title={`轮键 ${d.record_id}`}>
+                        轮 {d.record_id.slice(0, 8)}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+    </>
   );
 }

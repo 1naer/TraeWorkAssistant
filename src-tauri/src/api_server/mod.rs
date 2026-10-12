@@ -296,6 +296,7 @@ impl ApiSharedState {
             is_stream,
             ok,
             &session.preview,
+            &session.record_id,
         );
         self.usage_dirty
             .lock()

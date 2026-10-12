@@ -223,6 +223,7 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 | `qoder-credits-snapshot` | 固定 23:40 | 每日积分快照落 `qoder_credits_history` | `qoder_credits_sync_hhmm` / `qoder_credits_sync_enabled` |
 | `qoder-refresh` | 每 6h | `ensure_fresh(lazy_hours=7)` 遍历池刷新 token，顺带 fresh 拉积分暖缓存 | `qoder_token_renew_enabled`（默认开） |
 | `qoder-catalog-sync` | 固定 05:50 | 真 COSY 签名拉 `model/list` → `adopt_remote` 替换 CN 缓存（按池序逐账号，任一成功即收口；空池静默跳过） | `qoder_catalog_sync_hhmm` / `qoder_catalog_sync_enabled` |
+| `qoder-sessions-compact` | 每 6h | 会话流水定时合并：早于保留窗（默认 3 天，`qoder_sessions_compact_days` 可配 1..=90）的 `qoder_sessions` 请求行按 (date, uid, preview) 合并单行（幂等自愈，积分/token 合计不变；历史行 session_id 为随机值故按 preview 归并；展示层 `qoder_sessions_query` 另有两遍读时聚合：session_id 桶 + preview 归并；`qoder_session_detail_query` 支持会话行展开看各轮请求级明细，轮键 = 信封 `chat_record_id`） | `qoder_sessions_compact_enabled`（默认开）/ `qoder_sessions_compact_days`（默认 3） |
 
 双轨机制：以上为应用内轨道（60s tick + 启动补跑 + 30min `RETRY_COOLDOWN_MS` + `scheduler_state.json` + `scheduler_status` 命令）；另一轨为 Windows `schtasks` 每日任务经主 exe `--task-run <name>` 兜底直调，注册命令 `qoder_checkin_task_register(times)`（配套 `_status` / `_unregister`）。
 

@@ -187,6 +187,12 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
+    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
+    let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
+    pool.set_reserve_credits(reserve_credits);
+    wb_pool.set_reserve_credits(reserve_credits);
+    qoder_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
         apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
 
@@ -414,6 +420,37 @@ pub async fn do_start(
         started_at: now,
     });
 
+    // 启动积分保鲜（issue #91 缓存问题）：池内存在陈旧/缺时间戳的积分快照时
+    // 后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新经 push_credits
+    // 回写拨新后自动恢复生效。静默失败不影响启动流程
+    {
+        let app2 = app.clone();
+        let st2 = state.clone();
+        std::thread::spawn(move || {
+            let rt_state = app2.state::<Mutex<Option<ApiServerRuntime>>>();
+            let Some(shared) = safe_lock(&rt_state).as_ref().map(|rt| rt.shared.clone()) else {
+                return; // runtime 未就绪（启动中途失败）
+            };
+            if !shared.pool.has_stale_credits() {
+                return;
+            }
+            fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
+            match crate::commands::accounts::refresh_remaining_credits_impl(
+                &st2,
+                Some(rt_state.inner()),
+            ) {
+                Ok(n) => fs_utils::app_log(
+                    &st2.data_dir,
+                    &format!("API服务启动-积分保鲜: 刷新完成 accounts={}", n),
+                ),
+                Err(e) => fs_utils::app_log(
+                    &st2.data_dir,
+                    &format!("API服务启动-积分保鲜: 刷新失败(不影响使用) {}", e),
+                ),
+            }
+        });
+    }
+
     // 同步托盘菜单文本 + 系统通知（账号数分池展示：Trae 池空 ≠ 无资源，Buddy 池可能正常服务）
     sync_tray_api_text(app, true);
     let notify_body = if pool_file.wb_enabled {
@@ -636,6 +673,14 @@ fn apply_pool_snapshot(
     // 与分组筛选取交集（D5 池语义：组 ∩ 标签，均空 = 不限）
     let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let trae_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.trae_tag_ids, &tag_map);
+    // 积分快照文件级采集时间（issue #91 缓存保鲜）：rfc3339 → unix 秒。
+    // 一次刷新全量写入 credits 与 updated_at，文件级时间戳对全体条目生效；
+    // 池据此判断 reserve 过滤新鲜度（陈旧快照 fail-open，见 pool.rs）
+    let credits_fetched_at = credits_file
+        .updated_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp());
     let trae_accounts: Vec<_> = match &trae_tag_filter {
         Some(set) => accounts
             .accounts
@@ -652,6 +697,7 @@ fn apply_pool_snapshot(
         &groups_file.membership,
         &cooldowns_file.cooldowns,
         &pool_credits,
+        credits_fetched_at,
         &merge_pool_expire_times(&credits_file),
         &device_map,
     );
@@ -1495,9 +1541,19 @@ pub fn dispatch_policy_get(
 #[tauri::command]
 pub fn dispatch_policy_set(
     state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     policy: crate::api_server::dispatch::DispatchPolicy,
 ) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
     crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
+    // 账号保留剩余积分（issue #91）热应用：保存后三池即时生效
+    //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
+    if let Some(rt) = safe_lock(&runtime).as_ref() {
+        rt.shared.pool.set_reserve_credits(policy.reserve_credits);
+        rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
+        rt.shared
+            .qoder_pool
+            .set_reserve_credits(policy.reserve_credits);
+    }
     Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
 }
 
@@ -1962,6 +2018,7 @@ mod pool_merge_tests {
             global_region: false,
             credits: None,
             credits_expire_at: None,
+            credits_fetched_at: None,
             needs_relogin: false,
             group_id: String::new(),
         };

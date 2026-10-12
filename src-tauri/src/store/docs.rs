@@ -365,6 +365,103 @@ mod tests {
         (d, s)
     }
 
+    /// qoder_sessions_compact 全链路（会话聚合修复后口径）：按 (date, uid, preview)
+    /// 归并（随机 session_id 旧行同轮归并）、跨账号不串组、近期窗不动、
+    /// 幂等（再跑 0 变更）、迟到行并入已合并组不双计、agg 前缀防御。
+    #[test]
+    fn qoder_sessions_compact_merges_idempotent_and_self_heals() {
+        let (dir, s) = tmp_store("qcompact");
+        let old = (chrono::Local::now().date_naive() - chrono::Duration::days(5))
+            .format("%Y-%m-%d")
+            .to_string();
+        let recent = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let ins = |s: &Store, rid: &str, sid: &str, uid: &str, date: &str, ts: i64,
+                   model: &str, credits: f64, pt: i64, ct: i64, preview: &str| {
+            qoder_session_insert(s, rid, sid, uid, date, ts, model, credits, pt, ct, 10, true, true, preview, "rec-1")
+        };
+        // 修复前旧行：同轮同 preview、随机 sid 各异（u1@旧日，3 行）
+        ins(&s, "r1", "aaaa", "u1", &old, 1000, "gpt", 1.0, 100, 10, "审查代码");
+        ins(&s, "r2", "bbbb", "u1", &old, 2000, "gpt", 2.0, 200, 20, "审查代码");
+        ins(&s, "r3", "cccc", "u1", &old, 3000, "pro", 3.0, 300, 30, "审查代码");
+        // 跨账号同 preview：必须独立成组不串账
+        ins(&s, "r4", "dddd", "u2", &old, 4000, "gpt", 4.0, 400, 40, "审查代码");
+        // 同会话不同轮（preview 不同）：独立组
+        ins(&s, "r5", "sess-1", "u1", &old, 5000, "gpt", 5.0, 500, 50, "第二轮");
+        // 空 preview（失败早退行）：独立组
+        ins(&s, "r6", "", "u1", &old, 6000, "gpt", 0.0, 0, 0, "");
+        // 近期窗内（date >= cutoff）：不合并
+        ins(&s, "r7", "sess-1", "u1", &recent, 7000, "gpt", 7.0, 700, 70, "今日轮");
+
+        let (merged, deleted) = qoder_sessions_compact(&s, 3).unwrap();
+        assert_eq!(merged, 4, "4 组：(u1,审查代码)/(u2,审查代码)/(u1,第二轮)/(u1,空)");
+        assert_eq!(deleted, 6, "删 6 条原始请求行");
+
+        let count = |s: &Store| -> i64 {
+            s.with_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM qoder_sessions", [], |r| r.get(0))
+            })
+            .unwrap()
+        };
+        assert_eq!(count(&s), 5, "4 聚合行 + 近期窗 1 行");
+
+        let agg1: (f64, i64, i64, i64, String, String, String) = s
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT credits, pt, ct, ts, model, session_id, preview FROM qoder_sessions WHERE request_id = ?1",
+                    [format!("agg:{old}:u1:{}", hex_str("审查代码")).as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            agg1,
+            (6.0, 600, 60, 3000, "pro".into(), "cccc".into(), "审查代码".into()),
+            "SUM 与最新请求取值（sid/model 随最新行）"
+        );
+
+        // 幂等：已合并组（仅含 agg 行）再跑零变更
+        let again = qoder_sessions_compact(&s, 3).unwrap();
+        assert_eq!(again, (0, 0), "幂等：无新行不重写");
+        assert_eq!(count(&s), 5);
+
+        // 迟到行并入已合并组：下次运行 OR REPLACE 覆盖，合计 = 原聚合 + 迟到值
+        ins(&s, "r8", "zzzz", "u1", &old, 3500, "gpt", 10.0, 1000, 100, "审查代码");
+        let healed = qoder_sessions_compact(&s, 3).unwrap();
+        assert_eq!(healed, (1, 1), "迟到行所在组重合并");
+        let agg2: f64 = s
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT credits FROM qoder_sessions WHERE request_id = ?1",
+                    [format!("agg:{old}:u1:{}", hex_str("审查代码")).as_str()],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(agg2, 16.0, "迟到行并入不双计");
+
+        // 防御（审查修复）：上游伪造 "agg:" 前缀 request_id 不得顶撞聚合行主键
+        ins(&s, "agg:2020-01-01:u1:x", "S1", "u1", &old, 9000, "x", 99.0, 0, 0, "审查代码");
+        let agg3: f64 = s
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT credits FROM qoder_sessions WHERE request_id = ?1",
+                    [format!("agg:{old}:u1:{}", hex_str("审查代码")).as_str()],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(agg3, 16.0, "伪造前缀 id 被换 uuid，聚合行未被覆盖");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 与 SQL hex(CAST(preview AS BLOB)) 对齐的测试辅助（UTF-8 字节 hex）
+    fn hex_str(s: &str) -> String {
+        s.bytes().map(|b| format!("{b:02X}")).collect()
+    }
+
     #[test]
     fn accounts_roundtrip_preserves_order_and_optional_uid() {
         let (dir, s) = tmp_store("acc");
@@ -1479,22 +1576,31 @@ pub fn qoder_session_insert(
     stream: bool,
     ok: bool,
     preview: &str,
+    record_id: &str,
 ) -> Result<(), String> {
+    // 防御（审查修复）：request_id 取自上游信封（外部可控字段），"agg:" 为
+    // qoder_sessions_compact 聚合行保留前缀（DELETE 排除与 HAVING 判定依据）；
+    // 上游伪造同前缀 id 会经 ON CONFLICT 顶撞/覆盖历史聚合行主键——入口统一换 uuid
+    let request_id = if request_id.starts_with("agg:") {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        request_id.to_string()
+    };
     s.with_conn(|c| {
         c.execute(
             "INSERT INTO qoder_sessions
-             (request_id, session_id, uid, date, ts, model, credits, pt, ct, duration_ms, stream, ok, preview)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             (request_id, session_id, uid, date, ts, model, credits, pt, ct, duration_ms, stream, ok, preview, record_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(request_id) DO UPDATE SET
                uid = excluded.uid, date = excluded.date, ts = excluded.ts,
                model = excluded.model, credits = excluded.credits,
                pt = excluded.pt, ct = excluded.ct,
                duration_ms = excluded.duration_ms, stream = excluded.stream,
-               ok = excluded.ok, preview = excluded.preview
+               ok = excluded.ok, preview = excluded.preview, record_id = excluded.record_id
              WHERE excluded.ts > qoder_sessions.ts",
             rusqlite::params![
                 request_id, session_id, uid, date, ts, model, credits, pt, ct,
-                duration_ms, stream as i64, ok as i64, preview
+                duration_ms, stream as i64, ok as i64, preview, record_id
             ],
         )?;
         Ok(())
@@ -1507,6 +1613,72 @@ pub fn qoder_sessions_prune(s: &Store, keep_days: i64) -> Result<usize, String> 
         .format("%Y-%m-%d")
         .to_string();
     s.with_conn(|c| Ok(c.execute("DELETE FROM qoder_sessions WHERE date < ?1", [cutoff.as_str()])?))
+}
+
+/// 合并保留窗默认值（天）：早于 N 天的请求级流水参与合并（date < today-N），
+/// 近 N 天保留请求级明细供排查；实际窗口经 settings.qoder_sessions_compact_days
+/// 可配（环境配置页，非法/越界回退本值并 clamp 1..=90）
+pub const QODER_SESSIONS_COMPACT_AFTER_DAYS: i64 = 3;
+
+/// qoder_sessions 定时合并（幂等，qoder-sessions-compact 调度任务调用）：
+/// 早于 before_days 的请求行按 **(date, uid, preview)** 合并为单行
+/// （request_id = "agg:<date>:<uid>:<hex(preview)>"，hex 编码防 preview 冒号
+/// 与超长污染主键）。
+///
+/// 分组键不含 session_id 是刻意的：历史落库行 session_id 为每请求随机值
+/// （修复前的 seed 缺口），按 session_id 分组对旧行「每组一行」等于没合并；
+/// 同轮请求 preview 恒相同（末条 user 消息），同轮归并即可压缩体积，
+/// 页面读时聚合（aggregate_session_rows 两遍归并）再按 session_id 恢复会话级。
+///
+/// - SUM(credits/pt/ct)：合并前后行和恒一致；
+/// - ts/session_id/model/preview：取组内最新请求（ORDER BY ts DESC,
+///   request_id DESC，相关子查询引用 GROUP BY 列，SQLite 合法）；
+/// - duration_ms/stream/ok：合并行不携带请求级语义，落 0/0/1（查询层不消费）；
+/// - 幂等：已合并组（仅含 agg 行）经 HAVING 剔除不再重写；迟到行并入组后
+///   下次运行 OR REPLACE 覆盖聚合行，累计正确不双计；
+/// - 两步同事务（审查修复）：INSERT 与 DELETE 原子提交，中断整体回滚，
+///   绝不遗留「聚合行+原始行」并存——并存会使读时聚合双倍展示，且下次
+///   重跑 SUM 把旧聚合行自身计入而双倍固化（HAVING 仅要求组内有非 agg 行，
+///   拦不住该场景，依赖事务保证）；
+/// - 空 preview 行（失败早退）同组归并（同日同账号），合计诚实不隐藏。
+///
+/// 返回 (本次合并的会话组数, 删除的原始请求行数)。
+pub fn qoder_sessions_compact(s: &Store, before_days: i64) -> Result<(usize, usize), String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(before_days))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        // 两步同事务（审查修复）：INSERT 与 DELETE 原子提交——中断（进程退出/
+        // 语句报错）整体回滚，绝不遗留「聚合行+原始行」并存（并存会读时双倍
+        // 展示，且下次重跑 SUM 把旧聚合行计入而双倍固化）
+        let tx = c.unchecked_transaction()?;
+        let merged = tx.execute(
+            "INSERT OR REPLACE INTO qoder_sessions
+             (request_id, session_id, uid, date, ts, model, credits, pt, ct, duration_ms, stream, ok, preview)
+             SELECT 'agg:' || date || ':' || uid || ':' || hex(CAST(preview AS BLOB)),
+                    (SELECT x.session_id FROM qoder_sessions x
+                      WHERE x.date = q.date AND x.uid = q.uid AND x.preview = q.preview
+                      ORDER BY x.ts DESC, x.request_id DESC LIMIT 1),
+                    uid, date, MAX(ts),
+                    (SELECT x.model FROM qoder_sessions x
+                      WHERE x.date = q.date AND x.uid = q.uid AND x.preview = q.preview
+                      ORDER BY x.ts DESC, x.request_id DESC LIMIT 1),
+                    SUM(credits), SUM(pt), SUM(ct), 0, 0, 1,
+                    preview
+             FROM qoder_sessions q
+             WHERE q.date < ?1
+             GROUP BY q.date, q.uid, q.preview
+             HAVING SUM(request_id NOT LIKE 'agg:%') > 0",
+            [&cutoff],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM qoder_sessions
+             WHERE date < ?1 AND request_id NOT LIKE 'agg:%'",
+            [&cutoff],
+        )?;
+        tx.commit()?;
+        Ok((merged, deleted))
+    })
 }
 
 // ── Trae 积分流水（credits_history.json → credits_history 表）────────────────
