@@ -408,6 +408,17 @@ fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Opti
     if unified_catalog::whitelist_allows(&list, model) {
         return None;
     }
+    // issue #90 修复③a：池前缀模型 id（trae/xxx 等）按裸名准入——dispatch 与
+    // /v1/models 别名条目使用同一前缀语义，启用白名单的部署不得在准入层拦截。
+    // 分层检查：先原始名（覆盖白名单字面量含前缀条目的配置），再裸名兜底；
+    // 拒绝信息保留用户请求的原始名（显示裸名会让人误以为请求的是另一个模型）
+    let bare = super::dispatch::split_pool_prefix(model).map(|(_, bare)| bare);
+    if let Some(bare) = bare {
+        if unified_catalog::whitelist_allows(&list, bare) {
+            return None;
+        }
+    }
+    let model = bare.unwrap_or(model);
     // issue #38 实测修复：`-max` / `-thinking` 等入口后缀在 dispatch ② 段才剥离，
     // 白名单须按同一剥离规则对基名放行——否则启用白名单的部署下，Max Mode /
     // 路由后缀入口在准入层就被 404 拦截，整个能力不可用（剥离规则与 dispatch 同源，
@@ -588,6 +599,10 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
     let data_dir = state.data_dir.clone();
+    // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
+    // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
+    // 客户端（如 CC Switch）可在同名模型间区分来源池（三家倍率与效果不同）
+    let source_labels = dispatch::load_policy(&data_dir).model_source_labels;
     let list = tokio::task::spawn_blocking(move || {
         // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
         unified_catalog::unified_models_whitelisted_ex(
@@ -601,7 +616,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     .await
     .unwrap_or_default();
     // wb_enabled=false：仅 Buddy 源的模型过滤，双源模型保留（仍可由 Trae 源服务 §3.4）
-    let data: Vec<Value> = list
+    let mut data: Vec<Value> = list
         .iter()
         .filter(|m| wb_enabled || !m.sources.iter().all(|s| s.pool == "buddy"))
         .map(|m| {
@@ -626,6 +641,34 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             })
         })
         .collect();
+    // issue #90 修复③a：多源同名模型的池前缀别名条目（开关开启时追加，不改写
+    // 原有 id——已有客户端零影响）。带前缀 id 请求经 resolve_target 锁定该池，
+    // 白名单按裸名放行（whitelist_check 同步剥离）；别名条目随基础条目白名单
+    // 过滤结果派生，不重复过滤
+    if source_labels {
+        for m in list.iter().filter(|m| m.sources.len() >= 2) {
+            for s in m.sources.iter().filter(|s| s.pool != "custom") {
+                data.push(json!({
+                    "id": format!("{}/{}", s.pool, m.id),
+                    "object": "model",
+                    "created": 1753600000,
+                    "owned_by": "unified",
+                    "display": format!("[{}] {}", s.pool, m.display),
+                    "rate": s.rate,
+                    "context_length": m.context_length,
+                    "max_tokens": m.max_tokens,
+                    "supports_image": m.supports_image,
+                    "supported_efforts": m.efforts,
+                    "max_mode": m.max_mode,
+                    "sources": m.sources,
+                    // 别名标记：客户端可据此折叠展示；source_pool = 该 id 实际锁定的池
+                    "alias_of": m.id,
+                    "source_pool": s.pool,
+                    "manual": m.manual,
+                }));
+            }
+        }
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 

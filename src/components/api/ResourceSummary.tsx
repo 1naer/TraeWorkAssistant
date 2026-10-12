@@ -275,6 +275,18 @@ function DispatchCenterCard({
             />
             首选池不可用时跨池回退
           </label>
+          {/* issue #90 修复③a：多源同名模型来源标识（/v1/models 池前缀别名条目） */}
+          <label
+            className="flex items-center gap-1.5 text-slate-500 dark:text-zinc-400"
+            title="/v1/models 为多源同名模型附带 trae/xxx、buddy/xxx、qoder/xxx 别名条目，客户端可按前缀点名指定池（三家同名模型倍率与效果不同）；关闭时目录保持原形态"
+          >
+            <input
+              type="checkbox"
+              checked={policy.model_source_labels}
+              onChange={(e) => void savePolicy({ model_source_labels: e.target.checked })}
+            />
+            模型目录标注来源池
+          </label>
           <label
             className="flex items-center gap-2"
             title="剩余积分低于或等于该值的账号暂停调度（切换其他账号），防止积分被耗尽后免费模型也不可用；0 = 关闭"

@@ -66,6 +66,18 @@ impl TargetPool {
     }
 }
 
+/// 解析池前缀模型 id（issue #90 修复③a）：`trae/xxx` / `buddy/xxx` / `qoder/xxx`
+/// → (锁定池, 裸模型名)。custom 不参与前缀（自定义模型走 custom_models 直达）。
+/// 前缀段/裸名均 trim + 小写比对；裸名为空视为无效前缀，原样透传（不误吞
+/// 斜杠模型名）。白名单准入（routes::whitelist_check）复用本函数剥离前缀。
+pub(crate) fn split_pool_prefix(model: &str) -> Option<(TargetPool, &str)> {
+    let (prefix, bare) = model.split_once('/')?;
+    if bare.trim().is_empty() {
+        return None;
+    }
+    Some((TargetPool::parse(prefix)?, bare.trim()))
+}
+
 // ==================== 调度策略配置（§4.2） ====================
 
 /// 池间调度策略
@@ -104,6 +116,12 @@ pub struct DispatchPolicy {
     /// 默认 50——防止账号积分被调度耗尽后连免费模型也不可用
     #[serde(default = "default_reserve_credits")]
     pub reserve_credits: f64,
+    /// /v1/models 为多源同名模型附带池前缀别名条目（issue #90 修复③a）：
+    /// `trae/xxx` / `buddy/xxx` / `qoder/xxx`——三家池同名模型倍率与效果不同，
+    /// 开启后客户端可按前缀点名指定池服务（resolve_target 按前缀锁定单池）。
+    /// 默认关（目录保持原形态，零行为差异）
+    #[serde(default)]
+    pub model_source_labels: bool,
     #[serde(default)]
     pub updated_at: i64,
 }
@@ -124,6 +142,7 @@ impl Default for DispatchPolicy {
             per_model: HashMap::new(),
             fallback: true,
             reserve_credits: default_reserve_credits(),
+            model_source_labels: false,
             updated_at: 0,
         }
     }
@@ -321,18 +340,29 @@ pub fn resolve_target(
     // 端点层 model 仅过滤非空未 trim：入口统一去空白（strip_route_suffix 后缀
     // 匹配 / canonical 比对 / Custom 条目查找均依赖干净形态，错误信息同步受益）
     let model = model.trim();
+    // issue #90 修复③a：池前缀模型 id（`trae/xxx` / `buddy/xxx` / `qoder/xxx`）
+    // 显式锁定服务池——单池候选、跳过粘性/per_model/smart 重排，不可用即显式
+    // 报错不跨池回退（用户点名的就是这一池；前缀语义 > Key 绑定与全局策略）
+    let (forced_pool, model) = match split_pool_prefix(model) {
+        Some((pool, bare)) => (Some(pool), bare),
+        None => (None, model),
+    };
     // ⓪ 自定义模型直达（custom_models.json 命中 enabled 条目）：用户显式配置
     // 优先于内置目录；单源无跨池回退，模型名原样透传（custom_route 按条目
-    // base_url/key 直连）。mtime 缓存读取，未配置时零开销跳过
-    if let Some(cm) = super::custom_models::find_enabled(&state.data_dir, model) {
-        let _ = cm; // 命中信息由执行路径重新按 data_dir 读取（条目可能热更新）
-        return Ok(Resolved {
-            pool: TargetPool::Custom,
-            model: model.to_string(),
-            effort_hint: None,
-            max_mode_hint: false,
-            fallback_from: None,
-        });
+    // base_url/key 直连）。mtime 缓存读取，未配置时零开销跳过。
+    // issue #90 修复③a：池前缀锁定（trae/xxx 等）时跳过 custom 短路——否则
+    // 自定义模型与裸名同名时会劫持显式锁池请求到 Custom 池
+    if forced_pool.is_none() {
+        if let Some(cm) = super::custom_models::find_enabled(&state.data_dir, model) {
+            let _ = cm; // 命中信息由执行路径重新按 data_dir 读取（条目可能热更新）
+            return Ok(Resolved {
+                pool: TargetPool::Custom,
+                model: model.to_string(),
+                effort_hint: None,
+                max_mode_hint: false,
+                fallback_from: None,
+            });
+        }
     }
 
     // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
@@ -487,7 +517,13 @@ pub fn resolve_target(
     // Key 绑定池优先于粘性：粘性池 ≠ 绑定池时不沿用（重新按候选序选池）
     let sticky_key = pool_session_key(body);
     if let Some(sk) = &sticky_key {
-        if let Some(pool) = take_sticky(state, sk) {
+        // issue #90 修复③a：前缀锁定池时跳过粘性（粘住的是调度选择，显式点名优先）
+        let sticky_pool = if forced_pool.is_none() {
+            take_sticky(state, sk)
+        } else {
+            None
+        };
+        if let Some(pool) = sticky_pool {
             if bind.map_or(true, |b| pool.as_str() == b)
                 && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled)
                 && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref())
@@ -507,7 +543,10 @@ pub fn resolve_target(
     // ④ 按策略优先级序选池：有绑定时强制 [绑定池, 另一池] 候选序，跳过
     // per_model 与 smart 重排（用户 Key 级显式配置优先于全局策略）
     let policy = load_policy(&state.data_dir);
-    let mut order: Vec<TargetPool> = if let Some(b) = bind {
+    let mut order: Vec<TargetPool> = if let Some(p) = forced_pool {
+        // issue #90 修复③a：单池候选（不追加其他池，无跨池回退）
+        vec![p]
+    } else if let Some(b) = bind {
         // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"qoder"，无需再 parse
         if b == "trae" {
             vec![TargetPool::Trae, TargetPool::Buddy]
@@ -529,15 +568,18 @@ pub fn resolve_target(
             .collect()
     };
     // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
-    for p in [TargetPool::Buddy, TargetPool::Trae, TargetPool::Qoder] {
-        if !order.contains(&p) {
-            order.push(p);
+    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加）
+    if forced_pool.is_none() {
+        for p in [TargetPool::Buddy, TargetPool::Trae, TargetPool::Qoder] {
+            if !order.contains(&p) {
+                order.push(p);
+            }
         }
     }
     // ④+ 智能调度（strategy=smart）：可用源 ≥2 且无 per_model 显式覆盖时，
     // 按请求模型对候选池重排（到期 → 倍率/免费 → 积分多；并列保持优先级序）。
-    // 有绑定时跳过（绑定序即最终候选序）
-    if bind.is_none()
+    // 有绑定/前缀锁定时跳过（绑定序/单池即最终候选序）
+    if forced_pool.is_none() && bind.is_none()
         && policy.strategy == DispatchStrategy::Smart
         && policy.per_model.get(&canonical).is_none()
         && sources.available_count(trae_enabled, wb_enabled, qoder_enabled) >= 2
@@ -622,7 +664,9 @@ pub fn resolve_target(
         );
     }
     Err(DispatchError::NoHealthy(
-        preferred.unwrap_or(TargetPool::Trae),
+        // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
+        // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
+        forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
     ))
 }
 
@@ -1049,6 +1093,81 @@ mod tests {
     fn policy_default() -> DispatchPolicy {
         DispatchPolicy::default()
     }
+
+    // ---------- issue #90 修复③a：池前缀模型 id ----------
+
+    /// split_pool_prefix：合法前缀解析（trim/大小写宽容）；custom、未知池名、
+    /// 空裸名、无前缀 → None（原样透传，不误吞斜杠模型名）
+    #[test]
+    fn t90_split_pool_prefix_parse() {
+        assert_eq!(
+            split_pool_prefix("trae/glm-5.3"),
+            Some((TargetPool::Trae, "glm-5.3"))
+        );
+        assert_eq!(
+            split_pool_prefix("Qoder/DeepSeek-Flash"),
+            Some((TargetPool::Qoder, "DeepSeek-Flash"))
+        );
+        assert_eq!(
+            split_pool_prefix(" buddy/ hy4 "),
+            Some((TargetPool::Buddy, "hy4"))
+        );
+        assert_eq!(split_pool_prefix("custom/m1"), None);
+        assert_eq!(split_pool_prefix("openai/gpt-4o"), None);
+        assert_eq!(split_pool_prefix("trae/"), None);
+        assert_eq!(split_pool_prefix("glm-5.3"), None);
+    }
+
+    /// 前缀锁定：默认策略 Buddy 优先，`trae/` 前缀强制 Trae 胜出、`buddy/` 维持
+    /// Buddy；Resolved.model 均剥为裸名（执行路径按裸名解析目录）
+    #[test]
+    fn t90_prefix_locks_pool_over_policy() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve("trae/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+        let r = f.resolve("buddy/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "glm-5.3");
+    }
+
+    /// 锁定池无该模型源/池耗尽 → NoHealthy(锁定池)，不回退其他池、不误报 Trae
+    #[test]
+    fn t90_prefix_unavailable_source_errors_locked_pool() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(
+            f.resolve("qoder/glm-5.3").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Qoder)
+        );
+    }
+
+    /// 前缀锁池优先于 custom 短路：自定义模型与裸名同名（glm-5.3）时，
+    /// `trae/glm-5.3` 不得被 ⓪ 段 custom 直达劫持到 Custom 池
+    /// （issue #90 修复③a 审查修正回归）
+    #[test]
+    fn t90_prefix_lock_not_hijacked_by_same_name_custom() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let cm: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "name": "glm-5.3",
+            "base_url": "https://custom.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        super::super::custom_models::upsert(&f.dir, cm).unwrap();
+        // 裸名仍走 custom 直达（原语义不变）
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Custom);
+        // 前缀锁池不被劫持：显式点名 Trae 池服务
+        let r = f.resolve_no_session("trae/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+    }
+
 
     /// 覆写 Buddy 目录为仅含 `keep` 的显式条目（builtin_rev 拉平退出内置重建）：
     /// fixture 的 wb_model_catalog 写入缺 builtin_rev 会被 wb_catalog::load 重建为

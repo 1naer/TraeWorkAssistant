@@ -2260,6 +2260,41 @@ pub fn prepare_qoder_body(
 mod tests {
     use super::*;
 
+    // ── issue #90 修复③b：跨池命名别名归一 ──
+
+    /// Trae 侧命名（deepseek4.1flash）与空格变体（workbuddy 侧 deepseek flash）
+    /// 均归一到 Qoder 目录名 deepseek-flash；Qoder 原生名与未知名原样透传
+    #[test]
+    fn model_alias_normalizes_cross_pool_names() {
+        // 显式别名表：Trae 命名变体
+        assert_eq!(normalize_model_alias("deepseek4.1flash"), "deepseek-flash");
+        assert_eq!(normalize_model_alias("DeepSeek-4.1-Flash"), "deepseek-flash");
+        assert_eq!(normalize_model_alias("deepseek-4.1flash"), "deepseek-flash");
+        // 空格变体统一归一为连字符（workbuddy 侧 "deepseek flash"）
+        assert_eq!(normalize_model_alias("deepseek flash"), "deepseek-flash");
+        // Qoder 原生命名：大小写/空白归一但不改写
+        assert_eq!(normalize_model_alias("  DeepSeek-Flash "), "deepseek-flash");
+        // 未收录模型：无损透传（不猜测、不误路由）
+        assert_eq!(normalize_model_alias("glm-5.3"), "glm-5.3");
+        assert_eq!(normalize_model_alias("unknown-model"), "unknown-model");
+    }
+
+    /// 归一后的名字可命中目录：fallback 兜底表中 DeepSeek-Flash 可被
+    /// deepseek4.1flash 解析到（走真实 resolve 链路，不依赖远程目录状态）
+    #[test]
+    fn resolve_accepts_trae_named_deepseek() {
+        let entry = resolve("deepseek4.1flash", QoderRegion::Cn)
+            .or_else(|| resolve("deepseek flash", QoderRegion::Cn));
+        let entry = entry.expect("别名应命中 DeepSeek-Flash 兜底目录条目");
+        let key = entry
+            .get("upstreamKey")
+            .or_else(|| entry.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(key.contains("dfmodel") || key == "deepseek-flash", "实际命中 {key}");
+    }
+
     // ── 工具 ──
 
     /// 构造一帧上游信封行（body 为内层 JSON 字符串）

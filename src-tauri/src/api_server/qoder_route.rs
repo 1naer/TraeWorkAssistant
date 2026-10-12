@@ -95,22 +95,35 @@ fn note_model_cooldown(model: &str, secs: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(model.to_string())
-        .and_modify(|(until, _)| *until = Instant::now() + Duration::from_secs(secs))
+        // 取较大者：既有 Server 渐进冷却窗口（可能远长于排队建议值）不得被
+        // 本次建议值缩短（issue #90 修复①配套语义，queued_cooldown 测试固化）
+        .and_modify(|(until, _)| {
+            let candidate = Instant::now() + Duration::from_secs(secs);
+            if candidate > *until {
+                *until = candidate;
+            }
+        })
         .or_insert_with(|| (Instant::now() + Duration::from_secs(secs), 0));
 }
 
 /// Server 类错误（上游 5xx / 业务 504「上游服务异常」）模型级渐进冷却
-/// （issue #90 修复①）：连续失败次数 +1，冷却窗口 = min(30s × 2^(n-1), 600s)，
-/// 且不缩短既有冷却截止（并发请求刚记录过更长窗口时取较大者）。此前 504 只
-/// 做账号级 note_error + 换号，模型级冷却永不变热 → dispatch 预检永不触发
-/// 跨池回退，多源模型持续硬打已知 504 的上游（issue #90 主诉）。
+/// （issue #90 修复①）：冷却窗口 = min(30s × 2^n, 600s)，n = 失败片段数。
+/// **递增条件是既有窗口已过期**而非调用次数——流内/HTTP 两路径在 !sent_any
+/// 时都会 `break` 逐账号换号，一次请求内连续换号会对同一模型记账多次；若按
+/// 调用次数递增，5 账号一次请求即可把窗口推到 480s，把「跨片段渐进」放大成
+/// 「单请求轮换放大」，恢复探测被拉长到 8 分钟。按片段计数后：同请求内换号
+/// （窗口未过期）不递增，探测节奏 = 冷却窗口（30s→60s→…→10min），成功即清。
 fn note_model_server_cooldown(model: &str) {
     cooldown_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(model.to_string())
         .and_modify(|(until, fails)| {
-            *fails = fails.saturating_add(1);
+            // 既有窗口已过期 = 新一次失败片段 → 递增；未过期 = 同片段内的
+            // 换号/并发失败，仅维持/延长窗口
+            if Instant::now() >= *until {
+                *fails = fails.saturating_add(1);
+            }
             let delay = (SERVER_COOLDOWN_BASE_SECS << (*fails - 1).min(4))
                 .min(SERVER_COOLDOWN_MAX_SECS);
             let candidate = Instant::now() + Duration::from_secs(delay);
@@ -130,7 +143,7 @@ fn note_model_server_cooldown(model: &str) {
 pub fn model_cooling_remaining_secs(model: &str) -> Option<u64> {
     let map = cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
     let until = map.get(model)?;
-    let left = until.saturating_duration_since(Instant::now());
+    let left = until.0.saturating_duration_since(Instant::now());
     if left.is_zero() {
         None
     } else {
@@ -1643,8 +1656,8 @@ mod tests {
 
     // ==================== issue #90 修复①：Server 渐进模型级冷却 ====================
 
-    /// Server 冷却渐进递增且封顶；成功清除后归零。冷却表是进程级共享静态，
-    /// 用独占模型名（前缀 + 计数器）避免并行测试互扰。
+    /// Server 冷却按「失败片段」渐进（窗口过期才递增）且封顶；成功清除后归零。
+    /// 冷却表是进程级共享静态，用独占模型名（前缀 + 计数器）避免并行测试互扰。
     #[test]
     fn server_cooldown_progressive_capped_and_cleared() {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1653,22 +1666,46 @@ mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         assert!(model_cooling_remaining_secs(&model).is_none());
-        // 第 1 次失败：基准 30s
+        // 片段 1：基准 30s
         note_model_server_cooldown(&model);
         let r1 = model_cooling_remaining_secs(&model).unwrap();
         assert!(r1 > 28 && r1 <= 30, "首次失败应为 30s 基准，实际 {r1}");
-        // 第 2 次：翻倍至 60s（不缩短既有窗口 → 剩余必增）
-        std::thread::sleep(Duration::from_millis(1100));
+        // 同片段内连续记账（一次请求逐账号换号场景，窗口未过期）：
+        // 不递增片段数，窗口仅延长（剩余仍 ≈30s，绝不翻倍）
+        for _ in 0..4 {
+            note_model_server_cooldown(&model);
+        }
+        let (_, fails) = *cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&model)
+            .unwrap();
+        assert_eq!(fails, 1, "窗口未过期时连续记账不得递增片段数");
+        // 人为推进到窗口过期（不真等 30s）：片段 2 → 翻倍 60s
+        cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model.clone(), (Instant::now() - Duration::from_secs(1), 1));
         note_model_server_cooldown(&model);
         let r2 = model_cooling_remaining_secs(&model).unwrap();
-        assert!(r2 > r1, "连续失败冷却窗口应递增（{r1} → {r2}）");
-        // 连续失败至封顶：窗口恒 ≤ 600s
-        for _ in 0..8 {
+        assert!(r2 > 55 && r2 <= 60, "过期后新片段应翻倍至 60s，实际 {r2}");
+        // 连续失败片段至封顶：窗口恒 ≤ 600s
+        for _ in 0..10 {
+            let cur = cooldown_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&model)
+                .copied()
+                .unwrap();
+            cooldown_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(model.clone(), (Instant::now() - Duration::from_secs(1), cur.1));
             note_model_server_cooldown(&model);
         }
         let capped = model_cooling_remaining_secs(&model).unwrap();
         assert!(capped <= SERVER_COOLDOWN_MAX_SECS, "冷却窗口应封顶 600s，实际 {capped}");
-        // 成功清除 → 无冷却（渐进计数随之归零）
+        // 成功清除 → 无冷却（片段计数随之归零）
         clear_model_cooldown(&model);
         assert!(model_cooling_remaining_secs(&model).is_none());
     }

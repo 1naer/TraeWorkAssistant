@@ -596,6 +596,8 @@ export interface DispatchPolicy {
   per_model: Record<string, string[]>;
   /** 双源首选池不可用时按序回退 */
   fallback: boolean;
+  /** /v1/models 为多源同名模型附带池前缀别名条目（trae/xxx 等，issue #90 修复③a）；默认关 */
+  model_source_labels: boolean;
   /** 账号保留剩余积分（issue #91）：剩余 ≤ 该值的账号暂停调度（0 = 关闭），默认 50 */
   reserve_credits: number;
   updated_at: number;
