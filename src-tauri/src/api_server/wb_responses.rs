@@ -512,13 +512,25 @@ pub fn completion_to_responses(
         "error": null,
         "usage": {
             "input_tokens": it,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": v.get("usage").map(cached_tokens_of).unwrap_or(0)},
             "output_tokens": ot,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": it + ot,
         },
         "stop_reason": if finish == "tool_calls" { json!("tool_use") } else { json!(null) },
     })
+}
+
+fn cached_tokens_of(u: &Value) -> u64 {
+    [
+        "cache_read_input_tokens",
+        "cache_read_token",
+        "cached_tokens",
+        "cache_read_tokens",
+    ]
+        .iter()
+        .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
+        .unwrap_or(0)
 }
 
 fn u64_pair(u: &Value) -> (u64, u64) {

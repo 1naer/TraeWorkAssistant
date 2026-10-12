@@ -274,7 +274,9 @@ fn stream_convert_src(
                     }
                 }
                 "token_usage" => {
-                    pending_usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
+                    pending_usage = Some(normalize_openai_usage(
+                        &ev.usage.clone().unwrap_or(json!({})),
+                    ));
                 }
                 "done" | "turn_completion" => {
                     if !has_content {
@@ -408,7 +410,9 @@ fn stream_convert_text_src(
                     }
                 }
                 "token_usage" => {
-                    pending_usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
+                    pending_usage = Some(normalize_openai_usage(
+                        &ev.usage.clone().unwrap_or(json!({})),
+                    ));
                 }
                 "done" | "turn_completion" => {
                     if !has_content {
@@ -503,7 +507,7 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                     out.reasoning.push_str(&ev.reasoning);
                 }
                 "token_usage" => {
-                    out.usage = Some(json!(ev.usage.unwrap_or(json!({}))));
+                    out.usage = Some(normalize_openai_usage(&ev.usage.unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
                     if !ev.finish_reason.is_empty() {
@@ -617,6 +621,38 @@ fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter().find_map(|k| u.get(*k).and_then(|v| v.as_i64()))
 }
 
+/// 上游缓存读 tokens：WB token_usage 事件字段为 cache_read_token（与用量历史
+/// extra_info 同源口径），兼容 OpenAI 风格 cached_tokens / cache_read_tokens
+fn cached_tokens_i64(u: &Value) -> i64 {
+    // 实证（2026-10-13 glm-5.3-flash 上游抓包）：WB token_usage 事件字段为
+    // cache_read_input_tokens（另有 cache_creation_input_tokens 写入侧）；
+    // 保留 cache_read_token（用量历史 extra_info 口径）与 OpenAI 风格键兜底
+    usage_i64(
+        u,
+        &[
+            "cache_read_input_tokens",
+            "cache_read_token",
+            "cached_tokens",
+            "cache_read_tokens",
+        ],
+    )
+    .unwrap_or(0)
+}
+
+/// 归一化 OpenAI usage：WB token_usage 原始字段（cache_read_token 等）→
+/// OpenAI 标准（prompt_tokens/completion_tokens + prompt_tokens_details.cached_tokens）。
+/// 下游（CPA 等）只认标准字段，直接透传原始事件会导致缓存读恒为 0。
+fn normalize_openai_usage(u: &Value) -> Value {
+    let prompt = usage_i64(u, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
+    let completion = usage_i64(u, &["completion_tokens", "output_tokens"]).unwrap_or(0);
+    json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": { "cached_tokens": cached_tokens_i64(u) },
+    })
+}
+
 fn anthropic_event(name: &str, data: &Value) -> String {
     format!("event: {}\ndata: {}\n\n", name, data)
 }
@@ -683,7 +719,11 @@ fn stream_convert_anthropic_src(
                             "content": [],
                             "stop_reason": null,
                             "stop_sequence": null,
-                            "usage": { "input_tokens": 0, "output_tokens": 0 },
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_input_tokens": 0,
+                            },
                         },
                     })
                 );
@@ -757,8 +797,10 @@ fn stream_convert_anthropic_src(
                 );
             }
             let mut out_tokens = None;
+            let mut cached_tokens = 0i64;
             if let Some(u) = &usage {
                 out_tokens = usage_i64(u, &["output_tokens", "completion_tokens"]);
+                cached_tokens = cached_tokens_i64(u);
             }
             let mut message_delta = json!({
                 "type": "message_delta",
@@ -770,6 +812,9 @@ fn stream_convert_anthropic_src(
             });
             if let Some(o) = out_tokens {
                 message_delta["usage"]["output_tokens"] = json!(o);
+            }
+            if cached_tokens > 0 {
+                message_delta["usage"]["cache_read_input_tokens"] = json!(cached_tokens);
             }
             send_event!("message_delta", message_delta);
             send_event!("message_stop", json!({ "type": "message_stop" }));
@@ -1070,6 +1115,10 @@ pub fn aggregate_anthropic<R: Read + Send>(
         if let Some(v) = usage_i64(u, &["output_tokens", "completion_tokens"]) {
             usage_obj["output_tokens"] = json!(v);
         }
+        let cached = cached_tokens_i64(u);
+        if cached > 0 {
+            usage_obj["cache_read_input_tokens"] = json!(cached);
+        }
     }
 
     let resp = json!({
@@ -1284,5 +1333,41 @@ mod tests {
         // Anthropic 有文本块 → 非空
         let blocks = serde_json::json!({"content": [{"type": "text", "text": "hi"}]});
         assert!(!crate::api_server::aggregated_response_is_empty(&blocks));
+    }
+    #[test]
+    fn normalize_openai_usage_maps_cache_read_token() {
+        // WB token_usage 事件（上游字段 cache_read_token）→ OpenAI 标准 usage
+        let u = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "cache_read_token": 80,
+            "cache_write_token": 5,
+        });
+        let n = normalize_openai_usage(&u);
+        assert_eq!(n["prompt_tokens"], serde_json::json!(100));
+        assert_eq!(n["completion_tokens"], serde_json::json!(20));
+        assert_eq!(n["total_tokens"], serde_json::json!(120));
+        assert_eq!(n["prompt_tokens_details"]["cached_tokens"], serde_json::json!(80));
+    }
+
+    #[test]
+    fn normalize_openai_usage_defaults_cached_zero_when_absent() {
+        let u = serde_json::json!({"input_tokens": 10, "output_tokens": 3});
+        let n = normalize_openai_usage(&u);
+        assert_eq!(n["prompt_tokens"], serde_json::json!(10));
+        assert_eq!(n["prompt_tokens_details"]["cached_tokens"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn cached_tokens_i64_accepts_openai_style_keys() {
+        assert_eq!(
+            cached_tokens_i64(&serde_json::json!({"cached_tokens": 7})),
+            7
+        );
+        assert_eq!(
+            cached_tokens_i64(&serde_json::json!({"cache_read_tokens": 9})),
+            9
+        );
+        assert_eq!(cached_tokens_i64(&serde_json::json!({})), 0);
     }
 }

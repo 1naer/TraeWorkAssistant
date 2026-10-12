@@ -32,6 +32,7 @@ use super::pool::PickedAccount;
 use super::retry::{retry_plan, RetryAction};
 use super::wb_payload;
 use super::wb_sse;
+use super::wb_sse::cached_tokens_of;
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
@@ -1348,6 +1349,7 @@ pub async fn wb_tool_exec_chat(
             // 各轮上游 usage 累加（含最终轮），成功时写回最终 completion——
             // 多轮回喂的真实消耗 = 各轮之和，只记最终轮会少计中间轮
             let mut acc_usage = (0u64, 0u64);
+            let mut acc_cached = 0u64;
             let outcome = loop {
                 if round >= super::wb_toolexec::MAX_ROUNDS {
                     break Err(format!(
@@ -1414,6 +1416,7 @@ pub async fn wb_tool_exec_chat(
                                 acc_usage.0 + u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                 acc_usage.1 + u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                             );
+                            acc_cached += cached_tokens_of(u);
                         }
                         // P1-6：仅代理成功注入工具时才按名提取代执行调用；
                         // 客户端同名工具的调用一律视为普通透传（不提取不执行）
@@ -1432,11 +1435,13 @@ pub async fn wb_tool_exec_chat(
                                     if u.get("total_tokens").is_some() {
                                         u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
                                     }
+                                    u["cache_read_token"] = json!(acc_cached);
                                 }
                                 None => {
                                     completion["usage"] = json!({
                                         "prompt_tokens": acc_usage.0,
                                         "completion_tokens": acc_usage.1,
+                                        "cache_read_token": acc_cached,
                                     });
                                 }
                             }

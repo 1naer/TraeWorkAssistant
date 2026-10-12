@@ -211,7 +211,7 @@ fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usa
         let (it, ot) = u64_pair(u);
         obj["usage"] = json!({
             "input_tokens": it,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": cached_tokens_of(u)},
             "output_tokens": ot,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": it + ot,
@@ -968,6 +968,20 @@ fn u64_pair(u: &Value) -> (u64, u64) {
         get(&["prompt_tokens", "input_tokens"]),
         get(&["completion_tokens", "output_tokens"]),
     )
+}
+
+/// 上游缓存读 tokens：WB usage 事件字段为 cache_read_token（用量历史同源口径），
+/// 兼容 OpenAI 风格 cached_tokens / cache_read_tokens
+pub(crate) fn cached_tokens_of(u: &Value) -> u64 {
+    [
+        "cache_read_input_tokens",
+        "cache_read_token",
+        "cached_tokens",
+        "cache_read_tokens",
+    ]
+        .iter()
+        .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
+        .unwrap_or(0)
 }
 
 fn now_ts() -> u64 {
