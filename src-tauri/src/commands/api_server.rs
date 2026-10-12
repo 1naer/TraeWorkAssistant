@@ -420,9 +420,16 @@ pub async fn do_start(
         started_at: now,
     });
 
-    // 启动积分保鲜（issue #91 缓存问题）：池内存在陈旧/缺时间戳的积分快照时
-    // 后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新经 push_credits
-    // 回写拨新后自动恢复生效。静默失败不影响启动流程
+    // 启动积分保鲜（issue #91 缓存问题；审查 C3）：池内存在陈旧/缺时间戳的
+    // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
+    // 自动恢复生效。三池口径：
+    //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
+    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
+    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
+    //     路径，陈旧快照会一直 fail-open）；
+    //   Qoder 池：sync_from_qoder 恒 credits=None（倍率计费无余额概念），
+    //     reserve 对其结构性不生效，无保鲜需求（仅标注）。
+    // 静默失败不影响启动流程
     {
         let app2 = app.clone();
         let st2 = state.clone();
@@ -431,22 +438,62 @@ pub async fn do_start(
             let Some(shared) = safe_lock(&rt_state).as_ref().map(|rt| rt.shared.clone()) else {
                 return; // runtime 未就绪（启动中途失败）
             };
-            if !shared.pool.has_stale_credits() {
+            let trae_stale = shared.pool.has_stale_credits();
+            let wb_stale = shared.wb_pool.has_stale_credits();
+            if !trae_stale && !wb_stale {
                 return;
             }
             fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
-            match crate::commands::accounts::refresh_remaining_credits_impl(
-                &st2,
-                Some(rt_state.inner()),
-            ) {
-                Ok(n) => fs_utils::app_log(
-                    &st2.data_dir,
-                    &format!("API服务启动-积分保鲜: 刷新完成 accounts={}", n),
-                ),
-                Err(e) => fs_utils::app_log(
-                    &st2.data_dir,
-                    &format!("API服务启动-积分保鲜: 刷新失败(不影响使用) {}", e),
-                ),
+            if trae_stale {
+                match crate::commands::accounts::refresh_remaining_credits_impl(
+                    &st2,
+                    Some(rt_state.inner()),
+                ) {
+                    Ok(n) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Trae池刷新完成 accounts={}", n),
+                    ),
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Trae池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+            if wb_stale {
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                    Ok(parsed) => {
+                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
+                        //（对齐 write_back_pool_balances 的到期回写口径）
+                        let mut m: std::collections::HashMap<String, f64> =
+                            std::collections::HashMap::new();
+                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
+                            for acc in accounts {
+                                let ok = acc
+                                    .get("ok")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true);
+                                if !ok {
+                                    continue;
+                                }
+                                if let (Some(uid), Some(bal)) = (
+                                    acc.get("user_id").and_then(|v| v.as_str()),
+                                    acc.get("balance").and_then(|v| v.as_f64()),
+                                ) {
+                                    m.insert(uid.to_string(), bal);
+                                }
+                            }
+                        }
+                        shared.wb_pool.update_credits(&m);
+                        fs_utils::app_log(
+                            &st2.data_dir,
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                        );
+                    }
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: WB池刷新失败(不影响使用) {}", e),
+                    ),
+                }
             }
         });
     }

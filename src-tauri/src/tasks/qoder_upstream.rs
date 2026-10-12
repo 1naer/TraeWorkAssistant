@@ -2145,6 +2145,12 @@ fn session_id_for(user_id: &str, upstream_key: &str, seed: Option<&str>) -> Stri
 /// 「同段对话复用 session」语义，兼得上游会话侧缓存复用）；跨会话不同。
 /// 修复前：seed 为 None → 每请求一次性会话（session_id 全随机），
 /// 流水表会话键失效（页面不聚合、定时合并无效的根因）。
+///
+/// 已知权衡（审查 C4）：指纹无时间/随机成分，同账号+同模型下两条不同会话
+/// 的首条 user 消息若逐字节相同（同一开场白模板）→ 派生同一上游 session_id，
+/// 语义上视作「相同开头延续同一会话」：本地流水聚合为一行，上游表现为
+/// 缓存复用而非串扰（每轮全量重发 messages）。强隔离需混入天级日期等
+/// 易变成分，但会破坏「同段对话延续/缓存复用」的核心语义，权衡后维持现状。
 fn first_user_fingerprint(messages: &[Value]) -> Option<String> {
     let first = messages
         .iter()

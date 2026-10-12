@@ -45,6 +45,9 @@ export function OAuthLoginModal({
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
+  // 审查 C2：依赖用原始值而非 relogin 对象——父组件每次渲染以内联对象字面量
+  // 传 relogin，按对象身份比较会让登录进行中（step>=2、已填回调 URL）的任何
+  // 父重渲染（store 更新/后台事件刷新列表）把弹窗重置回第 1 步
   useEffect(() => {
     if (!open) {
       setStep(1);
@@ -64,7 +67,7 @@ export function OAuthLoginModal({
       setOpening(false);
       setAutoReady(true);
     }
-  }, [open, relogin]);
+  }, [open, relogin?.userId, relogin?.accountName]);
 
   // F-78 批次 1：监听回环监听器的 oauth-login-done 事件，自动收尾落库结果。
   // 后端已在本机回调时完成 oauth_login 落库，这里只刷新列表并关闭弹窗

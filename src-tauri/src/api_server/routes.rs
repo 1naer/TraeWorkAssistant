@@ -418,15 +418,18 @@ fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Opti
             return None;
         }
     }
-    let model = bare.unwrap_or(model);
+    // C1（审查修复）：后缀剥离仅按裸名段进行；拒绝信息保留用户请求的原始名
+    // （含前缀）——修复此前 `let model = bare.unwrap_or(model)` 遮蔽导致 404
+    // 文案显示裸名、与上方注释「保留原始名」矛盾的问题（放行/剥离逻辑不变）
+    let stripped = bare.unwrap_or(model);
     // issue #38 实测修复：`-max` / `-thinking` 等入口后缀在 dispatch ② 段才剥离，
     // 白名单须按同一剥离规则对基名放行——否则启用白名单的部署下，Max Mode /
     // 路由后缀入口在准入层就被 404 拦截，整个能力不可用（剥离规则与 dispatch 同源，
     // 基名最终可服务性仍由 dispatch 查模型列表判定，此处仅准入放行）
     let cfg = wb_model_route::load_config(&state.data_dir);
     let bases = [
-        wb_model_route::strip_max_suffix(model),
-        wb_model_route::strip_route_suffix(model, &cfg).map(|(b, _)| b),
+        wb_model_route::strip_max_suffix(stripped),
+        wb_model_route::strip_route_suffix(stripped, &cfg).map(|(b, _)| b),
     ];
     for base in bases.into_iter().flatten() {
         if unified_catalog::whitelist_allows(&list, &base) {
@@ -3035,6 +3038,27 @@ mod tests {
         let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    /// 审查 C1 + issue #90 修复③a：池前缀模型按裸名准入（与 /v1/models 别名
+    /// 条目同一前缀语义）；被拒时拒绝信息保留用户请求的原始名（含前缀），
+    /// 不得显示裸名（遮蔽回归防护）
+    #[tokio::test]
+    async fn whitelist_check_prefix_admission_keeps_original_name_in_denial() {
+        let f = wl_fixture("prefix");
+        unified_catalog::save_whitelist(&f.dir, &["glm-5.3".to_string()]).unwrap();
+        // 前缀模型按裸名准入
+        assert!(whitelist_check(&f.state, "trae/glm-5.3", Protocol::OpenAi).is_none());
+        // 非名单前缀模型 → 404 且消息保留原始前缀名
+        let denied = whitelist_check(&f.state, "trae/kimi-k3", Protocol::OpenAi).unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("model trae/kimi-k3 is not in"),
+            "拒绝信息应保留原始前缀名: {msg}"
+        );
     }
 
     // ==================== issue #54：Claude Code 分类器模型兜底 ====================
