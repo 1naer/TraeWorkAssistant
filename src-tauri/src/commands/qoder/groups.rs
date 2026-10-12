@@ -63,13 +63,19 @@ pub fn qoder_account_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    // 目标分组校验：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
-    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
-        if !super::super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
-            return Err(format!("目标分组不存在: {gid}"));
-        }
-    }
     with_pool_mut(&state, |accounts| {
+        // 目标分组复检纳入池锁临界区（with_pool_mut 已持 qoder_pool_lock，此处
+        // 取 group_defs_lock，锁序池锁→defs锁）：校验与写入原子化——原校验在
+        // 池锁外，校验后、写入前分组可被并发删除（delete_inner）→ 幽灵绑定
+        if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+            let _defs = state
+                .group_defs_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !super::super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
+                return Err(format!("目标分组不存在: {gid}"));
+            }
+        }
         let acct = accounts
             .iter_mut()
             .find(|a| a.id == user_id)

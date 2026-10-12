@@ -112,6 +112,19 @@ impl Store {
         .ok()
     }
 
+    /// 严格版 kv 读取（审查 R1）：区分「无键（Ok(None)）」与「读库失败（Err）」——
+    /// `kv_get_raw` 内部 `.ok()` 把两者合并为 None，fail-closed 场景（迁移源读等
+    /// 「空集会触发重创性写」的路径）必须用本方法：读失败显式上抛，绝不静默当空集
+    pub fn kv_get_raw_checked(&self, key: &str) -> Result<Option<String>, String> {
+        use rusqlite::OptionalExtension;
+        self.with_conn(|c| {
+            c.query_row("SELECT content FROM kv WHERE key = ?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+        })
+    }
+
     pub fn kv_set_raw(&self, key: &str, content: &str) -> Result<(), String> {
         self.with_conn(|c| {
             c.execute(

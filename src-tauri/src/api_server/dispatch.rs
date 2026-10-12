@@ -370,9 +370,21 @@ pub fn resolve_target(
     // Trae 模型列表一次加载（config_cache 缓存），③ 段剥离守卫与 trae_hit 判定共用
     let trae_list = models_sync::load_models(&state.data_dir);
     let in_trae = |n: &str| trae_list.iter().any(|m| canonical_id(&m.id) == canonical_id(n));
+    // ③⁻ Qoder 源判定（p3-3）前移：③ 段后缀剥离需先知道 Qoder 是否命中，防
+    // 「Qoder 目录收录形如 xxx-max 的模型、基名恰在 Trae 列表」时被 -max 剥离
+    // 劫持到 Trae 池（审查 m1）。resolve 先 CN 区后 Global 区——v1 恒以 CN 网关
+    // 执行，区域分流见 qoder_route 注释。final model 取目录归一化 id。
+    // v1 不做路由后缀剥离（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
+    let qoder_hit = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
+        .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
     let trae_final = if buddy_hit.is_none() {
         if in_trae(model) {
             // 整名命中：真模型名透传，不做任何后缀剥离
+            (model.to_string(), None, false)
+        } else if qoder_hit.is_some() {
+            // Qoder 目录命中且整名未命中 Trae 列表：跳过后缀剥离，整名保留
+            // （剥离只服务 WB/Trae 侧机制，此处剥离会把 Qoder 专属模型改写为
+            // 基名误路由 Trae）
             (model.to_string(), None, false)
         } else if let Some((base, hint)) = wb_model_route::strip_route_suffix(model, &cfg)
             .filter(|(base, _)| in_trae(base))
@@ -402,12 +414,6 @@ pub fn resolve_target(
         (model.to_string(), None, false)
     };
     let canonical = canonical_id(&trae_final.0);
-    // ③⁻ Qoder 源判定（p3-3）：Qoder 目录（远程清单 + 静态兜底，resolve 先 CN 区
-    // 后 Global 区——v1 恒以 CN 网关执行，区域分流见 qoder_route 注释）命中即源存在；
-    // final model 取目录归一化 id。v1 不做路由后缀剥离
-    //（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
-    let qoder_hit = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
-        .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
     // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
     let trae_hit = (buddy_hit.is_none() && qoder_hit.is_none())
@@ -925,6 +931,7 @@ mod tests {
             qoder_sticky_enabled: AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         Fixture { dir, state }
     }

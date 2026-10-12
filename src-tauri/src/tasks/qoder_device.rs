@@ -1,7 +1,7 @@
 //! Qoder 设备指纹域（F-80 M3，§5.10 多账号并发；v1.2 用户决策：伪造是正式需求，
 //! 以「每账号稳定绑定」而非随机轮换作为风险控制手段）。
 //!
-//! 移植自已验证的社区实现模型（docs/tmp/f80-qoder-recon/external-projects-recon.md）：
+//! 移植自已验证的社区实现模型（docs/已完成方案/Qoder外部项目调研归档.md）：
 //! - QoderGateway（§2.3）：machine_id 账号级持久稳定入库；machine_token/machine_type
 //!   每会话现场随机；服务端无强绑定校验
 //! - QoderPatcher（§1.3/§6.1）：machine_id = 32 位小写 hex 无分隔符；device_id/umid

@@ -26,6 +26,14 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// api_pool 整文档覆盖写互斥（审查修复清单 v1.4.9 B1，进程级叶子锁）：
+/// api_pool 为 kv 整文档「load→merge→kv_set」模型，3 个写点
+/// （pool_set / shared_groups delete ③段 / tags delete ③段）无互斥时并发互相
+/// 覆盖丢配置。纪律：写点读改写+落盘持锁、热重载放锁外；写点均在池/org 锁
+/// 释放后获取本锁，持锁期间严禁再取任何其他锁；启动迁移在 server bind 前执行
+/// 无并发窗口，不取锁
+pub(crate) static POOL_CFG_LOCK: Mutex<()> = Mutex::new(());
+
 // ==================== 启停命令 ====================
 
 /// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
@@ -287,6 +295,7 @@ pub async fn do_start(
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
+        listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
@@ -929,6 +938,11 @@ pub fn pool_set(
     wb_tag_ids: Option<Vec<String>>,
     qoder_tag_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // B1（审查修复清单 v1.4.9）：api_pool 整文档覆盖写互斥——3 个写点
+    // （本命令 / shared_groups ③段 / tags ③段）并发「load→merge→kv_set」互相
+    // 覆盖丢配置。进程级叶子锁：写点均在池/org 锁释放后获取，持锁期间不再取
+    // 其他锁（热重载在锁外）；启动迁移在 server bind 前无并发窗口，不取锁
+    let _cfg = POOL_CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let existing: ApiPoolFile = load_pool_file(&state.data_dir);
     let mut pool_file = merge_pool_set(
         &existing,
@@ -974,7 +988,8 @@ pub fn pool_set(
         pool_file.qoder_tag_ids = v;
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
-    // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    drop(_cfg);
+    // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared
             .pool
@@ -1113,6 +1128,7 @@ pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, Str
         qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
         wb_pool_lock: state.inner().wb_pool_lock.clone(),
         doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
+        group_defs_lock: state.inner().group_defs_lock.clone(),
     };
     tauri::async_runtime::spawn_blocking(move || {
         // run_task 返回 json：{ok:true, models:n} 或 {ok:true, skipped:...}
@@ -1320,6 +1336,7 @@ pub fn api_keys_list(
 #[tauri::command]
 pub fn api_keys_save(
     state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
     auth_disabled: Option<bool>,
 ) -> Result<(), String> {
@@ -1329,7 +1346,22 @@ pub fn api_keys_save(
         auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
     };
     // 非环回监听 + （新状态显式关闭鉴权 或 无任何启用 Key）→ 拒绝保存
-    let host = crate::api_server::gateway_settings::load(&state.data_dir).host;
+    // host 与运行时物理同源（对齐 auth.rs /health 豁免的 M3 修复）：服务运行中读
+    // rt.shared.listen_host（实际绑定值）——配置被改回 127.0.0.1 但服务仍监听
+    // 0.0.0.0 时按实际值判定，不出现「配置值 vs 实际监听值」分离导致的 fail-open；
+    // 未运行时读配置值（下次启动还有 ensure_bind_auth_policy 兜底）
+    let host = {
+        let guard = safe_lock(&runtime);
+        match guard.as_ref() {
+            Some(rt) => rt
+                .shared
+                .listen_host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            None => crate::api_server::gateway_settings::load(&state.data_dir).host,
+        }
+    };
     if !crate::api_server::server::is_loopback_host(&host)
         && (file.auth_disabled || !file.has_enabled())
     {
@@ -1350,7 +1382,7 @@ pub fn api_keys_org_preview(
     state: State<'_, AppState>,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, usize>> {
-    use crate::api_server::api_keys::split_pool_tagged;
+    use crate::api_server::api_keys::{parse_bind_pool, split_pool_tagged};
     use std::collections::HashMap;
     let idx = crate::api_server::org_index::get(&state.data_dir);
     let mut out: HashMap<String, HashMap<String, usize>> = HashMap::new();
@@ -1365,12 +1397,20 @@ pub fn api_keys_org_preview(
                 &idx,
             ));
         }
+        // 与运行时 pool_constraints 分池语义对齐（issue #30）：
+        // - 混合白名单（组/标签已配置 → 展开条目必带前缀；或精确白名单含前缀条目）
+        //   → 裸 uid 防御性归属 buddy（旧数据混入兜底，与运行时一致）
+        // - 非混合（全裸 uid 旧语义）→ 白名单整体作用于 bind_pool 所指池
+        //   （未绑定 = buddy，F-35 旧语义；bind=trae/buddy 各归其池）
+        let mixed = !k.allowed_groups.is_empty()
+            || !k.allowed_tags.is_empty()
+            || k.allowed_accounts.iter().any(|u| split_pool_tagged(u).0.is_some());
+        let legacy_pool = parse_bind_pool(&k.bind_pool).unwrap_or("buddy");
         let mut counts: HashMap<String, usize> = HashMap::new();
         for u in &allowed {
             let pool = match split_pool_tagged(u) {
                 (Some(p), _) => p,
-                // 裸条目防御性归属 buddy（与 pool_constraints 白名单分池语义一致）
-                (None, _) => "buddy",
+                (None, _) => if mixed { "buddy" } else { legacy_pool },
             };
             *counts.entry(pool.to_string()).or_default() += 1;
         }

@@ -21,7 +21,9 @@ pub struct OrgIndex {
     pub account_tags: HashMap<String, Vec<String>>,
 }
 
-fn load_index(data_dir: &Path) -> OrgIndex {
+/// 读库构建索引。**可失败**：读库失败（瞬时锁冲突/库损坏等）向上传播，
+/// 由 `get` 走旧快照兜底——静默回空索引会让全库账号在 TTL 窗口内不可取号。
+fn load_index(data_dir: &Path) -> Result<OrgIndex, String> {
     let store = crate::store::db(data_dir);
     // 单次 with_conn 读齐全部源表：同一把连接锁持有期内完成，杜绝
     // 「分组读迁移前、标签读迁移后」的撕裂快照（此前分 4 次加锁，写路径
@@ -47,8 +49,7 @@ fn load_index(data_dir: &Path) -> OrgIndex {
             let qoder = read_pairs("SELECT pk, data FROM qoder_accounts")?;
             let tags = read_pairs("SELECT pk, data FROM account_tags")?;
             Ok((members, [wb, qoder].concat(), tags))
-        })
-        .unwrap_or_default();
+        })?;
     let mut idx = OrgIndex::default();
     // Trae 成员：group_members 表
     for (uid, gid) in member_rows {
@@ -77,12 +78,22 @@ fn load_index(data_dir: &Path) -> OrgIndex {
             Some((uid, ids))
         })
         .collect();
-    idx
+    Ok(idx)
 }
 
-/// 取索引（缓存优先；写路径 invalidate + TTL 5s 兜底）
+/// 取索引（缓存优先；写路径 invalidate + TTL 5s 兜底）。
+/// 读库失败：沿用旧快照（即使已过期）兜底并记日志，不缓存空索引；
+/// 仅首启无任何快照时回退空索引（此时也无账号可展开，语义等价于空库）。
 pub fn get(data_dir: &Path) -> OrgIndex {
-    super::config_cache::get_or_load(data_dir, "org_index", || load_index(data_dir))
+    super::config_cache::get_or_load_fallible(
+        data_dir,
+        "org_index",
+        || load_index(data_dir),
+        || {
+            crate::fs_utils::app_log(data_dir, "[org_index] 读库失败且无旧快照，回退空索引");
+            OrgIndex::default()
+        },
+    )
 }
 
 /// 写路径显式失效（分组定义/成员/标签任何变更后调用，改动即时生效）

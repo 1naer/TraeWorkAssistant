@@ -688,8 +688,11 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     let out = json!({
         "ok": true, "cached": false, "accounts": results, "total_balance": total_balance,
     });
-    // 缓存回写（池级）：至少一个账号成功才回写，全失败保留旧缓存作回退数据源
-    if any_ok || results.is_empty() {
+    // 缓存回写（池级）：至少一个账号成功才回写，全失败保留旧缓存作回退数据源。
+    // 单账号过滤路径（user_id=Some）不回写——结果只是池级缓存的子集（目标账号
+    // 不存在时为空集），回写会在 TTL 内把池级缓存污染成残缺/空列表，
+    // 之后不带 uid 的池级查询会命中并返回空账号
+    if user_id.is_none() && (any_ok || results.is_empty()) {
         let _ = store.kv_set(
             "workbuddy_credits_cache",
             &json!({
@@ -805,6 +808,7 @@ mod wb_credits_tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 

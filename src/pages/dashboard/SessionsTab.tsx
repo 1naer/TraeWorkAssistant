@@ -52,8 +52,24 @@ export default function SessionsTab({
   const [loading, setLoading] = useState(false);
   // 审查 No.11：查询失败持久错误态（toast 稍纵即逝；横幅保留至下次成功查询）
   const [error, setError] = useState<string | null>(null);
+  // 模型下拉选项并集（审查 m-7）：data.models 是「过滤后结果」里的模型清单，
+  // 选中某模型后下拉只剩该模型，无法直接切回其它模型（需先清筛选）。
+  // 改为跨查询累计并集（切换平台时重置），下拉始终可选全部出现过的模型
+  const [modelsUnion, setModelsUnion] = useState<string[]>([]);
 
   useEffect(() => {
+    setModelsUnion([]);
+    setModel('');
+  }, [scope]);
+
+  useEffect(() => {
+    // D4（审查修复清单 v1.4.9）：开始日期晚于结束日期时不发无效请求（原实现
+    // 静默返回空列表，用户误以为无数据）——复用既有 error 横幅提示调整区间
+    if (start > end) {
+      setLoading(false);
+      setError('开始日期晚于结束日期，请调整时间范围后重试');
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -72,7 +88,15 @@ export default function SessionsTab({
       pageSize: PAGE_SIZE,
     })
       .then((r) => {
-        if (!cancelled) setData(r);
+        if (!cancelled) {
+          setData(r);
+          // 模型清单并入并集（排序去重；过滤态返回的子集不收缩下拉选项）
+          setModelsUnion((prev) => Array.from(new Set([...prev, ...(r.models ?? [])])).sort());
+        }
+        // 空页回夹（审查修复）：筛选/刷新后数据缩水，本地页码可能越界停在
+        // 空页——以服务端夹取后的 r.page 为准回同步（触发一次纠正查询）。
+        // cancelled 守卫防竞态：过期响应不得改页码再触发新一轮查询
+        if (!cancelled && r.page !== page) setPage(r.page);
       })
       .catch((err) => {
         // 审查 No.11：失败保留上次成功结果（不清空已渲染表格），错误横幅持续可见
@@ -90,8 +114,8 @@ export default function SessionsTab({
   }, [scope, start, end, model, userId, page, refreshKey, pushToast]);
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
-  // issue #82 问题2：Buddy 官网请求级行仅有 时间/模型/积分，无会话说明、token、
-  // 费用字段 → 直接隐藏这四列（此前恒显示 '—' 空列无信息量）
+  // issue #82 问题2：Buddy 官网请求级行无 token、费用字段 → 隐藏这两列（恒显示 '—' 无信息量）。
+  // 会话说明列三平台均展示：Buddy 已接入上游 input/inputTrunc（旧缓存未刷新前显示 '—'）
   const richColumns = scope !== 'buddy';
   // issue #82 问题5：Qoder 网关流水无缓存 token/费用字段 → 隐藏这两列
   const showCacheCost = scope === 'trae';
@@ -155,7 +179,7 @@ export default function SessionsTab({
           className="input !w-auto !py-1 text-xs"
         >
           <option value="">全部模型</option>
-          {(data?.models ?? []).map((m) => (
+          {modelsUnion.map((m) => (
             <option key={m} value={m}>
               {m}
             </option>
@@ -198,7 +222,7 @@ export default function SessionsTab({
                 <tr>
                   <th className="px-4 py-2 text-left">时间</th>
                   <th className="px-4 py-2 text-left">账号</th>
-                  {richColumns && <th className="px-4 py-2 text-left">会话说明</th>}
+                  <th className="px-4 py-2 text-left">会话说明</th>
                   <th className="px-4 py-2 text-left">模型</th>
                   <th className="px-4 py-2 text-right">消耗积分</th>
                   {richColumns && (
@@ -235,14 +259,12 @@ export default function SessionsTab({
                       {r.account_name || r.user_id}
                     </td>
                     {/* 概述开关关闭（T6.1）时仅隐藏展示（显示 '—'），不动缓存与查询 */}
-                    {richColumns && (
-                      <td
-                        className="max-w-[260px] truncate px-4 py-2 text-xs"
-                        title={showPreview ? r.preview : undefined}
-                      >
-                        {showPreview ? r.preview || '—' : '—'}
-                      </td>
-                    )}
+                    <td
+                      className="max-w-[260px] truncate px-4 py-2 text-xs"
+                      title={showPreview ? r.preview : undefined}
+                    >
+                      {showPreview ? r.preview || '—' : '—'}
+                    </td>
                     <td className="whitespace-nowrap px-4 py-2 text-xs">
                       <div className="flex items-center gap-1.5">
                         <span>{r.model}</span>
@@ -294,7 +316,7 @@ export default function SessionsTab({
                 {data && data.rows.length === 0 && (
                   <tr>
                     <td
-                      colSpan={4 + (richColumns ? 2 : 0) + (showCacheCost ? 2 : 0)}
+                      colSpan={5 + (richColumns ? 1 : 0) + (showCacheCost ? 2 : 0)}
                       className="px-4 py-6 text-center text-xs text-slate-400"
                     >
                       当前筛选条件下无会话记录
@@ -307,19 +329,19 @@ export default function SessionsTab({
           {/* 分页 */}
           <div className="flex items-center justify-between border-t border-slate-100 px-5 py-2.5 dark:border-zinc-800">
             <span className="text-xs text-slate-400">
-              第 {data?.page ?? 1} / {totalPages} 页 · 每页 {PAGE_SIZE} 条
+              第 {page} / {totalPages} 页 · 每页 {PAGE_SIZE} 条
             </span>
             <div className="flex gap-2">
               <button
                 className="btn-outline !px-2.5 !py-1 text-xs"
-                disabled={loading || (data?.page ?? 1) <= 1}
+                disabled={loading || page <= 1}
                 onClick={() => setPage((p) => Math.max(1, p - 1))}
               >
                 上一页
               </button>
               <button
                 className="btn-outline !px-2.5 !py-1 text-xs"
-                disabled={loading || !data || data.page >= totalPages}
+                disabled={loading || page >= totalPages}
                 onClick={() => setPage((p) => p + 1)}
               >
                 下一页

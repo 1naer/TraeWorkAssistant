@@ -584,7 +584,13 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
             if let Ok(file) =
                 serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
             {
-                let _ = crate::commands::doubao::save_pool(state, &file);
+                // 巡检回写失败不中断主流程，但落日志不静默
+                if let Err(e) = crate::commands::doubao::save_pool(state, &file) {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("doubao 巡检回写落池失败（{merged} 处变更丢失，下轮巡检重试）: {e}"),
+                    );
+                }
             }
         }
     }
@@ -669,6 +675,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 

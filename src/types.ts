@@ -384,10 +384,14 @@ export interface Settings {
   qoderwork_path: string | null;
   /** Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动） */
   qoder_checkin_hhmm: string;
-  /** Qoder 积分快照调度触发时刻 HH:MM（默认 23:40） */
+  /** Qoder 积分数据同步触发时刻 HH:MM（daily 模式生效，默认 23:40） */
   qoder_credits_sync_hhmm: string;
-  /** Qoder 积分快照调度开关（默认开） */
+  /** Qoder 积分数据同步旧开关（保留兼容；调度已改按 qoder_credits_sync_mode 判定） */
   qoder_credits_sync_enabled: boolean;
+  /** Qoder 积分数据同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认） */
+  qoder_credits_sync_mode: string;
+  /** Qoder 积分数据同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  qoder_credits_sync_hours: string;
   /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 6 小时兜底刷新全部账号凭证） */
   qoder_token_renew_enabled: boolean;
   /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */

@@ -79,8 +79,9 @@ const TASKS: &[SchedTask] = &[
     // 页面常驻时快照停留在最后打开时刻。跟随 trae_credits_sync_mode 频率；daily 模式用
     // 内置 23:50（不与积分同步共占配置时刻，天然错峰 10 分钟）
     SchedTask { key: "trae-usage-sync", name: "Trae 消耗明细同步", hhmm: "23:50", kind: "credits" },
-    // F-80 Qoder 积分快照：每日 HH:MM（settings.qoder_credits_sync_hhmm 可改，开关独立）
-    SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40", kind: "fix" },
+    // F-80 Qoder 积分数据同步：与 Buddy/Trae 同款四模式（off/hourly/daily/every_hours，
+    // settings.qoder_credits_sync_mode；daily 时刻可改，默认 23:40；mode 缺失时 state 按旧 enabled 派生）
+    SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分数据同步", hhmm: "23:40", kind: "credits" },
     // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
     // 空池空转；开关独立（settings.qoder_token_renew_enabled，默认开，环境配置页可关）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
@@ -133,6 +134,7 @@ fn credits_sync_mode(st: &AppState, key: &str) -> String {
     let s = st.settings();
     let raw = match key {
         "wb-credits-snapshot" => s.wb_credits_sync_mode.as_str(),
+        "qoder-credits-snapshot" => s.qoder_credits_sync_mode.as_str(),
         _ => s.trae_credits_sync_mode.as_str(),
     };
     match raw.trim() {
@@ -146,6 +148,7 @@ fn credits_sync_hours(st: &AppState, key: &str) -> i64 {
     let s = st.settings();
     let raw = match key {
         "wb-credits-snapshot" => s.wb_credits_sync_hours.as_str(),
+        "qoder-credits-snapshot" => s.qoder_credits_sync_hours.as_str(),
         _ => s.trae_credits_sync_hours.as_str(),
     };
     raw.trim().parse::<i64>().unwrap_or(2).clamp(1, 24)
@@ -158,7 +161,9 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
     }
     match t.kind {
         // 看板数据同步：按模式分档——hourly 每小时节流 / every_hours 每 N 小时节流
-        // （N 可手工设置，默认 2）/ daily（含非法值）按每日时刻
+        // （N 可手工设置，默认 2）/ daily 按每日时刻。非法值不会到达此分支：
+        // credits_sync_mode 已把空/未知值归一为 every_hours（state 缺省经
+        // fallback 回填，Trae/Buddy/Qoder 三池口径一致，恒 every_hours 兜底）
         "credits" => match credits_sync_mode(st, t.key).as_str() {
             "hourly" => SchedPlan::Hourly,
             "every_hours" => SchedPlan::EveryHours(credits_sync_hours(st, t.key)),
@@ -354,14 +359,12 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "trae-renew" => st.settings().jwt_renew_enabled,
         // WorkBuddy 每日成长（任务配置页）：跟随成长调度开关（默认开）
         "wb-growth" => st.settings().wb_growth_enabled,
-        // F-80 Qoder：签到跟随环境配置开关（qoder_settings.auto_checkin 默认开）；
-        // 积分快照独立开关（默认开；无账号时任务内部静默跳过不计失败）
+        // F-80 Qoder：签到跟随环境配置开关（qoder_settings.auto_checkin 默认开）
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
-        "qoder-credits-snapshot" => st.settings().qoder_credits_sync_enabled,
         // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
         // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（hourly/daily 均视为启用）
-        "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" => {
+        "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot" => {
             credits_sync_mode(st, key) != "off"
         }
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
@@ -748,6 +751,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -893,6 +897,23 @@ mod tests {
         // 非法模式回退 Trae 默认 every_hours
         set(json!({ "trae_credits_sync_mode": "weekly" }));
         assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::EveryHours(2)));
+        // Qoder 积分数据同步（同款四模式）：默认（无 kv mode 字段→state 按旧 enabled=true 派生）
+        // every_hours 每2小时；hourly/daily/every_hours/off 显式生效
+        let qoder_credits = || TASKS.iter().find(|t| t.key == "qoder-credits-snapshot").unwrap();
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::EveryHours(2)), "Qoder 默认每2小时");
+        set(json!({ "qoder_credits_sync_mode": "hourly" }));
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::Hourly));
+        set(json!({ "qoder_credits_sync_mode": "every_hours", "qoder_credits_sync_hours": "5" }));
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::EveryHours(5)));
+        set(json!({ "qoder_credits_sync_mode": "daily" }));
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::Daily(h) if h == "23:40"));
+        set(json!({ "qoder_credits_sync_mode": "daily", "qoder_credits_sync_hhmm": "06:30" }));
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::Daily(h) if h == "06:30"));
+        set(json!({ "qoder_credits_sync_mode": "off" }));
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::Skip));
+        // 旧数据迁移：无 mode 字段 + enabled=false → state 派生 off（关闭态不丢失）
+        set(json!({ "qoder_credits_sync_enabled": false }));
+        assert!(matches!(sched_plan(&st, qoder_credits()), SchedPlan::Skip), "旧关闭态迁移为 off");
         // 模型同步时刻覆盖 + 显式关闭
         set(json!({ "trae_models_sync_hhmm": "06:10" }));
         assert!(matches!(sched_plan(&st, trae_models()), SchedPlan::Daily(h) if h == "06:10"));

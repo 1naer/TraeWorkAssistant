@@ -311,11 +311,20 @@ pub fn sticky_bindings_save_ns(
             // LIKE+AND 的恒假条件——单个 key 不可能同时命中两个前缀模式，
             // DELETE 恒 0 行：过期绑定永不清理，且残留行占主键使后续 INSERT
             // 整事务回滚，WB 池粘性绑定在首次落库成功后永久失效（审查 major）
-            let conds: Vec<String> = other_ns.iter().map(|_| "key NOT LIKE ?".to_string()).collect();
-            let sql = format!("DELETE FROM sticky_bindings WHERE {}", conds.join(" AND "));
-            let mut stmt = c.prepare(&sql)?;
-            let patterns: Vec<String> = other_ns.iter().map(|p| format!("{}%", p)).collect();
-            stmt.execute(rusqlite::params_from_iter(patterns.iter()))?;
+            // 防御：过滤 other_ns 中的空串——空串的 LIKE '%' 模式会让 NOT LIKE 恒假
+            // （DELETE 0 行 → 残留行占主键 → INSERT 整事务回滚，与已修复的旧 bug 同构）
+            let other_ns: Vec<&str> = other_ns.iter().copied().filter(|p| !p.is_empty()).collect();
+            if other_ns.is_empty() {
+                // 无任何有效已登记命名空间 → 退化为整表删除（与上方全空分支等价）
+                c.execute_batch("DELETE FROM sticky_bindings;")?;
+            } else {
+                let conds: Vec<String> =
+                    other_ns.iter().map(|_| "key NOT LIKE ?".to_string()).collect();
+                let sql = format!("DELETE FROM sticky_bindings WHERE {}", conds.join(" AND "));
+                let mut stmt = c.prepare(&sql)?;
+                let patterns: Vec<String> = other_ns.iter().map(|p| format!("{}%", p)).collect();
+                stmt.execute(rusqlite::params_from_iter(patterns.iter()))?;
+            }
         } else {
             let mut stmt = c.prepare("DELETE FROM sticky_bindings WHERE key LIKE ?")?;
             stmt.execute(rusqlite::params![format!("{}%", ns)])?;
@@ -827,7 +836,22 @@ pub fn groups_load(s: &Store) -> GroupsFile {
     GroupsFile { groups, membership }
 }
 
+/// 组织定义类行文档表（groups / group_members / tags / account_tags）统一写互斥
+/// （2026-10-12 审查 P4，最高优先级）：上述表均为「整删全写 / 读-改-写」模型，
+/// 多处入口并发 RMW 互相覆盖会丢更新（丢新分组 / 复活已删分组 / 丢标签绑定）。
+/// store 层无 AppState 可挂，用进程级全局锁；全部写入口在本层持锁（ choke point
+/// 覆盖既有与未来全部调用方，调用处无需各自加锁）。
+/// 锁序强制单向嵌套「池锁 → group_defs_lock → 本锁」：本层不感知上层锁、
+/// 持本锁期间绝不回调上层，故不可能出现反向嵌套死锁。
+pub(crate) fn org_defs_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn groups_save(s: &Store, f: &GroupsFile) -> Result<(), String> {
+    let _org_guard = org_defs_lock();
     // 序列化在事务外完成
     let mut group_rows: Vec<(String, String)> = Vec::with_capacity(f.groups.len());
     for g in &f.groups {
@@ -868,8 +892,16 @@ pub fn group_defs_load(s: &Store) -> Vec<crate::models::Group> {
         .collect()
 }
 
-/// 全删全写定义行（不触碰 group_members 表——成员关系属各池机制，D1）
+/// 全删全写定义行（不触碰 group_members 表——成员关系属各池机制，D1）。
+/// 持 org_defs_lock：与并发 groups_save/tags_save/account_tags_* 写入口互斥
 pub fn group_defs_save(s: &Store, defs: &[crate::models::Group]) -> Result<(), String> {
+    let _org_guard = org_defs_lock();
+    group_defs_save_unlocked(s, defs)
+}
+
+/// 不加锁版本：仅供整段已持 org_defs_lock 的调用方（启动迁移 migrate_unified_groups
+/// 全程持锁）使用，防同线程重入 `Mutex` 死锁
+pub(crate) fn group_defs_save_unlocked(s: &Store, defs: &[crate::models::Group]) -> Result<(), String> {
     let rows: Vec<(String, String)> = defs
         .iter()
         .map(|g| serde_json::to_string(g).map(|text| (g.id.clone(), text)))
@@ -904,7 +936,9 @@ pub fn tags_load(s: &Store) -> Vec<crate::models::Tag> {
         .collect()
 }
 
+/// 持 org_defs_lock：tags 全删全写与并发绑定写入口互斥
 pub fn tags_save(s: &Store, defs: &[crate::models::Tag]) -> Result<(), String> {
+    let _org_guard = org_defs_lock();
     let rows: Vec<(String, String)> = defs
         .iter()
         .map(|t| serde_json::to_string(t).map(|text| (t.id.clone(), text)))
@@ -941,8 +975,9 @@ pub fn account_tags_map(s: &Store) -> std::collections::HashMap<String, Vec<Stri
         .collect()
 }
 
-/// 全量覆盖式设置某账号的标签绑定（校验 tag_id 存在由命令层负责）
+/// 全量覆盖式设置某账号的标签绑定（校验 tag_id 存在由命令层负责）。持 org_defs_lock
 pub fn account_tags_set(s: &Store, uid: &str, tag_ids: &[String]) -> Result<(), String> {
+    let _org_guard = org_defs_lock();
     let data = serde_json::to_string(&tag_ids).map_err(|e| format!("序列化失败: {e}"))?;
     s.with_conn(move |c| {
         c.execute(
@@ -955,16 +990,19 @@ pub fn account_tags_set(s: &Store, uid: &str, tag_ids: &[String]) -> Result<(), 
 }
 
 /// 删除某账号的全部标签绑定（账号删除路径调用，防幽灵绑定污染
-/// 标签计数 / 组标签展开 / Key 覆盖预览）
+/// 标签计数 / 组标签展开 / Key 覆盖预览）。持 org_defs_lock
 pub fn account_tags_remove_account(s: &Store, uid: &str) -> Result<(), String> {
+    let _org_guard = org_defs_lock();
     s.with_conn(|c| {
         c.execute("DELETE FROM account_tags WHERE pk = ?1", [uid])?;
         Ok(())
     })
 }
 
-/// 删除某标签的全部绑定（标签定义删除时清理引用）
+/// 删除某标签的全部绑定（标签定义删除时清理引用）。
+/// 持 org_defs_lock：整表扫描读-改-写，与并发 account_tags_set 互斥防丢改
 pub fn account_tags_remove_tag(s: &Store, tag_id: &str) -> Result<usize, String> {
+    let _org_guard = org_defs_lock();
     let map = account_tags_map(s);
     let mut affected = 0usize;
     for (uid, ids) in map {
@@ -1365,6 +1403,9 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         (UsageBucket::Trae, &f.days),
         (UsageBucket::Wb, &f.wb_days),
         (UsageBucket::Custom, &f.custom_days),
+        // 四桶对称（审查修复清单 v1.4.9 B8）：漏 Qoder 桶会使 JSON→SQLite 迁移时
+        // Qoder 历史用量整表丢弃（api_usage_load 侧 bucket_map_mut 四桶齐全）
+        (UsageBucket::Qoder, &f.qoder_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {

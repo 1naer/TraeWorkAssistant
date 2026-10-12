@@ -67,8 +67,20 @@ pub async fn start_api_server(
     state: Arc<ApiSharedState>,
 ) -> Result<ApiServerHandle, String> {
     let host = super::gateway_settings::load(&state.data_dir).host;
+    // 注入实际绑定 host（物理同源，2026-10-12 审查 M3）：auth 的 /health 环回
+    // 豁免改读 state.listen_host 而非重读配置——改配置未重启时不再出现
+    // 「配置值 vs 实际监听值」分离导致的 fail-open 误判
+    *state
+        .listen_host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = host.clone();
     ensure_bind_auth_policy(&host, &super::api_keys::load(&state.data_dir))?;
-    let addr = format!("{host}:{port}");
+    let bind_host = state
+        .listen_host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let addr = format!("{bind_host}:{port}");
     let listener = TcpListener::bind(&addr).await.map_err(|e| {
         // 审查 G1：绑定失败错误带监听地址与局域网访问指引（前端展示）
         format!(
@@ -254,7 +266,14 @@ mod tests {
 /// 频控红线：单次单请求、不重试、不批量，探活流量可忽略。
 fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
+    // 与 spawn_persistence_flusher 同构：持 Weak 引用，服务停止、共享状态被释放后
+    // 线程自动退出（重启服务重建新线程），避免反复启动/停止累积线程与整份共享状态。
+    let weak = Arc::downgrade(&state);
+    drop(state);
     std::thread::spawn(move || {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
         // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
         // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取
         {
@@ -297,6 +316,10 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                 .map(|d| d.subsec_nanos() as u64 % 60)
                 .unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_secs(300 + jitter));
+            // 服务停止后（共享状态释放）退出线程，避免泄漏
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
                 .build();

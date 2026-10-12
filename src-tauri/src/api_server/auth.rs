@@ -11,7 +11,7 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /health 跳过鉴权
+/// - /health 跳过鉴权（响应已收敏为 status/running 存活布尔，完整诊断在需鉴权的 /status）
 /// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
@@ -26,7 +26,18 @@ pub async fn bearer_auth(
     next: Next,
 ) -> Response {
     if request.uri().path() == "/health" {
-        return next.run(request).await;
+        // 环回豁免与 bind 物理同源（2026-10-12 审查 M3）：按实际绑定 host 判定，
+        // 不重读配置——改配置未重启时不会误用新配置值放行（fail-open）。非环回
+        // 监听时 /health 不豁免，与其他端点一致走 Key 鉴权（fail-closed；
+        // 响应本身已收敏为存活布尔，见 routes::health）
+        let host = state
+            .listen_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if super::server::is_loopback_host(&host) {
+            return next.run(request).await;
+        }
     }
 
     // 请求体预检（issue #21）：Content-Length 超过网关上限时在 body 提取器之前

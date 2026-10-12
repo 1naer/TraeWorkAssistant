@@ -314,12 +314,20 @@ pub struct Settings {
     /// Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动，§2.2）
     #[serde(default = "default_qoder_checkin_hhmm")]
     pub qoder_checkin_hhmm: String,
-    /// Qoder 积分快照调度触发时刻 HH:MM（默认 23:40）
+    /// Qoder 积分数据同步触发时刻 HH:MM（daily 模式生效，默认 23:40）
     #[serde(default = "default_qoder_credits_sync_hhmm")]
     pub qoder_credits_sync_hhmm: String,
-    /// Qoder 积分快照调度开关（默认开；无账号时任务内部静默跳过不计失败）
+    /// Qoder 积分数据同步开关（旧两态字段，保留兼容持久化；调度器改按 mode 判定，
+    /// mode 缺失时 state 归一按本布尔派生：true→every_hours、false→off）
     #[serde(default = "default_true")]
     pub qoder_credits_sync_enabled: bool,
+    /// Qoder 积分数据同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）|
+    /// every_hours（每N小时，默认）——serde default 空串，state 归一按旧 enabled 派生
+    #[serde(default)]
+    pub qoder_credits_sync_mode: String,
+    /// Qoder 积分数据同步间隔小时数（every_hours 模式生效，默认 2，合法范围 1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub qoder_credits_sync_hours: String,
     /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 6 小时为全部含
     /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h > 6h 调度
     /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
@@ -584,7 +592,7 @@ pub struct RemainingCreditsFile {
 /// 积分明细条目（仅剩余 > 0 且未过期的积分包）
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreditPackDetail {
-    /// "ͨ用" | "Work"
+    /// "通用" | "Work"
     pub kind: String,
     /// 来源名称（如「每日签到」「每月登录积分」）
     pub source: String,
@@ -606,7 +614,7 @@ pub struct CreditDetail {
     pub packs: Vec<CreditPackDetail>,
 }
 
-/// 单个账号的冷却状鎬?
+/// 单个账号的冷却状态
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct CooldownEntry {
     #[serde(rename = "type", default)]

@@ -8,6 +8,8 @@ import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import { fmtCredits, dateStrToEndTs } from '../../lib/format';
 import KpiRow, { type PlatformKpi, type PlatformScope } from './KpiRow';
+// D2/D3（审查修复清单 v1.4.9）：KPI「今日新增」按账号筛选推导
+import { qoderEarnedByDateFiltered, traeEarnedByDateFiltered, wbEarnedByDateFiltered } from './adapters';
 import ExpiryTab from './ExpiryTab';
 import CreditsTab from './CreditsTab';
 import TokensTab, { type GatewayDays } from './TokensTab';
@@ -379,8 +381,10 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           .creditsHistoryList()
           .then((r) => setQoderSnapshots(r.snapshots ?? []))
           .catch(() => setQoderSnapshots([])),
+        // D1（审查修复清单 v1.4.9）：窗口 2 天 → 90 天，与 Buddy 签到日志同口径
+        //（KPI 今日新增 + 积分统计「区间总获得」共用，窗口过短统计少计）
         api.qoder
-          .checkinResults(2)
+          .checkinResults(90)
           .then(setQoderCheckin)
           .catch(() => setQoderCheckin([])),
       ]);
@@ -407,17 +411,29 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const loadGateway = useCallback(async () => {
     setGatewayLoading(true);
     try {
-      // 看板按单平台展示，拉取 Trae/Buddy/Qoder 三池（custom 池仅 API 服务页 UsageStatsPanel 使用）
-      const [trae, buddy, qoder] = await Promise.all([
-        api.apiServer.usageStats(90).catch(() => [] as UsageDayView[]),
-        api.apiServer.wbUsageStats(90).catch(() => [] as UsageDayView[]),
-        api.apiServer.qoderUsageStats(90).catch(() => [] as UsageDayView[]),
+      // 看板按单平台展示，拉取 Trae/Buddy/Qoder 三池（custom 池仅 API 服务页 UsageStatsPanel 使用）。
+      // 三个统计命令为 Tauri 直读盘（API 服务未运行也可查），失败仅来自读盘/序列化异常——
+      // 用 allSettled 区分「真实失败」与「正常零数据」，避免零用量/新装用户每次刷新误报
+      const results = await Promise.allSettled([
+        api.apiServer.usageStats(90),
+        api.apiServer.wbUsageStats(90),
+        api.apiServer.qoderUsageStats(90),
       ]);
+      const empty: UsageDayView[] = [];
+      const trae = results[0].status === 'fulfilled' ? results[0].value : empty;
+      const buddy = results[1].status === 'fulfilled' ? results[1].value : empty;
+      const qoder = results[2].status === 'fulfilled' ? results[2].value : empty;
       setGateway({ trae, buddy, qoder });
+      // 仅存在真实查询失败时明示，不静默显示为「无数据」；正常空数据（零用量/
+      // Qoder 上游未接入）不提示
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed > 0) {
+        pushToast('warn', `网关用量查询失败（${failed}/3 个数据源异常），对应来源将显示为空`);
+      }
     } finally {
       setGatewayLoading(false);
     }
-  }, []);
+  }, [pushToast]);
 
   // 懒加载（§3.4）：本地 token 仅 Buddy 页拉取（Trae 页本地源禁用，tokenStats 为
   // WorkBuddy 会话扫描的重操作，Trae 页零消费不触发）；网关数据在 Token Tab
@@ -522,6 +538,14 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
 
   const today = localDate(new Date());
 
+  // Trae 筛选态「今日新增」按账号明细推导结果（skippedDates = 老快照行缺 accounts
+  // 明细被跳过的日数，仅历史迁移前行会命中，今日恒有明细）。提升为独立 memo 供
+  // KPI 数值与 earnedHint 口径标注共用，避免为取标注重复推导
+  const traeFilteredEarned = useMemo(
+    () => (visibleUids ? traeEarnedByDateFiltered(creditsDaily, visibleUids) : null),
+    [creditsDaily, visibleUids],
+  );
+
   // ---- Trae KPI（口径对齐原积分看板）----
   const traeKpi = useMemo<PlatformKpi>(() => {
     const nowSec = Date.now() / 1000;
@@ -551,12 +575,19 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       }
       if (a.membership_expire != null) packages += 1;
     }
-    // 今日新增：快照 earned 优先（积分包 CycleStartTime 归日口径），回退签到 history delta
+    // 今日新增（D2）：有筛选时改走按账号明细推导（traeFilteredEarned，skippedDates
+    // 口径标注见 earnedHint），与其他 KPI「筛选作用于数值」口径一致；无筛选维持
+    // 快照 earned 优先（积分包 CycleStartTime 归日口径）回退签到 history delta。
+    // snap 同时供今日消耗的快照回退（visibleUsage 缺失时）使用，保留在外层
     const snap = creditsDaily.find((s) => s.date === today);
-    const histDelta = creditsHistory
-      .filter((r) => r.date === today)
-      .reduce((s, r) => s + (r.delta || 0), 0);
-    const todayEarned = snap && snap.earned > 0 ? snap.earned : Math.max(0, histDelta);
+    const todayEarned = traeFilteredEarned
+      ? (traeFilteredEarned.byDate.get(today) ?? 0)
+      : (() => {
+          const histDelta = creditsHistory
+            .filter((r) => r.date === today)
+            .reduce((s, r) => s + (r.delta || 0), 0);
+          return snap && snap.earned > 0 ? snap.earned : Math.max(0, histDelta);
+        })();
     // 今日消耗：官网接口明细优先（credits_float 实际口径），回退快照 consumed。
     // 审查修复：按当前筛选口径取数（visibleUsage），与「筛选作用于 KPI」语义一致
     const usageVal =
@@ -575,7 +606,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed,
       expiring7d: expiring,
     };
-  }, [visibleAccounts, creditsDaily, creditsHistory, visibleUsage, today]);
+  }, [visibleAccounts, creditsDaily, creditsHistory, visibleUsage, traeFilteredEarned, today]);
 
   // Trae「可用积分总数」卡细分（对齐原积分看板 totalHint）；账号无通用/Work 字段时回退通用文案
   const traeTotalHint = useMemo(() => {
@@ -607,12 +638,17 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         }
       }
     }
-    // 今日新增：方案 B 快照 earned（余额差分+签到归并）优先，回退方案 A 签到 reward 聚合
-    const snapEarned = wbSnapshots.find((s) => s.date === today)?.earned;
-    const checkinEarned = wbCheckin
-      .filter((r) => r.date === today)
-      .reduce((s, r) => s + (r.reward ?? 0), 0);
-    const todayEarned = snapEarned != null ? Math.max(0, snapEarned) : checkinEarned;
+    // 今日新增（D3）：有筛选时改走按账号推导（wbEarnedByDateFiltered，快照全局
+    // earned 无账号维度不可拆 → 前端逐账号差分），无筛选维持原口径
+    const todayEarned = visibleUids
+      ? (wbEarnedByDateFiltered(wbSnapshots, wbCheckin, visibleUids).get(today) ?? 0)
+      : (() => {
+          const snapEarned = wbSnapshots.find((s) => s.date === today)?.earned;
+          const checkinEarned = wbCheckin
+            .filter((r) => r.date === today)
+            .reduce((s, r) => s + (r.reward ?? 0), 0);
+          return snapEarned != null ? Math.max(0, snapEarned) : checkinEarned;
+        })();
     // 今日消耗：官方用量优先（31 天窗口），回退快照差分
     const todayConsumed =
       wbOfficial?.summary.usage_today ?? wbFallback?.summary.usage_today ?? 0;
@@ -624,7 +660,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed,
       expiring7d: expiring,
     };
-  }, [visibleWbCredits, wbCheckin, wbSnapshots, wbOfficial, wbFallback, today]);
+  }, [visibleWbCredits, wbCheckin, wbSnapshots, wbOfficial, wbFallback, visibleUids, today]);
 
   // ---- Qoder KPI（官网积分查询 + 本地快照差分）----
   const qoderKpi = useMemo<PlatformKpi>(() => {
@@ -657,12 +693,17 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         }
       }
     }
-    // 今日新增：快照 earned（签到合计）优先，回退签到日志 reward 聚合（fetch 未落快照时）
+    // 今日新增（D3）：有筛选时改走按账号过滤的签到口径（快照 earned 全账号合并
+    // 不可拆，其源头即逐账号签到合计，同源同口径），无筛选维持原口径
     const todaySnap = qoderSnapshots.find((s) => s.date === today);
-    const checkinEarned = qoderCheckin
-      .filter((r) => r.date === today)
-      .reduce((s, r) => s + (r.reward ?? 0), 0);
-    const todayEarned = todaySnap?.earned != null ? Math.max(0, todaySnap.earned) : checkinEarned;
+    const todayEarned = visibleUids
+      ? (qoderEarnedByDateFiltered(qoderCheckin, visibleUids).get(today) ?? 0)
+      : (() => {
+          const checkinEarned = qoderCheckin
+            .filter((r) => r.date === today)
+            .reduce((s, r) => s + (r.reward ?? 0), 0);
+          return todaySnap?.earned != null ? Math.max(0, todaySnap.earned) : checkinEarned;
+        })();
     return {
       accounts: accs.length,
       totalCredits,
@@ -672,7 +713,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed: todaySnap?.consumed ?? null,
       expiring7d: expiring,
     };
-  }, [visibleQoderCredits, qoderSnapshots, qoderCheckin, today]);
+  }, [visibleQoderCredits, qoderSnapshots, qoderCheckin, visibleUids, today]);
 
   const kpi = isTrae ? traeKpi : isQoder ? qoderKpi : buddyKpi;
 
@@ -685,12 +726,16 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       : creditsResult.cached
         ? '缓存数据（≥10 分钟）'
         : '实时数据';
-  // 今日新增口径诚实标注（§8.4）：快照 earned 已统计 vs 回退签到口径
+  // 今日新增口径诚实标注（§8.4）：快照 earned 已统计 vs 回退签到口径；Trae 筛选态
+  // 按账号明细推导，老快照日缺 accounts 明细被跳过时如实标注（adapters 契约：
+  // skippedDates>0 时调用方必须说明，不静默少计）
   const todaySnapEarned = wbSnapshots.find((s) => s.date === today)?.earned;
   const qoderTodaySnap = qoderSnapshots.find((s) => s.date === today);
   const qoderLastSnapDate = qoderSnapshots.reduce<string | null>((acc, s) => (!acc || s.date > acc ? s.date : acc), null);
   const earnedHint = isTrae
-    ? undefined
+    ? filtersActive && traeFilteredEarned && traeFilteredEarned.skippedDates > 0
+      ? '筛选口径 · 部分老快照日缺账号明细未计入推导'
+      : undefined
     : isQoder
       ? qoderTodaySnap?.earned != null
         ? '口径：当日签到奖励合计'
@@ -720,6 +765,15 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         : wbFallback
           ? '快照差分推导（截至最后快照日）'
           : undefined;
+
+  // D3：consumed 为聚合口径（官方 summary / 快照差分）无法按账号拆分——有筛选时
+  // 诚实标注，避免与已按筛选取数的 earned 数值口径混淆（数值-徽标一致性）
+  const consumedHintShown =
+    filtersActive && !isTrae
+      ? consumedHint
+        ? `${consumedHint} · 聚合口径，未按账号筛选`
+        : '聚合口径，未按账号筛选'
+      : consumedHint;
 
   const scope: PlatformScope = platform;
 
@@ -768,7 +822,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           creditsHint={creditsHint}
           totalHint={traeTotalHint}
           earnedHint={earnedHint}
-          consumedHint={consumedHint}
+          consumedHint={consumedHintShown}
         />
       </div>
 
@@ -817,6 +871,16 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
               title="当前数据源为聚合口径（无账号维度），筛选仅作用于 KPI 与到期日历；消耗/Token 明细不做静默截断"
             >
               该数据源不支持账号级筛选
+            </span>
+          )}
+          {/* 会话明细 Tab：顶部筛选仅收窄账号候选下拉、不进查询参数（后端 user_id 单值）——
+              此前徽标豁免会话 Tab，用户误以为已按组过滤。明示语义断层（2026-10-12 审查） */}
+          {filtersActive && tab === 'sessions' && (
+            <span
+              className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+              title="顶部分组/账号筛选仅收窄会话页的账号候选下拉，不直接过滤查询结果；请使用会话页内的筛选行（时间/账号/模型）过滤"
+            >
+              顶部筛选仅收窄账号候选，会话结果按页内筛选过滤
             </span>
           )}
           <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>

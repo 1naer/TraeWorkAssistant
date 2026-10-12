@@ -100,15 +100,17 @@ export default function ApiKeysManager({
     setNewKeyValue('ck_' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32));
   }, []);
 
-  const saveKeys = async (next: ApiKeyEntry[], msg: string, nextAuthDisabled?: boolean) => {
+  const saveKeys = async (next: ApiKeyEntry[], msg: string, nextAuthDisabled?: boolean): Promise<boolean> => {
     setKeysSaving(true);
     try {
       await api.apiServer.keysSave(next, nextAuthDisabled);
       setApiKeys(next);
       if (nextAuthDisabled !== undefined) setAuthDisabled(nextAuthDisabled);
       toast('success', msg);
+      return true;
     } catch (e) {
       toast('error', `保存 Key 失败：${String(e).slice(0, 120)}`);
+      return false;
     } finally {
       setKeysSaving(false);
     }
@@ -134,7 +136,7 @@ export default function ApiKeysManager({
     );
   };
 
-  const addKey = () => {
+  const addKey = async () => {
     const name = newKeyName.trim();
     if (!name) {
       toast('error', '请填写 Key 名称');
@@ -165,11 +167,14 @@ export default function ApiKeysManager({
       allowed_tags: [],
       daily_stats: [],
     };
-    void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
-    setNewKeyName('');
-    setNewKeyLimit(0);
-    setNewBindPool('');
-    generateKeyValue();
+    // 保存成功后才清空表单：失败时保留用户已填的名称/限额，免重填
+    const ok = await saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
+    if (ok) {
+      setNewKeyName('');
+      setNewKeyLimit(0);
+      setNewBindPool('');
+      generateKeyValue();
+    }
   };
 
   const toggleKey = (id: string) => {
@@ -202,8 +207,16 @@ export default function ApiKeysManager({
     setEditGroups(new Set(k.allowed_groups ?? []));
     setEditTags(new Set(k.allowed_tags ?? []));
     // 共享分组/标签候选（全局一份；含各池成员计数）
-    api.groups.sharedList().then(setSharedGroups).catch(() => {});
-    api.tags.list().then(setSharedTags).catch(() => {});
+    // F3（审查修复清单 v1.4.9）：弹框候选列表加载失败不再静默吞掉——区域空白
+    // 无解释会让用户以为无分组/标签可选，明示失败并引导重开弹框重试
+    api.groups
+      .sharedList()
+      .then(setSharedGroups)
+      .catch(() => toast('error', '分组候选加载失败：请关闭弹框后重新打开重试'));
+    api.tags
+      .list()
+      .then(setSharedTags)
+      .catch(() => toast('error', '标签候选加载失败：请关闭弹框后重新打开重试'));
     // 服务可能刚启动，三池候选列表即时刷新
     api.apiServer
       .poolStatus()
@@ -258,25 +271,35 @@ export default function ApiKeysManager({
   // 覆盖账号数实时预览（D4/D5）：effective = 精确白名单 ∪ (组 ∩ 标签)；组/标签
   // 均未勾选时不显示。后端 org_index 实时展开，成员变化即时生效
   // 列表行批量预览：仅对配置了组/标签的 key 调用（一次批量，避免 N 次 invoke）
+  // F4：失败置错误态（行内显示 -- + 点击重试），不再永久停留 '…' 占位
+  const [listPreviewError, setListPreviewError] = useState(false);
+  const [listPreviewTick, setListPreviewTick] = useState(0);
   useEffect(() => {
     const bound = apiKeys.filter((k) => (k.allowed_groups?.length ?? 0) > 0 || (k.allowed_tags?.length ?? 0) > 0);
     if (bound.length === 0) {
       setListOrgPreview({});
+      setListPreviewError(false);
       return;
     }
     let cancelled = false;
     api.apiServer
       .keysOrgPreview(bound)
       .then((r) => {
-        if (!cancelled) setListOrgPreview(r);
+        if (!cancelled) {
+          setListOrgPreview(r);
+          setListPreviewError(false);
+        }
       })
       .catch(() => {
-        if (!cancelled) setListOrgPreview({});
+        if (!cancelled) {
+          setListOrgPreview({});
+          setListPreviewError(true);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [apiKeys]);
+  }, [apiKeys, listPreviewTick]);
   useEffect(() => {
     if (!editKey) {
       setOrgPreview(null);
@@ -306,11 +329,16 @@ export default function ApiKeysManager({
     };
   }, [editKey, editGroups, editTags, editAllowed]);
 
-  const updateKeyLimit = (id: string, limit: number) => {
+  const updateKeyLimit = (id: string, limit: number, revert?: () => void) => {
     const v = Math.max(0, Math.floor(limit) || 0);
     const cur = apiKeys.find((k) => k.id === id);
     if (!cur || cur.daily_limit === v) return;
-    void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新');
+    void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新').then(
+      (ok) => {
+        // 保存失败（uncontrolled 输入框已显示新值）→ 回写原值，保持显示与持久化一致
+        if (!ok) revert?.();
+      },
+    );
   };
 
   // 复制成功按钮级反馈（不依赖 toast，通知方式设为 none/system 时也可见）
@@ -565,7 +593,10 @@ export default function ApiKeysManager({
                             toast('error', '日限额需为非负整数，已还原原值');
                             return;
                           }
-                          updateKeyLimit(k.id, parseInt(raw, 10));
+                          const input = e.target;
+                          updateKeyLimit(k.id, parseInt(raw, 10), () => {
+                            input.value = String(k.daily_limit);
+                          });
                         }}
                         title="0 表示不限；失焦自动保存"
                       />
@@ -608,13 +639,24 @@ export default function ApiKeysManager({
                       )}
                       {/* P2 文档补齐：key 列表展示组/标签覆盖账号数预览（实时展开计算） */}
                       {((k.allowed_groups?.length ?? 0) > 0 || (k.allowed_tags?.length ?? 0) > 0) && (
-                        <span
-                          className={`ml-1 text-xs ${listOrgPreview[k.id]?.total === 0 ? 'font-medium text-rose-500' : 'text-slate-400'}`}
-                          title={`组/标签实时展开覆盖 ${listOrgPreview[k.id]?.total ?? '…'} 个账号（组 ∩ 标签，D5）`}
-                        >
-                          覆盖{listOrgPreview[k.id]?.total ?? '…'}账号
-                          {listOrgPreview[k.id]?.total === 0 && ' ⚠ 空集'}
-                        </span>
+                        listPreviewError ? (
+                          // F4：预览失败显示 -- 并提供点击重试（tick 自增重拉），不停留 '…'
+                          <button
+                            className="ml-1 text-xs text-slate-400 underline decoration-dotted"
+                            title="覆盖账号数预览失败，点击重试"
+                            onClick={() => setListPreviewTick((t) => t + 1)}
+                          >
+                            覆盖--账号（点击重试）
+                          </button>
+                        ) : (
+                          <span
+                            className={`ml-1 text-xs ${listOrgPreview[k.id]?.total === 0 ? 'font-medium text-rose-500' : 'text-slate-400'}`}
+                            title={`组/标签实时展开覆盖 ${listOrgPreview[k.id]?.total ?? '…'} 个账号（组 ∩ 标签，D5）`}
+                          >
+                            覆盖{listOrgPreview[k.id]?.total ?? '…'}账号
+                            {listOrgPreview[k.id]?.total === 0 && ' ⚠ 空集'}
+                          </span>
+                        )
                       )}
                     </td>
                     <td className="py-2 pr-4">

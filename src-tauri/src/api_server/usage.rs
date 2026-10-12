@@ -338,7 +338,28 @@ impl UsageFile {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        let day = self.bucket_mut(bucket).entry(today_key()).or_default();
+        self.record_in_ttfb_on(bucket, &today_key(), model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens, ttfb_ms);
+    }
+
+    /// 指定日期入账版（审查修复清单 v1.4.9 G3）：`day` 由调用方取定——
+    /// record_usage_qoder 在入口处取定 day 后，积分/流水/请求统计（本函数）
+    /// 落同一日期行，杜绝请求处理跨零点时 ttfb 统计自行重取日期分裂到次日行
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_in_ttfb_on(
+        &mut self,
+        bucket: UsageBucket,
+        day: &str,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let day = self.bucket_mut(bucket).entry(day.to_string()).or_default();
         day.record(
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,

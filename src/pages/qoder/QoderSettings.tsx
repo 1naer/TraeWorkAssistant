@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ListChecks, RefreshCw, Save, Search, ShieldAlert, SlidersHorizontal } from 'lucide-react';
+import { ListChecks, RefreshCw, Save, Search, ShieldAlert, SlidersHorizontal, AlertTriangle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { Badge, Spinner } from '../../components/ui';
+import { Badge, Spinner, Modal } from '../../components/ui';
 import { withMinDelay } from '../../lib/delay';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -29,13 +29,15 @@ export default function QoderSettings() {
   const [workPath, setWorkPath] = useState('');
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
   const [checkinGap, setCheckinGap] = useState(3);
-  const [creditsHhmm, setCreditsHhmm] = useState('23:40');
-  const [creditsSyncEnabled, setCreditsSyncEnabled] = useState(true);
+  // 积分数据同步（对齐 BuddySettings 四模式）：mode + daily 时刻 + every_hours 间隔
+  const [creditsForm, setCreditsForm] = useState({ mode: 'every_hours', hhmm: '23:40', hours: '2' });
   const [tokenRenewEnabled, setTokenRenewEnabled] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   // 计划任务注册/卸载互斥（防连点重复提交）
   const [taskBusy, setTaskBusy] = useState(false);
+  // 卸载确认（删除类操作二次确认，对齐 Settings/BuddySettings 口径）
+  const [confirmUnregister, setConfirmUnregister] = useState(false);
 
   /** qoder-settings 加载（签到开关数据源）：失败置错误态——null 时 checkbox 恒显默认 true
    *  且点击 no-op、保存会静默跳过 settingsSet 仍报「已保存」，必须显式拦截 */
@@ -79,8 +81,7 @@ export default function QoderSettings() {
     workPath: '',
     checkinHhmm: '10:15',
     checkinGap: 3,
-    creditsHhmm: '23:40',
-    creditsSyncEnabled: true,
+    creditsForm: { mode: 'every_hours', hhmm: '23:40', hours: '2' },
     tokenRenewEnabled: true,
   });
 
@@ -92,8 +93,9 @@ export default function QoderSettings() {
       workPath === s.workPath &&
       checkinHhmm === s.checkinHhmm &&
       checkinGap === s.checkinGap &&
-      creditsHhmm === s.creditsHhmm &&
-      creditsSyncEnabled === s.creditsSyncEnabled &&
+      creditsForm.mode === s.creditsForm.mode &&
+      creditsForm.hhmm === s.creditsForm.hhmm &&
+      creditsForm.hours === s.creditsForm.hours &&
       tokenRenewEnabled === s.tokenRenewEnabled;
     if (!untouched) return;
     const next = {
@@ -101,16 +103,18 @@ export default function QoderSettings() {
       workPath: settings.qoderwork_path ?? '',
       checkinHhmm: settings.qoder_checkin_hhmm || '10:15',
       checkinGap: settings.qoder_checkin_gap_secs ?? 3,
-      creditsHhmm: settings.qoder_credits_sync_hhmm || '23:40',
-      creditsSyncEnabled: settings.qoder_credits_sync_enabled ?? true,
+      creditsForm: {
+        mode: settings.qoder_credits_sync_mode || 'every_hours',
+        hhmm: settings.qoder_credits_sync_hhmm || '23:40',
+        hours: settings.qoder_credits_sync_hours || '2',
+      },
       tokenRenewEnabled: settings.qoder_token_renew_enabled ?? true,
     };
     setIdePath(next.idePath);
     setWorkPath(next.workPath);
     setCheckinHhmm(next.checkinHhmm);
     setCheckinGap(next.checkinGap);
-    setCreditsHhmm(next.creditsHhmm);
-    setCreditsSyncEnabled(next.creditsSyncEnabled);
+    setCreditsForm(next.creditsForm);
     setTokenRenewEnabled(next.tokenRenewEnabled);
     lastSynced.current = next;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -128,10 +132,13 @@ export default function QoderSettings() {
       pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
       return;
     }
-    if (!isValidHHMM(creditsHhmm)) {
-      pushToast('error', `快照时刻格式无效：${creditsHhmm}（应为 HH:MM）`);
+    if (creditsForm.mode === 'daily' && !isValidHHMM(creditsForm.hhmm)) {
+      pushToast('error', `同步时刻格式无效：${creditsForm.hhmm}（应为 HH:MM）`);
       return;
     }
+    const creditsHours = String(
+      Math.min(24, Math.max(1, Math.round(Number(creditsForm.hours) || 2))),
+    );
     setSaving(true);
     try {
       await withMinDelay(
@@ -141,8 +148,11 @@ export default function QoderSettings() {
             qoderwork_path: workPath.trim() || null,
             qoder_checkin_hhmm: checkinHhmm.trim(),
             qoder_checkin_gap_secs: checkinGap,
-            qoder_credits_sync_hhmm: creditsHhmm.trim(),
-            qoder_credits_sync_enabled: creditsSyncEnabled,
+            qoder_credits_sync_mode: creditsForm.mode,
+            qoder_credits_sync_hhmm: creditsForm.hhmm.trim() || '23:40',
+            qoder_credits_sync_hours: creditsHours,
+            // 旧两态开关双写兼容：mode≠off 即启用（调度器已改按 mode 判定，此处仅保历史读取方）
+            qoder_credits_sync_enabled: creditsForm.mode !== 'off',
             qoder_token_renew_enabled: tokenRenewEnabled,
           }),
           api.qoder.settingsSet(qoderSettings),
@@ -157,8 +167,7 @@ export default function QoderSettings() {
         workPath: workPath.trim(),
         checkinHhmm: checkinHhmm.trim(),
         checkinGap,
-        creditsHhmm: creditsHhmm.trim(),
-        creditsSyncEnabled,
+        creditsForm: { mode: creditsForm.mode, hhmm: creditsForm.hhmm.trim(), hours: creditsHours },
         tokenRenewEnabled,
       };
       await refresh();
@@ -406,7 +415,7 @@ export default function QoderSettings() {
                   <button
                     className="btn-ghost !px-3 !py-1 text-xs text-rose-500"
                     disabled={taskBusy}
-                    onClick={() => void unregisterTask()}
+                    onClick={() => setConfirmUnregister(true)}
                   >
                     {taskBusy ? <Spinner /> : null} 卸载
                   </button>
@@ -425,37 +434,91 @@ export default function QoderSettings() {
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
-          {/* 积分数据同步（原「积分快照」改名：定时同步积分看板的服务端数据） */}
+          {/* 积分数据同步（对齐 Buddy 设计）：四模式定时同步看板服务端数据 */}
           <div className="flex items-center justify-between">
             <h3 className="font-medium">积分数据同步</h3>
-            <span className="text-xs text-slate-400">开关与时刻随右上角「保存配置」生效</span>
+            <span className="text-xs text-slate-400">模式与时刻随右上角「保存配置」生效</span>
           </div>
           <p className="mb-3 mt-1 text-xs text-slate-400">
-            定时同步积分看板的服务端数据：每日拉取全部账号余额写入快照（积分看板趋势数据源）；
-            无账号时空转不计失败。应用关闭期间不执行。
+            应用运行期间按所选模式自动同步积分看板的服务端数据（每日拉取全部账号余额写入快照，积分看板趋势数据源）；
+            无账号时静默跳过不计失败，失败 30 分钟后自动重试；应用关闭期间不执行。
           </p>
           <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <input
-                type="checkbox"
-                checked={creditsSyncEnabled}
-                onChange={(e) => setCreditsSyncEnabled(e.target.checked)}
-              />
-              启用
+            <label className="flex items-center gap-2 text-sm">
+              <span className="text-xs font-medium text-slate-500">同步模式</span>
+              <select
+                className="input h-9 !w-32 text-sm"
+                value={creditsForm.mode}
+                onChange={(e) => setCreditsForm({ ...creditsForm, mode: e.target.value })}
+              >
+                <option value="every_hours">每N小时</option>
+                <option value="daily">每日定时</option>
+                <option value="hourly">每小时</option>
+                <option value="off">关闭</option>
+              </select>
             </label>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
-              <input
-                type="time"
-                className="input h-9 !w-28 text-sm"
-                value={creditsHhmm}
-                onChange={(e) => setCreditsHhmm(e.target.value || '23:40')}
-              />
-              <span className="text-xs text-slate-400">默认 23:40</span>
-            </div>
+            {creditsForm.mode === 'every_hours' && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-slate-500">同步间隔</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={24}
+                  value={creditsForm.hours}
+                  onChange={(e) => setCreditsForm({ ...creditsForm, hours: e.target.value })}
+                  onBlur={() => {
+                    // 清空为合法中间态（onChange 不强制回填），失焦时归一到 1-24 落值
+                    const n = Math.min(24, Math.max(1, Math.round(Number(creditsForm.hours) || 2)));
+                    setCreditsForm({ ...creditsForm, hours: String(n) });
+                  }}
+                  className="input h-9 !w-20 text-sm"
+                />
+                <span className="text-xs text-slate-400">
+                  小时（1-24）；距上次成功同步满 {creditsForm.hours || '2'} 小时自动执行一次
+                </span>
+              </div>
+            )}
+            {creditsForm.mode === 'daily' && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
+                <input
+                  type="time"
+                  value={creditsForm.hhmm}
+                  onChange={(e) => setCreditsForm({ ...creditsForm, hhmm: e.target.value || '23:40' })}
+                  className="input h-9 !w-28 text-sm"
+                />
+                <span className="text-xs text-slate-400">每天 {creditsForm.hhmm || '23:40'} 执行（应用关闭期间不执行）</span>
+              </div>
+            )}
+            {creditsForm.mode === 'hourly' && (
+              <span className="text-xs text-slate-400">应用运行期间每小时同步一次</span>
+            )}
           </div>
         </div>
       </div>
+
+      {/* 卸载确认弹窗（删除类操作二次确认） */}
+      <Modal
+        open={confirmUnregister}
+        onClose={() => setConfirmUnregister(false)}
+        title="确认卸载定时签到任务"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmUnregister(false)}>取消</button>
+            <button className="btn-danger" onClick={() => { setConfirmUnregister(false); void unregisterTask(); }}>确认卸载</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>确认卸载 Windows 定时签到计划任务{taskTimes.length > 0 ? `（${taskTimes.join('、')}）` : ''}？</p>
+            <p className="mt-2 text-xs text-slate-400">
+              卸载后应用未启动时将不再有签到兜底；应用内置调度不受影响，之后可随时重新注册。
+            </p>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

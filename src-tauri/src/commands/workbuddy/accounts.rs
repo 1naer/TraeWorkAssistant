@@ -734,38 +734,12 @@ pub fn workbuddy_accounts_export(state: State<AppState>, include_credentials: Op
 /// 账号库导入（F-46 扩展）：解析导出文件 → 逐账号按 uid 幂等入池
 ///（已存在（同 uid，可能换 token/异机 id）原位更新并保留原 id，不重复入池）+ 凭证回写 token store。
 /// P2：tags 字段恢复共享标签绑定（仅本机已存在的 tag id，未知 id 忽略）。
-
-/// 导入条目的 tags 字段收集：仅保留本机已存在的 tag id（未知 id 计入 ignored，
-/// 不自动创建标签）；final_id = 原位更新保留的原 id 或新增 id
-fn collect_import_tags(
-    entry: &serde_json::Value,
-    final_id: &str,
-    tag_defs: &[crate::models::Tag],
-    out: &mut Vec<(String, Vec<String>)>,
-    ignored: &mut usize,
-) {
-    let Some(arr) = entry.get("tags").and_then(|v| v.as_array()) else {
-        return;
-    };
-    let valid: Vec<String> = arr
-        .iter()
-        .filter_map(|t| t.as_str())
-        .filter(|t| {
-            if tag_defs.iter().any(|d| d.id == **t) {
-                true
-            } else {
-                *ignored += 1;
-                false
-            }
-        })
-        .map(String::from)
-        .collect();
-    if !valid.is_empty() {
-        out.push((final_id.to_string(), valid));
-    }
-}
 #[tauri::command(async)]
-pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+pub fn workbuddy_accounts_import(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     if payload.get("kind").and_then(|v| v.as_str()) != Some("aiwork-workbuddy-pool") {
         return Err("文件格式无法识别（缺少 aiwork-workbuddy-pool 标记）".into());
     }
@@ -783,10 +757,28 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     // 标签绑定恢复（P2 需求③）：读入文件中的 tags，循环结束后按最终账号 id
-    // 落 account_tags 表（仅本机已存在的 tag id，未知 id 忽略不自动创建）
-    let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+    // 落 account_tags 表（仅本机已存在的 tag id，未知 id 忽略不自动创建）。
+    // defs 短锁内读取：与并发标签增删的 RMW 快照一致
+    let tag_defs = {
+        let _defs = state
+            .group_defs_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::store::docs::tags_load(&crate::store::db(&state.data_dir))
+    };
+    // 幽灵分组防御（对齐 qoder 导入侧）：预载共享分组定义，新增条目的 group_id
+    // 指向不存在分组（异机导入未随载荷携带定义/本地已删分组）时回落「未分组」——
+    // 聚合落空的幽灵引用不如显式未分组。池锁已持有，与并发 defs 写方读隔离
+    let valid_group_ids: std::collections::HashSet<String> =
+        crate::store::docs::group_defs_load(&crate::store::db(&state.data_dir))
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
     let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     let mut tags_ignored = 0usize;
+    // 凭证先收集、save_pool 成功后统一落库逐条聚合（对齐 qoder 先例）：原实现
+    // 循环内 upsert_token_store 带 ?，某条失败整次导入中断且无明细，账号半成品
+    let mut cred_writes: Vec<(String, serde_json::Value)> = Vec::new();
     for a in accounts {
         let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if id.is_empty() {
@@ -829,15 +821,20 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
             }
             x.auth_saved_at = Some(chrono::Utc::now().timestamp());
             updated += 1;
-            collect_import_tags(a, &x.id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
-            // 凭证副本回写（导出时含凭证才有效）：写回保留的原 id 名下，与池条目对齐
+            crate::commands::tags::collect_import_tags(a, &x.id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
+            // 凭证副本收集（导出时含凭证才有效）：写回保留的原 id 名下，与池条目对齐
             if let Some(cred) = a.get("credential").filter(|c| c.is_object()) {
-                let rec = cred.clone();
-                upsert_token_store(&state, &x.id, &rec)?;
-                with_cred += 1;
+                cred_writes.push((x.id.clone(), cred.clone()));
             }
             continue;
         }
+        // 新增条目 group_id 指向不存在分组 → 回落「未分组」（空串）
+        let entry_gid = a.get("group_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let entry_gid = if entry_gid.is_empty() || valid_group_ids.contains(&entry_gid) {
+            entry_gid
+        } else {
+            String::new()
+        };
         pool.accounts.push(WorkBuddyAccount {
             id: id.clone(),
             uid: entry_uid,
@@ -846,33 +843,61 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
             edition_type: a.get("edition_type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             access_token_expires_at: a.get("access_token_expires_at").and_then(|v| v.as_i64()),
             refresh_token_expires_at: a.get("refresh_token_expires_at").and_then(|v| v.as_i64()),
-            group_id: a.get("group_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            group_id: entry_gid,
             note: a.get("note").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             auth_saved_at: Some(chrono::Utc::now().timestamp()),
             ..Default::default()
         });
         added += 1;
-        collect_import_tags(a, &id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
-        // 凭证副本回写（导出时含凭证才有效）
+        crate::commands::tags::collect_import_tags(a, &id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
+        // 凭证副本收集（导出时含凭证才有效）
         if let Some(cred) = a.get("credential").filter(|c| c.is_object()) {
-            let rec = cred.clone();
-            upsert_token_store(&state, &id, &rec)?;
-            with_cred += 1;
+            cred_writes.push((id.clone(), cred.clone()));
         }
     }
     save_pool(&state, &pool)?;
-    // 标签绑定落 account_tags 表（uid 键跨池通用；池锁仍持有——账号与标签同批恢复）
-    let store = crate::store::db(&state.data_dir);
+    // 标签绑定落 account_tags 表（uid 键跨池通用；池锁仍持有——账号与标签同批恢复）：
+    // 走 account_tags_set_inner（持 group_defs_lock 校验标签存在性）而非盲写——
+    // 收集→落库窗口内被并发删除的标签按「未知标签忽略」记数 + 日志，不再写入
+    // 指向已删标签的幽灵绑定。持池锁期间取 defs 锁（锁序池锁→defs锁）
+    let mut tags_restored = 0usize;
     for (uid, ids) in &tag_bindings {
-        crate::store::docs::account_tags_set(&store, uid, ids)?;
+        match crate::commands::tags::account_tags_set_inner(&state, uid, ids) {
+            Ok(()) => tags_restored += ids.len(),
+            Err(e) if e.starts_with("标签不存在") => {
+                tags_ignored += ids.len();
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("workbuddy 导入: 标签绑定跳过（落库时标签已被并发删除，按未知标签忽略）uid={uid}: {e}"),
+                );
+            }
+            Err(e) => rejected.push(serde_json::json!({
+                "id": uid,
+                "reason": format!("账号已入池，但标签绑定落库失败：{e}（重新导入可补齐）"),
+            })),
+        }
+    }
+    // 凭证统一落库逐条聚合：单条失败不中断（账号已入池，重新导入可补齐）
+    for (final_id, rec) in cred_writes {
+        match upsert_token_store(&state, &final_id, &rec) {
+            Ok(()) => with_cred += 1,
+            Err(e) => rejected.push(serde_json::json!({
+                "id": final_id,
+                "reason": format!("账号已入池，但凭证落库失败：{e}（重新导入可补齐）"),
+            })),
+        }
     }
     fs_utils::app_log(
         &state.data_dir,
-        &format!("workbuddy: 账号库导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {} / 标签绑定 {}（未知标签忽略 {tags_ignored}）", rejected.len(), tag_bindings.len()),
+        &format!("workbuddy: 账号库导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）", rejected.len()),
     );
     crate::api_server::org_index::invalidate(&state.data_dir);
+    // 网关池热重载（对齐 Trae accounts_import / qoder data_io 口径）：新增/更新
+    // 账号凭证后不重载，运行中的网关看不到新凭证。先释放池锁（锁序纪律）
+    drop(_guard);
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     // skipped 保留为旧版前端兼容字段：旧语义「同 id 跳过」已改为按 uid 原位合并（updated）
-    Ok(serde_json::json!({ "added": added, "updated": updated, "skipped": 0, "with_credentials": with_cred, "rejected": rejected }))
+    Ok(serde_json::json!({ "added": added, "updated": updated, "skipped": 0, "with_credentials": with_cred, "rejected": rejected, "tags_restored": tags_restored, "tags_ignored": tags_ignored }))
 }
 
 #[cfg(test)]

@@ -1056,7 +1056,14 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
             let back = std::time::Duration::from_secs(stale_secs.min(RESULT_TTL_SECS));
             if let Ok(mut guard) = RESULT_CACHE.lock() {
                 if let Some(at) = Instant::now().checked_sub(back) {
-                    *guard = Some((at, payload.clone()));
+                    // 防旧值覆盖（2026-10-12 审查修复）：kv 读与本次内存写之间，
+                    // 并发后台重扫可能已在锁内写入更新的内存缓存（时间戳≈now）。
+                    // 现有条目时间戳较新则跳过水合——回拨后的旧时间戳必然更旧，
+                    // 覆盖会把新扫描结果回退为 kv 旧快照（300s 节流内不自愈）
+                    match guard.as_ref() {
+                        Some((existing_at, _)) if *existing_at > at => {}
+                        _ => *guard = Some((at, payload.clone())),
+                    }
                 }
             }
             if stale_secs < RESULT_TTL_SECS {

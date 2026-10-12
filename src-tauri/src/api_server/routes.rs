@@ -438,36 +438,14 @@ fn whitelist_error_response(model: &str, proto: Protocol) -> Response {
 }
 
 pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
-    let pool = state.pool.status_list();
-    let wb_pool = state.wb_pool.status_list();
-    let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
-    let cooling = pool.iter().filter(|p| p.cooling).count();
-    let disabled = pool.iter().filter(|p| p.disabled).count();
-    let total_credits: f64 = pool.iter().filter_map(|p| p.credits).sum();
-    let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
-    let active = safe_lock(&state.active_uid).clone();
-    let last_err = safe_lock(&state.last_error).clone();
-    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let wb_available = wb_pool.iter().filter(|p| !p.disabled && !p.cooling).count();
-
+    // 收敏（2026-10-12 审查 P2）：/health 在 auth.rs 免鉴权放行（探活豁免），
+    // 原实现透出 total_credits/active_uid/last_error/池账号数——非环回监听时
+    // 局域网内无 Key 即可抓取账号与积分画像，与「非环回强制鉴权」防线矛盾。
+    // 探活只需存活布尔；完整诊断由需鉴权的 GET /status 承载（字段超集）
+    let _ = &state;
     Json(json!({
         "status": "ok",
         "running": true,
-        "total_requests": total,
-        "active_uid": active,
-        "last_error": last_err,
-        "pool": {
-            "total_accounts": pool.len(),
-            "available": available,
-            "cooling": cooling,
-            "disabled": disabled,
-            "total_credits": (total_credits * 100.0).round() / 100.0,
-        },
-        "wb": {
-            "enabled": wb_enabled,
-            "total_accounts": wb_pool.len(),
-            "available": wb_available,
-        }
     }))
 }
 
@@ -2968,6 +2946,7 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         WlFixture { dir, state }
     }

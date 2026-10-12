@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, MousePointerClick, Search, SlidersHorizontal, ListChecks } from 'lucide-react';
+import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, MousePointerClick, Search, SlidersHorizontal, ListChecks, AlertTriangle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { Badge, Spinner } from '../../components/ui';
+import { Badge, Spinner, Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -179,6 +179,7 @@ const DAY_LABEL: Record<string, string> = {
 /** 任务配置卡：JWT 定时续期（refreshToken 配置 + 每周兜底任务）+ 自动签到（含每日时刻）+ 积分与 Token 同步 + 自动成长 */
 function TaskConfigCard({
   settings,
+  savedSettingsRef,
   patch,
   growthForm,
   setGrowthForm,
@@ -190,6 +191,10 @@ function TaskConfigCard({
   setCheckinGap,
 }: {
   settings: WorkBuddySettings | null;
+  /** 最近一次持久化/加载的设置快照（ref）：savePatch 的基底，避免连带持久化未保存的
+      本地编辑；传 ref 而非快照值，savePatch 成功后就地推进基底（调用时读取恒为新值，
+      同卡连续两次单项保存互不回滚） */
+  savedSettingsRef: { current: WorkBuddySettings | null };
   patch: (p: Partial<WorkBuddySettings>) => void;
   growthForm: { enabled: boolean; hhmm: string };
   setGrowthForm: (f: { enabled: boolean; hhmm: string }) => void;
@@ -208,6 +213,9 @@ function TaskConfigCard({
   const [taskBusy, setTaskBusy] = useState(false);
   // UI 点击兜底执行态（防连点重复驱动鼠标）
   const [uiClickBusy, setUiClickBusy] = useState<'capture' | 'run' | null>(null);
+  // 卸载确认（删除类操作二次确认，与 Settings 页口径一致）
+  const [confirmUnregister, setConfirmUnregister] = useState(false);
+  const [confirmRenewOff, setConfirmRenewOff] = useState(false);
   // 每日签到注册时刻（默认 09:00 可改；第二时段可清空 = 单时段）
   const [t1, setT1] = useState('09:00');
   const [t2, setT2] = useState('21:00');
@@ -224,7 +232,10 @@ function TaskConfigCard({
     refreshTasks();
   }, [refreshTasks]);
 
-  // settings 单项保存（走 settingsSet 全量 patch，与父页「保存配置」同通道）
+  // settings 单项保存（走 settingsSet 全量写，与父页「保存配置」同通道）。
+  // 以 savedSettingsRef（最近一次持久化/加载快照）为基底，仅叠加本次字段——
+  // 不可 spread 实时 settings prop：其中含本卡已改但未随「保存配置」落盘的
+  // 本地编辑（keepalive_days / CLI 轮换参数等），连带提交违背「随保存配置生效」语义
   const savePatch = async (p: Partial<WorkBuddySettings>) => {
     if (!settings) {
       pushToast('warn', '设置尚未加载，请稍后重试');
@@ -232,8 +243,12 @@ function TaskConfigCard({
     }
     setSavingSettings(true);
     try {
+      const next = { ...(savedSettingsRef.current ?? settings), ...p };
       patch(p);
-      await api.workbuddy.settingsSet({ ...settings, ...p });
+      await api.workbuddy.settingsSet(next);
+      // 成功后就地推进基底快照：settingsSet 为整文档替换，若仍以旧快照为基底，
+      // 同卡连续两次单项保存（如「先启用开关→再取点」）会把上一次已落盘的字段回滚丢失
+      savedSettingsRef.current = next;
     } catch (err) {
       pushToast('error', `保存设置失败：${String(err)}`);
     } finally {
@@ -350,7 +365,7 @@ function TaskConfigCard({
               onChange={(e) => setRenewTime(e.target.value || '10:30')}
               className="input h-9 !w-28 text-sm"
             />
-            <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void toggleRenew()}>
+            <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => (renewOn ? setConfirmRenewOff(true) : void toggleRenew())}>
               {taskBusy ? <Spinner /> : null} {renewOn ? '卸载' : '注册'}
             </button>
           </div>
@@ -429,7 +444,7 @@ function TaskConfigCard({
                   {taskBusy ? <Spinner /> : null} 注册
                 </button>
               ) : (
-                <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void unregisterTasks()}>
+                <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => setConfirmUnregister(true)}>
                   {taskBusy ? <Spinner /> : null} 卸载
                 </button>
               )}
@@ -535,8 +550,9 @@ function TaskConfigCard({
               min={1}
               max={24}
               value={creditsForm.hours}
-              onChange={(e) => setCreditsForm({ ...creditsForm, hours: e.target.value || '2' })}
+              onChange={(e) => setCreditsForm({ ...creditsForm, hours: e.target.value })}
               onBlur={() => {
+                // 清空为合法中间态（onChange 不强制回填），失焦时归一到 1-24 落值
                 const n = Math.min(24, Math.max(1, Math.round(Number(creditsForm.hours) || 2)));
                 setCreditsForm({ ...creditsForm, hours: String(n) });
               }}
@@ -623,6 +639,50 @@ function TaskConfigCard({
           </label>
         </div>
       </div>
+
+      {/* 卸载确认弹窗（删除类操作二次确认，对齐 Settings 页口径） */}
+      <Modal
+        open={confirmUnregister}
+        onClose={() => setConfirmUnregister(false)}
+        title="确认卸载定时签到任务"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmUnregister(false)}>取消</button>
+            <button className="btn-danger" onClick={() => { setConfirmUnregister(false); void unregisterTasks(); }}>确认卸载</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>确认卸载 Windows 定时签到计划任务{tasks.length > 0 ? `（${tasks.join('、')}）` : ''}？</p>
+            <p className="mt-2 text-xs text-slate-400">
+              卸载后应用未启动时将不再有签到兜底；应用内置调度不受影响，仍可随「保存配置」重新注册。
+            </p>
+          </div>
+        </div>
+      </Modal>
+      <Modal
+        open={confirmRenewOff}
+        onClose={() => setConfirmRenewOff(false)}
+        title="确认卸载每周续期任务"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmRenewOff(false)}>取消</button>
+            <button className="btn-danger" onClick={() => { setConfirmRenewOff(false); void toggleRenew(); }}>确认卸载</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>确认卸载每周兜底续期任务？</p>
+            <p className="mt-2 text-xs text-slate-400">
+              卸载后凭证临期不会自动刷新，需手动续期；过期后账号将不可用。之后可随时重新注册。
+            </p>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }
@@ -651,6 +711,10 @@ export default function BuddySettings() {
   const [detecting, setDetecting] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const prefilled = useRef(false);
+  // 最近一次持久化/加载的 settings 快照（TaskConfigCard savePatch 基底，
+  // 见该卡内注释）；refresh 成功后、父页「保存配置」完成后的 refresh、
+  // 以及 TaskConfigCard 内 savePatch 成功后都会更新
+  const savedSettingsRef = useRef<WorkBuddySettings | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -661,6 +725,7 @@ export default function BuddySettings() {
       ]);
       setEnv(e);
       setSettings(st);
+      savedSettingsRef.current = st;
     } catch (err) {
       pushToast('error', `环境检测失败：${String(err)}`);
     }
@@ -913,6 +978,7 @@ export default function BuddySettings() {
         {/* 右：任务配置（JWT 续期 / 自动签到 / 积分与 Token 同步 / 自动成长） */}
         <TaskConfigCard
           settings={settings}
+          savedSettingsRef={savedSettingsRef}
           patch={patch}
           growthForm={growthForm}
           setGrowthForm={setGrowthForm}

@@ -338,6 +338,10 @@ fn import_device_map(store: &Store, path: &Path) -> ImportStatus {
     })
 }
 
+/// 旧版 groups.json 导入（经 DOC_ENTRIES 表接入旧目录迁移链路）。不持
+/// org_defs_lock/group_defs_lock：调用点均为启动期旧目录一次性导入、单线程
+/// 顺序执行，早于任何并发写路径（调度器/网关/命令层均未启动）；groups_save
+/// 内部仍取 org_defs_lock，与未来可能的并发写入口保持互斥底线
 fn import_groups(store: &Store, path: &Path) -> ImportStatus {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<crate::models::GroupsFile>(&text) {
@@ -491,7 +495,9 @@ fn migrate_kv_flows_v1_to_v2(store: &Store) -> Result<(), String> {
         ("wb_sticky_sessions", import_sticky_bindings_value),
     ];
     for (key, importer) in importers {
-        let Some(text) = store.kv_get_raw(key) else {
+        // R1：走严格版读取——无键（全新安装）才跳过，读库失败显式上抛中止迁移
+        //（kv_get_raw 把读失败也折成 None → 静默跳过，流水键残留不迁移）
+        let Some(text) = store.kv_get_raw_checked(key)? else {
             continue; // v1 老库无此键（全新安装）→ 跳过
         };
         let v: Value = serde_json::from_str(&text)
@@ -513,10 +519,12 @@ fn import_wb_credits_history_value(store: &Store, v: &Value) -> Result<(), Strin
 ///    迁移前整体快照至 kv("groups_pre_migration") 可回滚；
 /// 2. 按 name 去重合并（同名即同组，颜色/排序取 Trae > Buddy > Qoder 首个出现），
 ///    全部重新生成 `shg_` 新 ID（不保留任何旧应用 id），构建 id_map 全量重定向；
-/// 3. 重定向 group_members 表、WB/Qoder 账号 group_id 字段、
+/// 3. 全删全写 groups 表（defs 先于重定向落库，保证崩溃重跑按 name 复用既有
+///    shg_ id，引用不悬空）；
+/// 4. 重定向 group_members 表、WB/Qoder 账号 group_id 字段、
 ///    api_pool.group_ids/wb_group_ids/qoder_group_ids；
-/// 4. 全删全写 groups 表；删除 kv workbuddy_groups / qoder_groups；
-/// 5. kv("unified_groups_migrated") 标记幂等，二次启动跳过。
+/// 5. 删除 kv workbuddy_groups / qoder_groups；
+/// 6. kv("unified_groups_migrated") 标记幂等，二次启动跳过。
 /// 容错（审查修复）：中途失败重试时，① 快照不覆盖（只写一次保原始备份）；
 /// ② 复用 groups 表已残留的 shg_ 定义 id，重定向引用不悬空。
 /// 返回统一后的分组条数（0 = 幂等跳过）。
@@ -525,18 +533,39 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
     if store.kv_get::<bool>("unified_groups_migrated") {
         return Ok(0);
     }
+    // 全程持 org_defs_lock（2026-10-12 审查 P4）：与运行期分组/标签写入口
+    // （docs 层同锁）互斥，迁移的 defs 读-改-写不再与并发写互相覆盖。
+    // 局限：进程内锁对 CLI 双进程无效——迁移仅启动期执行且有幂等标记，
+    // 风险有限，文件锁暂不实施。内部 group_defs_save 走 unlocked 版防重入死锁
+    let _org_guard = crate::store::docs::org_defs_lock();
     // 1. 读三处 defs + Trae membership，整体快照备份（可回滚）。
     //    快照只写一次（审查修复）：中途失败重试时若覆盖快照，备份会被
     //    「已部分重定向」的状态污染，恰在回滚最需要时失效。
-    let trae_all: Vec<Group> = docs::group_defs_load(store);
+    // 源读 fail-closed（审查修复清单 v1.4.9 B2）：三处源读失败显式上抛中止迁移——
+    // 原实现静默空集会让「全删全写 defs / 删 kv」重创性迁移在残缺快照上误执行
+    //（且 groups_pre_migration 备份会固化残缺态）。失败即中止，下次启动重试
+    let trae_all: Vec<Group> = store
+        .rows_all("groups")?
+        .into_iter()
+        .filter_map(|(_, data)| serde_json::from_value(data).ok())
+        .collect();
     // 上次中途失败残留的 shg_ 定义不算 Trae 旧定义（迁移计数/备份口径均剔除）
     let trae: Vec<Group> = trae_all
         .iter()
         .filter(|g| !g.id.starts_with("shg_"))
         .cloned()
         .collect();
-    let wb: Vec<Group> = store.kv_get("workbuddy_groups");
-    let qoder: Vec<Group> = store.kv_get("qoder_groups");
+    // 两池私有 kv：缺失（None）= 合法空集；读取失败（Err）与解析失败显式上抛
+    //（R1：走 kv_get_raw_checked 严格版——kv_get/kv_get_raw 均把读失败与缺失
+    // 合并为默认值/None，fail-open）
+    let kv_groups = |key: &str| -> Result<Option<Vec<Group>>, String> {
+        store
+            .kv_get_raw_checked(key)?
+            .map(|raw| serde_json::from_str(&raw).map_err(|e| format!("{key} 解析失败: {e}")))
+            .transpose()
+    };
+    let wb: Vec<Group> = kv_groups("workbuddy_groups")?.unwrap_or_default();
+    let qoder: Vec<Group> = kv_groups("qoder_groups")?.unwrap_or_default();
     let member_rows: Vec<(String, String)> = store
         .with_conn(|c| {
             let mut stmt = c.prepare("SELECT uid, group_id FROM group_members")?;
@@ -544,11 +573,12 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
-        })
-        .unwrap_or_default();
+        })?;
     let members_before: std::collections::HashMap<String, String> =
         member_rows.iter().cloned().collect();
-    if store.kv_get_raw("groups_pre_migration").is_none() {
+    // R1：备份判断走严格版——读失败上抛中止（kv_get_raw 把读失败折成 None，
+    // 会覆盖重写备份，污染「只写一次」的原始备份红线）；仅确认无键时才写
+    if store.kv_get_raw_checked("groups_pre_migration")?.is_none() {
         store.kv_set(
             "groups_pre_migration",
             &json!({
@@ -589,7 +619,14 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
         g.order = (i + 1) as i32;
     }
 
-    // 3. id_map 全量重定向（逐条 UPDATE，旧 id 不存在时 0 行受影响，幂等无害）
+    // 3. defs 先落库（崩溃窗口修复）：重定向引用**之前**先把统一 defs 全删全写进
+    //    groups 表——此后任一步崩溃，重跑经上方「残留 shg_ 定义按 name 复用」
+    //    路径拿到同一 id，已重定向的引用不悬空。原实现 defs 在重定向后才落库，
+    //    重定向完成至落库之间崩溃时，重跑会生成全新 shg_ id，指向旧 id 的
+    //    成员/账号/池筛选引用全部悬空（且重名校验还会拒绝同名新组）。
+    docs::group_defs_save_unlocked(store, &new_defs)?;
+
+    // 4. id_map 全量重定向（逐条 UPDATE，旧 id 不存在时 0 行受影响，幂等无害）
     for (old, new) in &id_map {
         if old == new {
             continue;
@@ -606,8 +643,7 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
     redirect_pool_group_ids(store, "qoder_accounts", &id_map)?;
     redirect_api_pool_group_ids(store, &id_map)?;
 
-    // 4. 全删全写统一 defs；5. 删除三套私有 kv
-    docs::group_defs_save(store, &new_defs)?;
+    // 5. 删除三套私有 kv；6. 置幂等标记（defs 已在步骤 3 落库）
     store.kv_delete("workbuddy_groups")?;
     store.kv_delete("qoder_groups")?;
     store.kv_set("unified_groups_migrated", &true)?;
@@ -638,9 +674,11 @@ fn redirect_pool_group_ids(
     table: &str,
     id_map: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
+    // R1 fail-closed（对齐 migrate_unified_groups 的 kv 源读取红线）：读库失败
+    // 显式上抛中止迁移——若折成空集静默跳过，旧 group_id 在 kv 定义删除、幂等
+    // 标记置位后永久悬空且不再重试（一次性数据损坏）
     let rows: Vec<(String, Value)> = store
-        .rows_all(table)
-        .unwrap_or_default()
+        .rows_all(table)?
         .into_iter()
         .filter(|(_, data)| {
             data.get("group_id")
@@ -677,7 +715,9 @@ fn redirect_api_pool_group_ids(
     store: &Store,
     id_map: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let Some(raw) = store.kv_get_raw("api_pool") else {
+    // R1：无键（未配置 api_pool）才跳过重定向；读库失败显式上抛——静默 Ok 会让
+    // api_pool 引用残留旧分组 id（悬空），且迁移幂等标记已置位不再重试
+    let Some(raw) = store.kv_get_raw_checked("api_pool")? else {
         return Ok(());
     };
     let mut v: Value = serde_json::from_str(&raw).map_err(|e| format!("api_pool 解析失败: {e}"))?;
@@ -878,6 +918,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         crate::vault::migrate_on_startup(&state);
 

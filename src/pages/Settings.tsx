@@ -136,7 +136,6 @@ export default function Settings() {
     try {
       const r = await withMinDelay(api.misc.taskStatus());
       setTaskInfo(r);
-      toast('success', '查询完成');
     } catch (e) {
       setTaskInfo(`查询失败：${String(e)}`);
       toast('error', `查询失败：${String(e)}`);
@@ -474,9 +473,10 @@ export default function Settings() {
                   min={1}
                   max={24}
                   value={form.trae_credits_sync_hours}
-                  onChange={(e) => update('trae_credits_sync_hours', e.target.value || '2')}
+                  onChange={(e) => update('trae_credits_sync_hours', e.target.value)}
                   onBlur={(e) => {
-                    // 手输可绕过 min/max（0/负数/超 24），失焦时归一到 1-24（与后端 clamp 口径一致）
+                    // 手输可绕过 min/max（0/负数/超 24），失焦时归一到 1-24（与后端 clamp 口径一致）；
+                    // onChange 保留原始输入（清空为合法中间态），仅失焦时落归一值
                     const n = Math.min(24, Math.max(1, Math.round(Number(e.target.value) || 2)));
                     update('trae_credits_sync_hours', String(n));
                   }}

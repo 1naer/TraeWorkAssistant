@@ -38,6 +38,11 @@ export function TagsModal({
       tags.forEach((t) => {
         if (!(t.id in next)) next[t.id] = t.name;
       });
+      // 清理已删除标签的残留输入值（防 state 无限累积）
+      const live = new Set(tags.map((t) => t.id));
+      for (const id of Object.keys(next)) {
+        if (!live.has(id)) delete next[id];
+      }
       return next;
     });
   }, [tags]);
@@ -126,7 +131,11 @@ export function TagsModal({
                         return next;
                       });
                     })
-                    .catch(() => {});
+                    .catch(() => {
+                      // F5（审查修复清单 v1.4.9）：保存失败回退输入框为持久化旧名
+                      //（调用方已 toast 失败），不残留未持久化新值误导用户
+                      setEditingNames((prev) => ({ ...prev, [t.id]: t.name }));
+                    });
                 }
               }}
               className="input !py-1 flex-1 !text-xs"

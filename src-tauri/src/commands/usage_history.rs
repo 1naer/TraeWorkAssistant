@@ -281,8 +281,11 @@ fn fetch_chunk(
             "usage_type": [USAGE_TYPE],
         });
         let resp = web_usage_post(agent, jwt, USAGE_URL, body)?;
+        // total 字段缺失时不写入哨兵 0（G9）：保持 None，终止条件按满页判断继续
         if total.is_none() {
-            total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
+            if let Some(n) = resp.get("total").and_then(Value::as_u64) {
+                total = Some(n as usize);
+            }
         }
         let arr = resp
             .get("user_usage_group_by_sessions")
@@ -361,9 +364,13 @@ fn fetch_chunk(
             sessions.entry(date).or_default().push(row);
         }
         got += arr.len();
-        let total_n = total.unwrap_or(0);
-        // 终止条件：已取满 total / 本页不满页大小（服务端截断页）/ 超过安全页数上限
-        if got >= total_n || (arr.len() as u32) < PAGE_SIZE || page >= MAX_PAGES {
+        // 终止条件（G9）：total 明确时取满即止；total 字段缺失按满页判断继续拉取
+        //（原实现缺失被当作 0，第一页后即终止静默截断），至 MAX_PAGES 上限如实
+        // 返回已取行；本页不满页大小（服务端截断页）照常终止
+        if matches!(total, Some(n) if got >= n)
+            || (arr.len() as u32) < PAGE_SIZE
+            || page >= MAX_PAGES
+        {
             break;
         }
         page += 1;
@@ -745,7 +752,10 @@ pub fn usage_sessions_query(
     rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.session_id.cmp(&a.session_id)));
     let total = rows.len() as u64;
     let credits_total = rows.iter().map(|r| r.credits).sum();
-    let begin = ((page - 1) * page_size) as usize;
+    // 页码夹取：越界页回夹到最后一页（数据减少后翻页不再出现空页）；乘法 u64 饱和
+    let total_pages = total.div_ceil(page_size as u64).max(1) as u32;
+    let page = page.min(total_pages);
+    let begin = ((page as u64 - 1).saturating_mul(page_size as u64)) as usize;
     let rows: Vec<UsageSessionView> = rows
         .into_iter()
         .skip(begin)

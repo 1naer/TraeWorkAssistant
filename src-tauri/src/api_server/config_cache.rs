@@ -56,6 +56,59 @@ where
     v
 }
 
+/// 取缓存或加载（可失败版，org_index 等整库读场景专用）：
+/// - 未过期缓存命中 → 直接返回；
+/// - miss/过期 → 调用 `load`；成功则回填缓存并返回；
+/// - `load` 失败（如瞬时读库失败）→ **不缓存失败结果**，若注册表中存在旧快照
+///   （即使已过期）则沿用旧快照兜底并记日志——避免一次瞬时读库失败把空索引
+///   回填缓存、导致全库账号在 TTL 窗口内不可取号；
+/// - 首启无任何快照才调用 `fallback`（调用方通常回退空索引）。
+pub fn get_or_load_fallible<T, E>(
+    data_dir: &Path,
+    key: &'static str,
+    load: impl FnOnce() -> Result<T, E>,
+    fallback: impl FnOnce() -> T,
+) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    E: std::fmt::Display,
+{
+    let cache_key = (data_dir.to_path_buf(), key);
+    // 未过期命中直接返回；过期条目暂存（快照引用），load 失败时兜底用
+    let mut stale: Option<std::sync::Arc<serde_json::Value>> = None;
+    {
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = reg.get(&cache_key) {
+            if e.at.elapsed() < TTL {
+                if let Ok(v) = serde_json::from_value::<T>((*e.val).clone()) {
+                    return v;
+                }
+                // 类型不匹配（理论不可达）：视作脏条目，走下方重载
+            } else {
+                stale = Some(e.val.clone());
+            }
+        }
+    }
+    match load() {
+        Ok(v) => {
+            if let Ok(json) = serde_json::to_value(&v) {
+                let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+                reg.insert(cache_key, Entry { val: std::sync::Arc::new(json), at: Instant::now() });
+            }
+            v
+        }
+        Err(err) => {
+            eprintln!("[config_cache] {key} 重载失败（沿用旧快照兜底）: {err}");
+            if let Some(json) = stale {
+                if let Ok(v) = serde_json::from_value::<T>((*json).clone()) {
+                    return v;
+                }
+            }
+            fallback()
+        }
+    }
+}
+
 /// 写路径显式失效（保存函数写库后调用，配置改动即时生效）
 pub fn invalidate(data_dir: &Path, key: &'static str) {
     let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());

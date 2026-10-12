@@ -31,11 +31,19 @@ pub fn qoder_sessions_query(
     let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
 
-    // 账号展示名以账号池为准（uid → nickname）；拷入闭包所有权（with_conn 要求 'static 闭包）
+    // 账号展示名以账号池为准（uid → nickname）；拷入闭包所有权（with_conn 要求 'static 闭包）。
+    // 双键匹配（id + uid）：流水 uid 列记录的是取号账号标识，不同写入路径分别落
+    // 账号 id（qd- 前缀）与 uid（数字），仅按单键索引会查不到 → 归属名恒空
     let name_of: std::collections::HashMap<String, String> = super::common::load_pool(&state)
         .into_iter()
         .filter(|a| !a.uid.is_empty())
-        .map(|a| (a.uid.clone(), a.nickname.clone()))
+        .flat_map(|a| {
+            let mut kv = vec![(a.uid.clone(), a.nickname.clone())];
+            if !a.id.is_empty() && a.id != a.uid {
+                kv.push((a.id.clone(), a.nickname.clone()));
+            }
+            kv
+        })
         .collect();
 
     let raw = crate::store::db(&state.data_dir).with_conn(move |c| {
@@ -63,8 +71,8 @@ pub fn qoder_sessions_query(
                         mode: String::new(),
                         credits: r.get(6)?,
                         cost_money: 0.0,
-                        input_tokens: r.get::<_, i64>(7)? as u64,
-                        output_tokens: r.get::<_, i64>(8)? as u64,
+                        input_tokens: r.get::<_, i64>(7)?.max(0) as u64,
+                        output_tokens: r.get::<_, i64>(8)?.max(0) as u64,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
                         preview: r.get(9)?,
@@ -74,11 +82,14 @@ pub fn qoder_sessions_query(
         })?;
         while let Some(item) = it.next() {
             let (model, pair) = item?;
-            // models 清单收录不受 model 过滤影响（筛选下拉用）
-            models.insert(model);
+            // uid 过滤先行（G1）：models 清单不收录被 uid 过滤掉的账号用过的模型——
+            // 否则 A 账号可见 B 账号用过的模型名（对齐 Trae 侧口径：uid 过滤 →
+            // 收录 → model 过滤）
             if uid_filter.is_some_and(|f| pair.1.user_id != f) {
                 continue;
             }
+            // models 清单收录不受 model 过滤影响（筛选下拉用）
+            models.insert(model);
             if model_filter.is_some_and(|m| pair.1.model != m) {
                 continue;
             }
@@ -97,7 +108,11 @@ pub fn qoder_sessions_query(
     });
     let total = rows.len() as u64;
     let credits_total = rows.iter().map(|r| r.1.credits).sum();
-    let begin = ((page - 1) * page_size) as usize;
+    // 页码夹取 + u64 中间量：越界页回夹到最后一页（原实现越界返回空页，前端
+    // 翻页期间数据减少会出现「空白页卡死」）；乘法走 u64 饱和防溢出
+    let total_pages = total.div_ceil(page_size as u64).max(1) as u32;
+    let page = page.min(total_pages);
+    let begin = ((page as u64 - 1).saturating_mul(page_size as u64)) as usize;
     let rows: Vec<UsageSessionView> = rows
         .into_iter()
         .skip(begin)

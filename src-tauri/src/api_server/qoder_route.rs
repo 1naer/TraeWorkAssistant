@@ -129,28 +129,13 @@ fn sleep_interruptible(
     true
 }
 
-/// resolve 命中条目是否 Global 专属（审查修复：v1 恒 CN 网关执行，Global
-/// 专属条目调度 resolve 双区兜底判活、执行必死，需在执行入口明确拒绝）。
-///
-/// qoder_upstream 未暴露分区分目录/兜底表的查询接口（他人文件不可改），判定
-/// 基于两路**确定性证据**，不依赖旧实现「resolve(Global) 结果与命中条目 Value
-/// 全等 ⟹ 两区同名条目声明必有差异」的脆弱值假设（同名同值场景会误判）：
-/// ① list() 并集按 id 去重、Global 侧先注册：标注 "cn" ⟺ Global 侧（远程目录
-///    + 静态兜底表）完全无此 id → CN resolve 的命中必来自 CN 侧 → 必非专属；
-/// ② 标注 "global" 时借 resolve 双区优先序差异取第二证据：resolve(Global) 序
-///    = [Global 目录, CN 目录, CN 兜底, Global 兜底]，resolve(Cn) 序 = [CN 目录,
-///    Global 目录, Global 兜底, CN 兜底]。两路命中**不同**条目时可逐源证明
-///    CN 侧必有此 id（CN 远程目录或 CN 兜底表至少其一声明）→ 必非专属；
-/// ③ 两路命中全等：既有 pub 接口无法区分「仅 Global 独持」与「两区同名同值」
-///    （后者仅可能来自远程目录动态刷新；静态兜底表两区同名条目倍率/档位全
-///    不同）。按 v1 恒 CN 执行的 fail-closed 策略判 Global 专属：Global 侧
-///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
-///    收上游诡异报错，拒绝则走明确的 404 提示通道。
 /// 从上游 usage JSON 提取 Qoder 积分测量（issue #82 T2）：
-/// 返回 (credits, original_credits)。credits 复数字段优先——单数 `credit` 是旧版
-/// 字段，读它恒为 0（qoder2api-hub issue #22 命门）；两字段均非负时与 Python
-/// `or` 链回退语义等价。usage 缺失或计费字段都取不到 → None（调用方传 None
-/// 不入账，与「上游未下发 usage 不得伪造」口径一致）
+/// 返回 (credits, original_credits)。credits 取复数字段——单数 `credit` 是旧版
+/// 字段，读它恒为 0（qoder2api-hub issue #22 命门），故仅在复数缺失时参与回退。
+/// **等价性前提**：与 Python `or` 链「首值非零即用」等价，仅在上游保证单数
+/// credit 恒为 0/缺失时成立；两值同现时取 max（按更高积分计）是有意为之的
+/// 保守口径，不追求与 or 链逐值等价。usage 缺失或计费字段都取不到 → None
+/// （调用方传 None 不入账，与「上游未下发 usage 不得伪造」口径一致）
 fn extract_billing(usage: Option<&Value>) -> (Option<f64>, Option<f64>) {
     let Some(u) = usage else {
         return (None, None);
@@ -170,8 +155,48 @@ fn extract_billing(usage: Option<&Value>) -> (Option<f64>, Option<f64>) {
     (credits, original)
 }
 
+/// system-reminder 剥离正则（惰性编译一次）：非贪婪跨行匹配整块注入。
+fn reminder_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?s)\s*<system-reminder>.*?</system-reminder>\s*")
+            .expect("system-reminder regex")
+    })
+}
+
+/// user 输入包裹标签正则（惰性编译一次）：<user_input> / </user_input>（容忍属性）。
+fn user_input_tag_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"</?user_input[^>]*>").expect("user_input tag regex")
+    })
+}
+
+/// 剥掉客户端注入的 `<system-reminder>` 块与 `<user_input>` 包裹标签（agent
+/// 客户端把它们拼进 user 消息——reminder 前置劫持正文、输入被标签包裹），
+/// 剩余即用户原话。剥离后仅剩空白时返回空串（调用方按无 preview 处理）。
+fn strip_reminders(text: &str) -> String {
+    let no_reminders = reminder_re().replace_all(text, " ");
+    let stripped = user_input_tag_re().replace_all(&no_reminders, " ");
+    // 连续空白压成单个空格后 trim（多块剥离后常残留空行/空格）
+    let mut out = String::with_capacity(stripped.len());
+    let mut in_ws = false;
+    for ch in stripped.chars() {
+        if ch.is_whitespace() {
+            in_ws = true;
+        } else {
+            if in_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            in_ws = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// issue #82 问题5：会话 preview——末条 user 消息文本（与 build_upstream_body
-/// last_user_text 同款逆序口径），截 200 字符。
+/// last_user_text 同款逆序口径），剥离注入块/包裹标签后截 200 字符。
 fn session_preview(peek: &Value) -> String {
     let mut text = String::new();
     if let Some(messages) = peek.get("messages").and_then(Value::as_array) {
@@ -184,22 +209,14 @@ fn session_preview(peek: &Value) -> String {
             }
         }
     }
-    text.chars().take(200).collect()
+    strip_reminders(&text).chars().take(200).collect()
 }
 
-/// issue #82 问题5：记账会话上下文。成功路径从上游信封（prepare_qoder_body 产物）
-/// 顶层反解析 request_id/session_id；信封缺失或解析失败退化为 uuid 占位
-/// （request_id 仅幂等用途，占位不影响正确性）。
-fn session_ctx(peek: &Value, converted: Option<&[u8]>) -> super::usage::QoderSessionCtx {
-    match converted.and_then(extract_envelope_ids) {
-        Some((rid, sid)) => super::usage::QoderSessionCtx {
-            request_id: rid,
-            session_id: sid,
-            ts: chrono::Local::now().timestamp(),
-            preview: session_preview(peek),
-        },
-        None => super::usage::QoderSessionCtx::placeholder(session_preview(peek)),
-    }
+/// issue #82 问题5：失败路径记账会话上下文。失败时本无上游信封可解析
+/// （两处调用恒为占位），恒退化为 uuid 占位（request_id 仅幂等用途，占位不
+/// 影响正确性）。成功路径由预解析 id 走 session_ctx_from_ids，不经本函数。
+fn session_ctx(peek: &Value) -> super::usage::QoderSessionCtx {
+    super::usage::QoderSessionCtx::placeholder(session_preview(peek))
 }
 
 /// issue #82 审查修复 K：信封顶层 request_id/session_id 提取。信封含完整对话历史
@@ -233,6 +250,23 @@ fn session_ctx_from_ids(
     }
 }
 
+/// resolve 命中条目是否 Global 专属（审查修复：v1 恒 CN 网关执行，Global
+/// 专属条目调度 resolve 双区兜底判活、执行必死，需在执行入口明确拒绝）。
+///
+/// qoder_upstream 未暴露分区分目录/兜底表的查询接口（他人文件不可改），判定
+/// 基于两路**确定性证据**，不依赖旧实现「resolve(Global) 结果与命中条目 Value
+/// 全等 ⟹ 两区同名条目声明必有差异」的脆弱值假设（同名同值场景会误判）：
+/// ① list() 并集按 id 去重、Global 侧先注册：标注 "cn" ⟺ Global 侧（远程目录
+///    + 静态兜底表）完全无此 id → CN resolve 的命中必来自 CN 侧 → 必非专属；
+/// ② 标注 "global" 时借 resolve 双区优先序差异取第二证据：resolve(Global) 序
+///    = [Global 目录, CN 目录, CN 兜底, Global 兜底]，resolve(Cn) 序 = [CN 目录,
+///    Global 目录, Global 兜底, CN 兜底]。两路命中**不同**条目时可逐源证明
+///    CN 侧必有此 id（CN 远程目录或 CN 兜底表至少其一声明）→ 必非专属；
+/// ③ 两路命中全等：既有 pub 接口无法区分「仅 Global 独持」与「两区同名同值」
+///    （后者仅可能来自远程目录动态刷新；静态兜底表两区同名条目倍率/档位全
+///    不同）。按 v1 恒 CN 执行的 fail-closed 策略判 Global 专属：Global 侧
+///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
+///    收上游诡异报错，拒绝则走明确的 404 提示通道。
 fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
     if id.is_empty() {
@@ -277,13 +311,17 @@ fn safe_slice(s: &str, n: usize) -> &str {
 struct QoderHedgeLease {
     uid: String,
     counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// 对冲账号信封的 (request_id, session_id)（G4）：对冲请求按对冲账号 uid
+    /// 重建信封，两账号信封 id 不同——接管记账必须落对冲账号信封的 id，
+    /// 否则行 uid=对冲账号而会话键属主账号信封，归属错位
+    session_ids: Option<(String, String)>,
 }
 
 impl QoderHedgeLease {
-    fn acquire(state: &ApiSharedState, uid: &str) -> Self {
+    fn acquire(state: &ApiSharedState, uid: &str, session_ids: Option<(String, String)>) -> Self {
         let counter = state.qoder_pool.inflight_handle(uid);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { uid: uid.to_string(), counter }
+        Self { uid: uid.to_string(), counter, session_ids }
     }
 }
 
@@ -300,6 +338,9 @@ struct QoderRaceWin {
     uid: String,
     hedge: Option<QoderHedgeLease>,
     takeover: bool,
+    /// 胜者信封的 (request_id, session_id)（G4）：主账号胜 = 主信封 id，
+    /// 对冲接管 = 对冲信封 id；记账按胜者落定，与会话行 uid 同源
+    session_ids: Option<(String, String)>,
 }
 
 /// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -319,6 +360,7 @@ fn race_qoder_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
+    primary_session_ids: &Option<(String, String)>,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
@@ -330,6 +372,7 @@ fn race_qoder_first_byte(
             uid: primary_uid.to_string(),
             hedge: None,
             takeover: false,
+            session_ids: primary_session_ids.clone(),
         });
     }
     let state2 = state.clone();
@@ -349,9 +392,11 @@ fn race_qoder_first_byte(
             state2.logger.log_sched_event(&ev);
         }
         // 租约先于凭证解析获取：失败路径随闭包局部变量 Drop 自动 -1
-        let lease = QoderHedgeLease::acquire(&state2, &picked2.uid);
         let creds2 = (state2.qoder_identity.as_ref()? )(&picked2.uid).ok()?;
         let converted2 = qoder_upstream::prepare_qoder_body(&peek2, &entry2, &creds2.uid).ok()?;
+        // G4：对冲信封 id 随租约带出，接管记账按对冲账号信封落定
+        let session_ids = extract_envelope_ids(&converted2);
+        let lease = QoderHedgeLease::acquire(&state2, &picked2.uid, session_ids);
         let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
         Some((reader2, lease))
     };
@@ -365,7 +410,19 @@ fn race_qoder_first_byte(
             } else {
                 primary_uid.to_string()
             };
-            Ok(QoderRaceWin { lines: out.lines, uid, hedge: out.hedge, takeover: out.takeover })
+            // G4：会话 id 按胜者信封落定——接管取对冲信封 id，主胜取主信封 id
+            let session_ids = if out.takeover {
+                out.hedge.as_ref().and_then(|l| l.session_ids.clone())
+            } else {
+                primary_session_ids.clone()
+            };
+            Ok(QoderRaceWin {
+                lines: out.lines,
+                uid,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                session_ids,
+            })
         }
         Err(()) => Err(()),
     }
@@ -598,7 +655,7 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek, None));
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
@@ -739,6 +796,7 @@ fn run_qoder_stream(
                         &tried,
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
+                        &envelope_ids,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -751,6 +809,8 @@ fn run_qoder_stream(
                     guard = settle_qoder_hedge(state, &mut race, guard, &picked.uid);
                     hedge_taken = race.takeover;
                     let win_uid = race.uid.clone();
+                    // G4：记账会话 id 按胜者信封落定（race 在 translate 处被消费，先取快照）
+                    let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
                     let (error_info, sent_any, failed_inline, usage) =
@@ -784,7 +844,7 @@ fn run_qoder_stream(
                         Some(ttfb_ms),
                         credits,
                         original_credits,
-                        &session_ctx_from_ids(&peek, envelope_ids.as_ref()),
+                        &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                     );
                     match error_info {
                         Some((code, msg)) => {
@@ -1088,7 +1148,7 @@ pub async fn qoder_aggregate_chat(
                             None,
                             None,
                             None,
-                            &session_ctx(&peek, None),
+                            &session_ctx(&peek),
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
@@ -1177,6 +1237,7 @@ pub async fn qoder_aggregate_chat(
                             &tried,
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
+                            &envelope_ids,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -1189,6 +1250,8 @@ pub async fn qoder_aggregate_chat(
                         guard = settle_qoder_hedge(&state, &mut race, guard, &picked.uid);
                         hedge_taken = race.takeover;
                         let win_uid = race.uid.clone();
+                        // G4：记账会话 id 按胜者信封落定（race 在聚合处被部分消费，先取快照）
+                        let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                         // 竞速胜者原始行源 → 翻译 → 聚合（tool_calls 合并/usage 收集）；
                         // 首字超时已在 race 内裁定，聚合阶段无失败通道
                         let agg_chat_id = format!("chatcmpl-{}", now_ts());
@@ -1219,7 +1282,7 @@ pub async fn qoder_aggregate_chat(
                                     Some(ttfb_ms),
                                     credits,
                                     original_credits,
-                                    &session_ctx_from_ids(&peek, envelope_ids.as_ref()),
+                                    &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                                 );
                                 clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&win_uid);
@@ -1521,6 +1584,40 @@ mod tests {
         let (c, o) = extract_billing(Some(&neg_pair));
         assert_eq!(c, Some(5.0));
         assert_eq!(o, None);
+    }
+
+    /// 会话 preview 剥离 system-reminder 注入块与 <user_input> 包裹标签：
+    /// agent 客户端把提醒拼在正文前、输入用标签包裹，preview 必须取剥离后的
+    /// 用户原话（多块 / 跨行 / 前置残留空白）。
+    #[test]
+    fn session_preview_strips_system_reminder_blocks() {
+        // 典型形态：多块 reminder 前置 + <user_input> 包裹的用户原话
+        let peek = json!({"messages": [{"role": "user", "content":
+            "<system-reminder>\nTodos have changed...\n# Todos\n- x\n</system-reminder>\n\n<system-reminder>The maximum number of terminals is 5</system-reminder>\n<user_input>\n说一个100字笑话\n</user_input>"}]});
+        assert_eq!(session_preview(&peek), "说一个100字笑话");
+
+        // 仅 <user_input> 包裹、无 reminder
+        let wrapped = json!({"messages": [{"role": "user", "content":
+            "<user_input>写一个100字笑话</user_input>"}]});
+        assert_eq!(session_preview(&wrapped), "写一个100字笑话");
+
+        // 剥离后仅剩空白 → 空串（调用方按无 preview 处理，不展示注入内容）
+        let only_reminder = json!({"messages": [{"role": "user", "content":
+            "<system-reminder>纯注入</system-reminder>"}]});
+        assert_eq!(session_preview(&only_reminder), "");
+
+        // 无 reminder 的普通消息不受影响；末条 user 才是取值来源
+        let plain = json!({"messages": [
+            {"role": "user", "content": "第一条"},
+            {"role": "assistant", "content": "回复"},
+            {"role": "user", "content": "<system-reminder>x</system-reminder> 写一个100字笑话"}
+        ]});
+        assert_eq!(session_preview(&plain), "写一个100字笑话");
+
+        // reminder 之后再无正文 → 空；reminder 内含 "</system-reminder>" 字样也按整块匹配（非贪婪）
+        let empty_tail = json!({"messages": [{"role": "user", "content":
+            "前文<system-reminder>注入</system-reminder>  \n"}]});
+        assert_eq!(session_preview(&empty_tail), "前文");
     }
 
     /// 远程目录测试条目（adopt_remote 接受的最小合法信封载荷）

@@ -254,12 +254,15 @@ function defaultSettings(): Settings {
     pinned_app: 'trae',
     hidden_apps: [],
     app_icons: {},
-    // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到 / 23:40 快照）
+    // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到）；
+    // 积分数据同步与 Buddy/Trae 同款四模式（默认 every_hours 每2小时，daily 时刻 23:40）
     qoder_ide_path: null,
     qoderwork_path: null,
     qoder_checkin_hhmm: '10:15',
     qoder_credits_sync_hhmm: '23:40',
     qoder_credits_sync_enabled: true,
+    qoder_credits_sync_mode: 'every_hours',
+    qoder_credits_sync_hours: '2',
     qoder_token_renew_enabled: true,
   };
 }

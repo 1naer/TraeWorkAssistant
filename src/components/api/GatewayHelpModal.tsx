@@ -22,6 +22,18 @@ const POOL_LABELS: Record<string, string> = {
   custom: '自定义',
 };
 
+/** 倍率取当前可用来源池最小值（同一模型多池服务时按最低消耗展示）。
+ * 仅统计 enabled 来源：不可用池不承接请求，其倍率不应参与展示，
+ * 否则用户会看到实际路由不到的低价（与「实际生效倍率」口径背离）；
+ * 全部不可用或未声明 → null（显示 —） */
+function minRateOf(m: UnifiedModel): number | null {
+  const rates = m.sources
+    .filter((s) => s.enabled)
+    .map((s) => s.rate)
+    .filter((r): r is number => r != null && Number.isFinite(r));
+  return rates.length ? Math.min(...rates) : null;
+}
+
 function Endpoint({ method, path, note }: { method: string; path: string; note: string }) {
   return (
     <div className="flex items-baseline gap-2">
@@ -81,10 +93,12 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'`;
-    setCopied(true);
     try {
-      if (await copyText(example)) toast('success', 'cURL 示例已复制到剪贴板');
-      else toast('error', '复制失败');
+      // 复制成功后才置 copied（复制中态仅在实际耗时场景出现，避免快速完成时闪烁）
+      if (await copyText(example)) {
+        setCopied(true);
+        toast('success', 'cURL 示例已复制到剪贴板');
+      } else toast('error', '复制失败');
     } catch {
       toast('error', '复制失败');
     } finally {
@@ -245,6 +259,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               <tbody>
                 {filtered.map((m) => {
                   const enabled = m.sources.some((s) => s.enabled);
+                  const rate = minRateOf(m);
                   return (
                     <tr
                       key={m.id}
@@ -256,13 +271,13 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                       <td className="px-2 py-2">
                         <span className="block break-all font-mono leading-snug">{m.id}</span>
                       </td>
-                      <td className="px-2 py-2 text-right tabular-nums">
-                        {m.rate == null ? (
+                      <td className="px-2 py-2 text-right tabular-nums" title="多来源模型取各池最小倍率">
+                        {rate == null ? (
                           <span className="text-slate-400 dark:text-zinc-500">—</span>
-                        ) : m.rate === 0 ? (
+                        ) : rate === 0 ? (
                           <Badge tone="green">免费</Badge>
                         ) : (
-                          `${m.rate.toFixed(2)}x`
+                          `${rate.toFixed(2)}x`
                         )}
                       </td>
                       <td className="truncate px-2 py-2 text-[11px]" title={m.efforts.length ? m.efforts.join(' / ') : undefined}>

@@ -138,6 +138,9 @@ export default function BuddyApiService() {
   const [wbPoolTags, setWbPoolTags] = useState<Set<string>>(new Set());
   const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
+  // F1（审查修复清单 v1.4.9）：账号列表请求失败 ≠ 空列表——失败置错误态，
+  // 渲染先判错误再判空，不再把失败当成功空集误报「暂无账号」引导
+  const [accountsError, setAccountsError] = useState(false);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   // 厂商列数据源（§6.2）：WbModelInfo 无 vendor 字段，经统一目录聚合按模型 id
   // 关联（vendor = 自定义模型用户填写值优先，否则按模型名系列推断）；id 缺失/
@@ -160,7 +163,7 @@ export default function BuddyApiService() {
       const [st, pf, accs, cat, wbp, wbg, unified, tags] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
-        api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
+        api.workbuddy.accountsList().catch(() => null as WorkBuddyAccountView[] | null),
         api.apiServer.wbCatalogList().catch(() => [] as WbModelInfo[]),
         api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
         api.workbuddy.groups.list().catch(() => [] as GroupView[]),
@@ -170,7 +173,14 @@ export default function BuddyApiService() {
       setStatus(st);
       setTagDefs(tags);
       setPool(pf);
-      setAccounts(accs);
+      if (accs === null) {
+        // F1：失败哨兵——置错误态并提示重试，不清空既有列表（fail-closed 方向）
+        setAccountsError(true);
+        pushToast('error', '账号列表读取失败：请点击刷新重试');
+      } else {
+        setAccountsError(false);
+        setAccounts(accs);
+      }
       setCatalog(cat);
       setWbPool(wbp);
       setWbGroups(wbg);
@@ -534,7 +544,11 @@ export default function BuddyApiService() {
                 )}
               </div>
             )}
-            {credAccounts.length === 0 ? (
+            {accountsError ? (
+              <p className="py-4 text-center text-xs text-rose-500 dark:text-rose-400">
+                账号列表读取失败：请点击右上角「刷新」重试（此前不显示引导，避免误判为无账号）。
+              </p>
+            ) : credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
                 暂无含凭证账号：请先在「账号管理」扫描本机账号或 OAuth 登录入池（凭证写入本地 token store）。
               </p>

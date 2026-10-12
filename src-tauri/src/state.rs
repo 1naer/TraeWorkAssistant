@@ -144,6 +144,13 @@ pub struct AppState {
     /// Doubao 账号池读-改-写互斥：同 wb_pool_lock，罩住命令/巡检任务/保活线程
     /// 与 vault 启动迁移的全部写点
     pub doubao_pool_lock: Arc<Mutex<()>>,
+    /// 组织定义（groups / tags 行文档表）读-改-写互斥：shared_groups 的
+    /// create/update/delete、tags 的 create/update/delete、qoder 导入的 defs
+    /// 合并、account_tags_set 的校验+写入全部持锁执行，杜绝并发「load→save」
+    /// 互相覆盖（丢新分组/丢新标签/复活已删项）与「校验后删除」幽灵 TOCTOU。
+    /// 锁序固定「池锁 → defs锁」：需要双锁的路径（qoder 导入、账号 move 复检）
+    /// 先持池锁再持本锁；本锁之下只嵌套 store::docs 的 org_defs_lock（单向）
+    pub group_defs_lock: Arc<Mutex<()>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -178,6 +185,7 @@ impl AppState {
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
             doubao_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -284,6 +292,13 @@ impl AppState {
             s.qoder_credits_sync_enabled = true;
             s.qoder_credits_sync_hhmm = "23:40".into();
         }
+        // Qoder 积分数据同步模式零值归一：mode 为空视为旧数据（只有 enabled 布尔），
+        // 按旧开关派生保持语义：true→every_hours（对齐 Buddy/Trae 默认）、false→off；
+        // 间隔小时数并入下方 clamp 循环
+        if s.qoder_credits_sync_mode.trim().is_empty() {
+            s.qoder_credits_sync_mode =
+                if s.qoder_credits_sync_enabled { "every_hours" } else { "off" }.into();
+        }
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
         if s.wb_catalog_sync_hhmm.trim().is_empty() {
@@ -304,7 +319,11 @@ impl AppState {
         if s.trae_credits_sync_mode.trim().is_empty() {
             s.trae_credits_sync_mode = "every_hours".into();
         }
-        for field in [&mut s.wb_credits_sync_hours, &mut s.trae_credits_sync_hours] {
+        for field in [
+            &mut s.wb_credits_sync_hours,
+            &mut s.trae_credits_sync_hours,
+            &mut s.qoder_credits_sync_hours,
+        ] {
             let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
             *field = v.to_string();
         }
@@ -380,6 +399,7 @@ mod tests {
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
             doubao_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
         }
     }
 

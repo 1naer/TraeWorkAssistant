@@ -720,7 +720,35 @@ pub fn oauth_parse_callback(
 /// - 请求头：仅 Content-Type + x-cloudide-token: ""（空串；真实客户端 m() 方法原样）
 /// - 响应：Result.Token / Result.RefreshToken
 /// 保留旧形态变体作兜底探测（协议固化验证后移除）。
+/// 交换端点 host 白名单（审查 m9）：host 来自用户粘贴的回调 URL 参数，直接拼接为
+/// ExchangeToken 端点——AuthCode + PKCE CodeVerifier 均属安全令牌，必须限定官方
+/// API 域，防伪造回调把令牌发往任意第三方主机。host 口径与默认值 / bypass.rs
+/// 已登记域一致（api.trae.com.cn 为主路径）。
+const EXCHANGE_HOST_ALLOWLIST: [&str; 3] = ["api.trae.com.cn", "api.trae.cn", "api.trae.com"];
+
+fn validate_exchange_host(host: &str) -> Result<(), String> {
+    // 形如 "https://api.trae.com.cn"（可带路径/尾斜杠）；无 scheme 时按裸域处理
+    let bare = host
+        .split("://")
+        .nth(1)
+        .unwrap_or(host)
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host_only = bare.rsplit('@').next().unwrap_or(bare).to_ascii_lowercase();
+    let host_only = host_only.split(':').next().unwrap_or("");
+    if EXCHANGE_HOST_ALLOWLIST.contains(&host_only) {
+        Ok(())
+    } else {
+        Err(format!(
+            "回调 URL 的 host 参数不在官方 API 域白名单内（{host_only}），已拒绝交换以防令牌外发"
+        ))
+    }
+}
+
 fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
+    validate_exchange_host(host)?;
     let client_id = oauth_client().client_id.clone();
     let code_v = code.to_string();
     let verifier_v = verifier.unwrap_or("").to_string();
@@ -1489,11 +1517,15 @@ pub fn oauth_login(
 
     // 所选分组统一在账号落库后应用（新增/合并路径对齐）：用户在登录界面明确选择分组时
     // 同步写入 membership（合并路径此前静默丢弃所选分组）；未选分组时保持原分组不变。
+    // 持 group_defs_lock：membership RMW 与并发分组增删/导入互斥防丢更新；
+    // invalidate 在锁 drop 后执行
     if let Some(g) = group_id {
+        let _defs = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut groups: crate::models::GroupsFile =
             crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(user_id.clone(), g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        drop(_defs);
         // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐，
         // 不依赖 TTL 5s 兜底）
         crate::api_server::org_index::invalidate(&state.data_dir);

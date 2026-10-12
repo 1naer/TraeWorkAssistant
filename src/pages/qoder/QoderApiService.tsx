@@ -51,6 +51,9 @@ export default function QoderApiService() {
   const [qoderPoolTags, setQoderPoolTags] = useState<Set<string>>(new Set());
   const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
+  // F1（审查修复清单 v1.4.9）：账号列表请求失败 ≠ 空列表——失败置错误态，
+  // 渲染先判错误再判空，不再把失败当成功空集误报「暂无账号」引导
+  const [accountsError, setAccountsError] = useState(false);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -69,7 +72,7 @@ export default function QoderApiService() {
       const [st, pf, accs, cat, groups, tags] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
-        api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
+        api.qoder.accountsList().catch(() => null as QoderAccountView[] | null),
         api.apiServer
           .unifiedModels()
           .then((list) => list.filter((m) => m.sources.some((s) => s.pool === 'qoder')))
@@ -79,7 +82,14 @@ export default function QoderApiService() {
       ]);
       setStatus(st);
       setPool(pf);
-      setAccounts(accs);
+      if (accs === null) {
+        // F1：失败哨兵——置错误态并提示重试，不清空既有列表（fail-closed 方向）
+        setAccountsError(true);
+        pushToast('error', '账号列表读取失败：请点击刷新重试');
+      } else {
+        setAccountsError(false);
+        setAccounts(accs);
+      }
       setModels(cat);
       setQoderGroups(groups);
       setTagDefs(tags);
@@ -474,7 +484,11 @@ export default function QoderApiService() {
             )}
 
             {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；筛选外整行灰显） */}
-            {credAccounts.length === 0 ? (
+            {accountsError ? (
+              <p className="py-4 text-center text-xs text-rose-500 dark:text-rose-400">
+                账号列表读取失败：请点击右上角「刷新」重试（此前不显示引导，避免误判为无账号）。
+              </p>
+            ) : credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
                 暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
               </p>
