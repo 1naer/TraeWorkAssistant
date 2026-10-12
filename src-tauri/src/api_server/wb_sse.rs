@@ -395,14 +395,24 @@ pub fn stream_forward_ex(
                         } else {
                             tid.clone()
                         };
-                        let item = json!({
+                        let mut item = json!({
                             "id": item_id,
                             "type": "function_call",
                             "status": "completed",
                             "call_id": if tid.is_empty() { format!("call_{}_{}", chat_id, i) } else { tid.clone() },
-                            "name": name,
                             "arguments": args,
                         });
+                        // 编码名还原为 Codex 只接受的 {name, namespace} 双字段；
+                        // 扁平 function 工具保持单 name 字段（issue #93）
+                        match crate::api_server::wb_responses::split_namespaced(name) {
+                            Some((ns, inner)) => {
+                                item["name"] = json!(inner);
+                                item["namespace"] = json!(ns);
+                            }
+                            None => {
+                                item["name"] = json!(name);
+                            }
+                        }
                         let mut added = item.clone();
                         added["status"] = json!("in_progress");
                         added["arguments"] = json!("");
@@ -1137,6 +1147,43 @@ mod tests {
         assert!(completed.contains("\"input_tokens\":3"));
         assert!(completed.contains("\"output_tokens\":2"));
         assert!(!body.contains("[DONE]"), "Responses 流不应出现 OpenAI [DONE] 帧");
+    }
+
+    /// issue #93：Responses 流式下编码名 function_call 还原为 {name, namespace}
+    /// 双字段；扁平 function 工具保持单 name 且不带 namespace（回归）
+    #[test]
+    fn stream_forward_responses_restores_namespaced_function_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"multi_agent_v1__spawn_agent\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4}}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, usage) =
+            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_6", "m");
+        assert!(err.is_none());
+        assert!(sent_any);
+        assert!(usage.is_some());
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        // done 项：编码名拆为 spawn_agent + namespace=multi_agent_v1
+        assert!(body.contains("\"name\":\"spawn_agent\""));
+        assert!(body.contains("\"namespace\":\"multi_agent_v1\""));
+        // 扁平工具不带 namespace 字段
+        assert!(body.contains("\"name\":\"shell\""));
+        assert!(!body.contains("\"namespace\":\"\""));
+        let shell_done = body
+            .split("\"name\":\"shell\"")
+            .nth(1)
+            .and_then(|s| s.split("response.output_item.done").next())
+            .unwrap_or("");
+        assert!(!shell_done.contains("namespace"), "扁平工具 item 不得携带 namespace 字段");
     }
 
     /// 回归（F-40 审查修复）：文本已流出后遇错误帧 → created 已发即 sent_any=true，
