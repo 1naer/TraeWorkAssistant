@@ -187,6 +187,11 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
+    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
+    pool.set_log_ctx(&state.data_dir, "trae");
+    wb_pool.set_log_ctx(&state.data_dir, "buddy");
+    qoder_pool.set_log_ctx(&state.data_dir, "qoder");
     // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
     //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;

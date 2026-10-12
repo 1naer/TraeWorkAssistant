@@ -185,6 +185,9 @@ pub struct ApiPool {
     /// f64 bits 存储；剩余积分 ≤ 阈值的账号不参与调度（0 = 不过滤）。
     /// 防止账号积分被调度耗尽后连免费模型也不可用
     reserve_credits: std::sync::atomic::AtomicU64,
+    /// 冷却/禁用标记的 app.log 观测上下文：(data_dir, 池标签)。
+    /// do_start 装配三池（trae/buddy/qoder）时注入；None（测试/未启动）不落日志
+    log_ctx: Mutex<Option<(std::path::PathBuf, String)>>,
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -201,7 +204,14 @@ impl ApiPool {
             inflight: Mutex::new(HashMap::new()),
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
+            log_ctx: Mutex::new(None),
         }
+    }
+
+    /// 装配冷却/禁用标记的日志上下文：池标签 + 数据目录（do_start 启动时调用）；
+    /// 未装配（测试/未启动网关）时 note_error 不落 app.log，无副作用
+    pub fn set_log_ctx(&self, data_dir: &std::path::Path, label: &str) {
+        *safe_lock(&self.log_ctx) = Some((data_dir.to_path_buf(), label.to_string()));
     }
 
     /// 设置账号并发上限（F-77，pool_set 热应用；0 = 不限）
@@ -752,26 +762,43 @@ impl ApiPool {
         }
     }
 
-    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）
+    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）。
+    /// 冷却/禁用标记发生时同步落一条 app.log（F-80 可观测）：
+    /// `account cooldown: pool=<池> acct=<名称> uid=<uid> kind=<错误分类> action=<处置>`，
+    /// 排查「账号何时、为何被打冷却→选池 no_healthy_account→跨池回退」链路时可直接定位
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
         let mut entries = safe_lock(&self.entries);
+        let mut cooldown_ev: Option<(String, String)> = None;
         if let Some(e) = entries.get_mut(uid) {
             e.failures = e.failures.saturating_add(1);
+            let mut action: Option<String> = None;
             match kind {
                 ErrKind::SessionDead | ErrKind::Forbidden => {
                     e.disabled = true;
                     e.reason = kind.as_str().to_string();
+                    action = Some("action=disabled".to_string());
                 }
                 ErrKind::HardCredit => {
                     // 积分耗尽：冷却到次日 04:00，到期自动恢复探测（F-29 v1.2）
-                    e.hard_until = next_0400(now_ts());
+                    let until = next_0400(now_ts());
+                    e.hard_until = until;
                     e.reason = "hard_credit".to_string();
                     e.err_count = 0;
+                    action = Some(format!(
+                        "action=hard_cooldown until={} (下个04:00)",
+                        fmt_local_ts(until)
+                    ));
                 }
                 ErrKind::PlanLimit | ErrKind::SoftRate | ErrKind::NotFound => {
-                    e.until = now_ts() + kind.cooldown_duration().as_secs() as i64;
+                    let secs = kind.cooldown_duration().as_secs() as i64;
+                    let until = now_ts() + secs;
+                    e.until = until;
                     e.reason = kind.as_str().to_string();
                     e.err_count = 0;
+                    action = Some(format!(
+                        "action=cooldown secs={secs} until={}",
+                        fmt_local_ts(until)
+                    ));
                     // P2 修复10：不重置 cb_trips——熔断记忆只应在 note_success 重置，
                     // 否则 Server 熔断记忆被非 Server 错误意外清零
                 }
@@ -780,12 +807,35 @@ impl ApiPool {
                     if e.err_count >= 3 {
                         // 熔断器：30m 起指数递增（×2/次），封顶 6h
                         let exp = 30 * 60u64 << e.cb_trips.min(4);
-                        e.until = now_ts() + exp.min(6 * 3600) as i64;
+                        let capped = exp.min(6 * 3600);
+                        let until = now_ts() + capped as i64;
+                        e.until = until;
                         e.reason = "consecutive_errors".to_string();
                         e.err_count = 0;
                         e.cb_trips = e.cb_trips.saturating_add(1);
+                        action = Some(format!(
+                            "action=circuit_breaker secs={capped} until={}",
+                            fmt_local_ts(until)
+                        ));
                     }
                 }
+            }
+            if let Some(a) = action {
+                cooldown_ev = Some((e.name.clone(), a));
+            }
+        }
+        drop(entries);
+        // F-80：log_ctx 未装配（测试/未启动）时静默跳过，不产生日志副作用
+        if let Some((name, ev)) = cooldown_ev {
+            let ctx = safe_lock(&self.log_ctx).clone();
+            if let Some((dir, label)) = ctx {
+                crate::fs_utils::app_log(
+                    &dir,
+                    &format!(
+                        "account cooldown: pool={label} acct={name} uid={uid} kind={} {ev}",
+                        kind.as_str(),
+                    ),
+                );
             }
         }
     }
@@ -1176,6 +1226,16 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// Unix 秒 → 固定东八区时间展示（与 next_0400 的 local_ts 约定同源），
+/// 供冷却日志 until 可读化；解析失败回退原始数值
+fn fmt_local_ts(ts: i64) -> String {
+    use chrono::TimeZone;
+    chrono::FixedOffset::east_opt(8 * 3600)
+        .and_then(|tz| tz.timestamp_opt(ts, 0).single())
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 /// 确定性派生 hex 字符串（与原 device_proxy.py 的 _seeded_stream 算法一致，accounts::derive_device 同源）
 /// 用于从 uid 生成 machine_id，保证同一账号始终得到同一设备标识
 pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
@@ -1240,6 +1300,39 @@ mod tests {
             &HashMap::new(),
         );
         pool
+    }
+
+    // ==================== F-80：冷却/禁用标记落 app.log ====================
+
+    #[test]
+    fn cooldown_event_logged_when_ctx_assembled() {
+        let dir = std::env::temp_dir().join(format!("aiwa_f80_on_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        pool.set_log_ctx(&dir, "trae");
+        pool.note_error("uid_a", ErrKind::Forbidden);
+        let line = std::fs::read_to_string(dir.join("logs").join("app.log")).unwrap();
+        assert!(
+            line.contains(
+                "account cooldown: pool=trae acct=uid_a uid=uid_a kind=Forbidden action=disabled"
+            ),
+            "实际日志: {line}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cooldown_event_not_logged_without_ctx() {
+        let dir = std::env::temp_dir().join(format!("aiwa_f80_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        // 未装配 log_ctx（测试/未启动网关）：note_error 不产生日志副作用
+        pool.note_error("uid_a", ErrKind::Forbidden);
+        assert!(
+            !dir.join("logs").join("app.log").exists(),
+            "未装配 log_ctx 不应产生日志文件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

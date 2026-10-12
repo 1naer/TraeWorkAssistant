@@ -195,6 +195,13 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 固定优先级按序取首选可用池（Qoder 默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
               </p>
               <p>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">模型目录标注来源池：</span>
+                「资源总览 → 调度策略中心」开启后，/v1/models 目录为多源同名模型附带{' '}
+                <code>trae/xxx</code>、<code>buddy/xxx</code>、<code>qoder/xxx</code> 别名条目（三家同名模型倍率与效果不同），
+                右表「来源」列同步标注模型由哪些池服务；请求使用带池前缀的模型 ID 即点名锁定该池——
+                单池服务、不参与跨池回退，该池不可用时直接报错（前缀优先级高于 Key 绑定与全局策略）；关闭时目录保持原形态。
+              </p>
+              <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">池内取号：</span>
                 Trae 池 / Buddy 池 / Qoder 池各自独立配置策略（默认积分先过期优先，可选 余额多优先 / 随机 / 三因子加权 / P2C）。
               </p>
