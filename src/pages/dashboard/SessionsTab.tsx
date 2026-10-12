@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, MessagesSquare } from 'lucide-react';
 import { Badge, EmptyState, Spinner } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -63,6 +63,8 @@ export default function SessionsTab({
   const [detail, setDetail] = useState<UsageSessionView[] | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  // 明细请求序号守卫：快速切换展开行时旧响应可能后到，仅最新一次请求可写明细态
+  const detailSeqRef = useRef(0);
 
   const toggleDetail = (key: string, r: UsageSessionView) => {
     if (expandedKey === key) {
@@ -70,6 +72,7 @@ export default function SessionsTab({
       setDetail(null);
       return;
     }
+    const seq = ++detailSeqRef.current;
     setExpandedKey(key);
     setDetail(null);
     setDetailError(null);
@@ -77,17 +80,33 @@ export default function SessionsTab({
     api.qoder
       .sessionDetail({ date: r.date, uid: r.user_id, sessionId: r.session_id, preview: r.preview })
       .then((rows) => {
+        if (seq !== detailSeqRef.current) return;
         setDetail(rows);
         setDetailError(null);
       })
-      .catch((err) => setDetailError(String(err)))
-      .finally(() => setDetailLoading(false));
+      .catch((err) => {
+        if (seq !== detailSeqRef.current) return;
+        setDetailError(String(err));
+      })
+      .finally(() => {
+        if (seq === detailSeqRef.current) setDetailLoading(false);
+      });
   };
+
+  // 展开/明细随主查询重置：筛选或翻页后行键可能恰好重合，陈旧明细不得残留
+  const resetExpanded = useCallback(() => {
+    detailSeqRef.current++;
+    setExpandedKey(null);
+    setDetail(null);
+    setDetailError(null);
+    setDetailLoading(false);
+  }, []);
 
   useEffect(() => {
     setModelsUnion([]);
     setModel('');
-  }, [scope]);
+    resetExpanded();
+  }, [scope, resetExpanded]);
 
   useEffect(() => {
     // D4（审查修复清单 v1.4.9）：开始日期晚于结束日期时不发无效请求（原实现
@@ -100,6 +119,7 @@ export default function SessionsTab({
     let cancelled = false;
     setLoading(true);
     setError(null);
+    resetExpanded();
     const fetchFn =
       scope === 'buddy'
         ? api.workbuddy.usageSessions

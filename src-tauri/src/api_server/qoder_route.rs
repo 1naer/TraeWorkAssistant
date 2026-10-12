@@ -124,8 +124,12 @@ fn note_model_server_cooldown(model: &str) {
             if Instant::now() >= *until {
                 *fails = fails.saturating_add(1);
             }
-            let delay = (SERVER_COOLDOWN_BASE_SECS << (*fails - 1).min(4))
-                .min(SERVER_COOLDOWN_MAX_SECS);
+            // saturating_sub：fails 可能为 0（note_model_cooldown 排队退避路径
+            // or_insert 的 (until, 0) 条目）——裸 `*fails - 1` 会下溢（debug panic /
+            // release 回绕致 min(4) 恒取 4、冷却被错误推到 480s）
+            let delay = (SERVER_COOLDOWN_BASE_SECS
+                << (*fails).saturating_sub(1).min(4))
+            .min(SERVER_COOLDOWN_MAX_SECS);
             let candidate = Instant::now() + Duration::from_secs(delay);
             if candidate > *until {
                 *until = candidate;
@@ -1730,6 +1734,31 @@ mod tests {
             after >= before.saturating_sub(1),
             "排队建议值不得缩短既有 Server 窗口（{before} → {after}）"
         );
+        clear_model_cooldown(&model);
+    }
+
+    /// 回归：排队退避先插入 fails=0 条目（note_model_cooldown 的 or_insert 路径），
+    /// 随后 Server 失败进入 and_modify —— fails=0 不得下溢（曾为 `*fails - 1`，
+    /// debug panic / release 冷却被错误推到 480s），应保持基准 30s 且计数不动
+    #[test]
+    fn server_cooldown_after_queued_only_entry_no_underflow() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t90-queue0-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        // 排队退避先落条目：fails = 0
+        note_model_cooldown(&model, 5);
+        // Server 失败：窗口未过期（5s 内）不递增计数，基准 30s 兜底
+        note_model_server_cooldown(&model);
+        let r = model_cooling_remaining_secs(&model).unwrap();
+        assert!(r > 28 && r <= 30, "fails=0 时应为 30s 基准窗口，实际 {r}");
+        let (_, fails) = *cooldown_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&model)
+            .unwrap();
+        assert_eq!(fails, 0, "窗口未过期不得递增失败计数");
         clear_model_cooldown(&model);
     }
 

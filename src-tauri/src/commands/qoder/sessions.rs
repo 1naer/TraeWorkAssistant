@@ -278,13 +278,22 @@ pub fn qoder_session_detail_query(
     let pv = preview.trim().to_string();
     let name_of = load_account_names(&state);
     crate::store::db(&state.data_dir).with_conn(move |c| {
-        let mut stmt = c.prepare(
+        // 失败桶（sid 空）不得带 `session_id = ''` 条件——那会把同日同账号
+        // **所有**失败行（其他错误说明）都误捞进本会话明细；仅按 preview 匹配
+        let sql = if sid.is_empty() {
+            "SELECT request_id, session_id, ts, model, credits, pt, ct, preview, record_id
+             FROM qoder_sessions
+             WHERE date = ?1 AND uid = ?2 AND preview = ?4
+             ORDER BY ts ASC
+             LIMIT 500"
+        } else {
             "SELECT request_id, session_id, ts, model, credits, pt, ct, preview, record_id
              FROM qoder_sessions
              WHERE date = ?1 AND uid = ?2 AND (session_id = ?3 OR preview = ?4)
              ORDER BY ts ASC
-             LIMIT 500",
-        )?;
+             LIMIT 500"
+        };
+        let mut stmt = c.prepare(sql)?;
         let mut rows: Vec<UsageSessionView> = Vec::new();
         let mut it = stmt.query_map(
             rusqlite::params![date, uid, sid, pv],
