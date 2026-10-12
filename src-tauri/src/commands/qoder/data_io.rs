@@ -420,15 +420,12 @@ fn qoder_accounts_import_impl(
     // 覆盖永久丢账号，违反 common.rs 红线）
     let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool_checked(state)?;
-    // 分组定义合并（审查修复）：导出载荷携带 groups（旧版无此字段则跳过），
-    // 按 id 幂等 upsert——本地已有同 id 分组保留本地定义（用户可能已改名），仅补缺失。
-    // 持池锁执行：与并发导入互斥，防账号池读改写竞争丢账号；
-    // 且池损坏提前 Err 时不再产生分组定义副作用
-    // P0 需求①：分组定义统一读共享 groups 表；导出载荷携带的 groups（旧版无此
-    // 字段则跳过）按 id 幂等合并进共享定义——本地已有同 id 分组保留本地定义
-    //（用户可能已改名），仅补缺失。持池锁 + group_defs_lock 双锁执行（锁序
-    // 池锁→defs锁）：与并发导入互斥防池覆盖丢账号；与并发 shared_groups
-    // create/update/delete 互斥防 defs「load→save」互相覆盖丢新分组。
+    // 分组定义合并（审查修复 / P0 需求①）：分组定义统一存共享 groups 表，
+    // 导出载荷携带的 groups（旧版无此字段则跳过）按 id 幂等合并进共享定义——
+    // 本地已有同 id 分组保留本地定义（用户可能已改名），仅补缺失。
+    // 持池锁 + group_defs_lock 双锁执行（锁序池锁→defs锁）：与并发导入互斥
+    // 防池覆盖丢账号；与并发 shared_groups create/update/delete 互斥防
+    // defs「load→save」互相覆盖丢新分组；且池损坏提前 Err 时不再产生分组副作用
     let store = crate::store::db(&state.data_dir);
     let defs: Vec<crate::models::Group> = {
         let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());

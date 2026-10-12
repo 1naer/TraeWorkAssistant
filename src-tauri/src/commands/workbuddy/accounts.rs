@@ -763,24 +763,25 @@ pub fn workbuddy_accounts_import(
     // 循环内 upsert_token_store 与池锁无嵌套，持锁调用无死锁（同 qoder data_io 先例）
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
-    // 标签绑定恢复（P2 需求③）：读入文件中的 tags，循环结束后按最终账号 id
-    // 落 account_tags 表（仅本机已存在的 tag id，未知 id 忽略不自动创建）。
-    // defs 短锁内读取：与并发标签增删的 RMW 快照一致
-    let tag_defs = {
+    // 幽灵分组防御（对齐 qoder 导入侧）：预载共享分组定义，新增条目的 group_id
+    // 指向不存在分组（异机导入未随载荷携带定义/本地已删分组）时回落「未分组」——
+    // 聚合落空的幽灵引用不如显式未分组。与 tag_defs 同一 defs 短锁读取：
+    // 池锁不隔离 defs 写方（defs 写方只持 group_defs_lock），须靠 defs 短锁
+    // 保证与并发标签/分组增删的 RMW 快照一致（与 qoder 侧同构）
+    let (tag_defs, valid_group_ids) = {
         let _defs = state
             .group_defs_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::store::docs::tags_load(&crate::store::db(&state.data_dir))
+        let tag_defs =
+            crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+        let valid_group_ids: std::collections::HashSet<String> =
+            crate::store::docs::group_defs_load(&crate::store::db(&state.data_dir))
+                .into_iter()
+                .map(|g| g.id)
+                .collect();
+        (tag_defs, valid_group_ids)
     };
-    // 幽灵分组防御（对齐 qoder 导入侧）：预载共享分组定义，新增条目的 group_id
-    // 指向不存在分组（异机导入未随载荷携带定义/本地已删分组）时回落「未分组」——
-    // 聚合落空的幽灵引用不如显式未分组。池锁已持有，与并发 defs 写方读隔离
-    let valid_group_ids: std::collections::HashSet<String> =
-        crate::store::docs::group_defs_load(&crate::store::db(&state.data_dir))
-            .into_iter()
-            .map(|g| g.id)
-            .collect();
     let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     let mut tags_ignored = 0usize;
     // 凭证先收集、save_pool 成功后统一落库逐条聚合（对齐 qoder 先例）：原实现

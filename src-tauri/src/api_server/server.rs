@@ -271,12 +271,15 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     let weak = Arc::downgrade(&state);
     drop(state);
     std::thread::spawn(move || {
-        let Some(state) = weak.upgrade() else {
-            return;
-        };
+        // 首次目录替换与后续探测一样，强引用仅在块内临时 upgrade、块结束即释放；
+        // 不得把强引用绑定到闭包存活域——否则服务停止、共享状态释放后本线程
+        // 仍持有整份 ApiSharedState，永不退出（泄漏线程 + 两个账号池）
         // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
         // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取
         {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
             let picked = state.wb_pool.pick_excluding_constrained(
                 &std::collections::HashSet::new(),
                 None,

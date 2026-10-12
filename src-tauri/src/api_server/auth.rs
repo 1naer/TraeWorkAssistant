@@ -11,7 +11,9 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /health 跳过鉴权（响应已收敏为 status/running 存活布尔，完整诊断在需鉴权的 /status）
+/// - 仅 /health 豁免且仅限环回监听（响应已收敏为 status/running 存活布尔，完整
+///   诊断在需鉴权的 /status）；/healthz 不豁免——其 503 体含
+///   reason=no healthy account，非环回走 Key 鉴权（fail-closed）
 /// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
