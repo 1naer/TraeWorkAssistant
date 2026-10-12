@@ -1,6 +1,6 @@
 //! Qoder 公共请求层（F-80 M1，对照 wb_common.rs 模式裁剪）。
 //!
-//! 端点与鉴权情报基线（docs/已完成方案/Qoder平台支持设计方案.md §2.3，M0 定稿前均为待验证）：
+//! 端点与鉴权情报基线（docs/completed/Qoder平台支持设计方案.md §2.3，M0 定稿前均为待验证）：
 //! - OpenAPI 域：`openapi.qoder.com.cn`（sash 活动 / quota 用量 / userinfo / deviceToken）
 //! - `Cosy-ClientType` 必带（缺失时 sash 返回 `campaigns: []` 静默空列表——最隐蔽的坑）；
 //!   CN 客户端真实取值 R-4 待抓包确认，缺省 "10"（社区逆向脚本取值）
