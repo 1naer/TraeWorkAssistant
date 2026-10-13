@@ -1044,7 +1044,7 @@ pub fn completion_to_text(v: &Value, model: &str) -> Value {
 fn u64_pair(u: &Value) -> (u64, u64) {
     let get = |keys: &[&str]| -> u64 {
         keys.iter()
-            .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
+            .find_map(|k| u.get(*k).and_then(token_number))
             .unwrap_or(0)
     };
     (
@@ -1053,11 +1053,20 @@ fn u64_pair(u: &Value) -> (u64, u64) {
     )
 }
 
+/// 宽口径数值解析：对齐 workbuddy_stats::number()——u64 → i64 → f64（非负有限
+/// 截断）→ 字符串 parse；浮点/字符串形态的 token 数不再静默得 0
+pub(crate) fn token_number(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| v.as_f64().filter(|n| n.is_finite() && *n >= 0.0).map(|n| n as u64))
+        .or_else(|| v.as_str()?.trim().parse::<u64>().ok())
+}
+
 /// 正值提取：首个 > 0 的键生效（0 值别名不遮蔽后续别名，对齐
 /// workbuddy_stats::positive_field——陈旧 0 值别名掩盖有效别名的场景已实证）
 fn positive_of(u: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
-        .find_map(|k| u.get(*k).and_then(|v| v.as_u64()).filter(|v| *v > 0))
+        .find_map(|k| u.get(*k).and_then(token_number).filter(|v| *v > 0))
 }
 
 /// 上游缓存读 tokens：宽口径提取（对齐 workbuddy_stats::cached_input_field），
@@ -1091,8 +1100,12 @@ pub(crate) fn cached_tokens_of(u: &Value) -> u64 {
     .unwrap_or(0)
 }
 
-/// 上游缓存写 tokens（cache_creation 口径）：宽口径提取，仅认正值，
-/// 键集对齐用量统计 CACHE_WRITE_KEYS
+/// 上游缓存写 tokens（cache_creation 口径）：宽口径提取，仅认正值。键集覆盖：
+/// - cache_creation_input_tokens：WB token_usage 主形态
+/// - cache_write_input_tokens / cacheWriteInputTokens：camelCase / 备选别名
+/// - prompt_cache_write_tokens：用量统计 CACHE_WRITE_KEYS 同款
+/// - cache_write_token：用量历史 extra_info 同源单数口径（读侧 cache_read_token
+///   的对称收录；usage_history 按此键落账）
 pub(crate) fn cache_write_tokens_of(u: &Value) -> u64 {
     positive_of(
         u,
@@ -1101,6 +1114,7 @@ pub(crate) fn cache_write_tokens_of(u: &Value) -> u64 {
             "cache_write_input_tokens",
             "cacheWriteInputTokens",
             "prompt_cache_write_tokens",
+            "cache_write_token",
         ],
     )
     .unwrap_or(0)
@@ -1570,7 +1584,9 @@ mod tests {
         assert_eq!(cache_write_tokens_of(&json!({"cache_write_input_tokens": 6})), 6);
         assert_eq!(cache_write_tokens_of(&json!({"cacheWriteInputTokens": 7})), 7);
         assert_eq!(cache_write_tokens_of(&json!({"prompt_cache_write_tokens": 2})), 2);
-        // 0 值别名不遮蔽后续别名
+        // 单数 cache_write_token：用量历史 extra_info 同源口径（读侧 cache_read_token 的对称收录）
+        assert_eq!(cache_write_tokens_of(&json!({"cache_write_token": 8})), 8);
+        // 0 值别名不遮蔽后续别名（含单数键）
         assert_eq!(
             cache_write_tokens_of(&json!({
                 "cache_creation_input_tokens": 0,
@@ -1578,7 +1594,30 @@ mod tests {
             })),
             3
         );
+        assert_eq!(
+            cache_write_tokens_of(&json!({"cache_creation_input_tokens": 0, "cache_write_token": 3})),
+            3
+        );
         assert_eq!(cache_write_tokens_of(&json!({})), 0);
+    }
+
+    /// 宽口径数值解析对齐 workbuddy_stats::number()：f64 / 字符串形态不再静默得 0
+    #[test]
+    fn token_number_parses_f64_and_string() {
+        // f64 截断（读侧与写侧键）
+        assert_eq!(cached_tokens_of(&json!({"cached_tokens": 12.0})), 12);
+        assert_eq!(cache_write_tokens_of(&json!({"cache_write_token": 7.0})), 7);
+        // 字符串数字
+        assert_eq!(cache_write_tokens_of(&json!({"cache_write_token": "7"})), 7);
+        assert_eq!(cached_tokens_of(&json!({"cache_read_input_tokens": "34"})), 34);
+        // u64_pair 同口径：prompt/completion 支持浮点与字符串
+        assert_eq!(
+            u64_pair(&json!({"prompt_tokens": 10.0, "completion_tokens": "3"})),
+            (10, 3)
+        );
+        // 负值 / 非法字符串按缺省 0 处理
+        assert_eq!(cached_tokens_of(&json!({"cached_tokens": -3})), 0);
+        assert_eq!(cache_write_tokens_of(&json!({"cache_write_token": "abc"})), 0);
     }
 
     /// Anthropic 流式出口 message_delta 透传缓存读/写 tokens（0 值别名不遮蔽）
