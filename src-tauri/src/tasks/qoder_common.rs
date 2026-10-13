@@ -518,9 +518,16 @@ fn parse_runtime_info_stdout(s: &str) -> Option<NativeRiskIdentity> {
 /// 失败（客户端未安装/执行失败/解析失败）返回 None，调用方走派生 fallback。
 pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
     static CACHE: std::sync::OnceLock<Option<NativeRiskIdentity>> = std::sync::OnceLock::new();
+    // 审查修复：降级路径（原生真值不可得 → 调用方走 machine_id 派生 fallback /
+    // 独立风控桶）此前零观测；OnceLock 语义使本日志进程内至多落一次
+    const FALLBACK_NOTE: &str =
+        "原生风控身份解析失败（设备头走 machine_id 派生 fallback，风控身份独立桶）";
     CACHE
         .get_or_init(|| {
             let Some(exe) = runtime_info_exe_path() else {
+                crate::fs_utils::app_log_default(&format!(
+                    "{FALLBACK_NOTE}: 未找到客户端 runtime_info 可执行文件"
+                ));
                 return None;
             };
             let mut cmd = std::process::Command::new(&exe);
@@ -531,12 +538,25 @@ pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
                 cmd.creation_flags(0x0800_0000);
             }
             let Ok(out) = cmd.output() else {
+                crate::fs_utils::app_log_default(&format!("{FALLBACK_NOTE}: runtime_info 执行失败"));
                 return None;
             };
             if !out.status.success() {
+                crate::fs_utils::app_log_default(&format!(
+                    "{FALLBACK_NOTE}: runtime_info 退出码非 0（{:?}）",
+                    out.status.code()
+                ));
                 return None;
             }
-            parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout))
+            match parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout)) {
+                Some(id) => Some(id),
+                None => {
+                    crate::fs_utils::app_log_default(&format!(
+                        "{FALLBACK_NOTE}: runtime_info 输出解析不出三键"
+                    ));
+                    None
+                }
+            }
         })
         .as_ref()
 }

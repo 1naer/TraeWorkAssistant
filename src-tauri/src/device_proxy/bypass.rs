@@ -51,8 +51,18 @@ pub fn cleanup_residual_bypass(data_dir: &Path) {
         return;
     }
     let key = win::KEY_PATH;
-    if win::reg_query_value(key, "ProxyEnable").as_deref() == Some("0x1") {
-        let current = win::reg_query_value(key, "ProxyOverride").unwrap_or_default();
+    // 审查修复：读失败（reg 命令执行失败等）必须与「值缺失」区分——此前统一按空表
+    // 处理会覆盖写清空用户白名单。读失败保留标记，下次启动重试
+    let Ok(enable) = win::reg_query_value(key, "ProxyEnable") else {
+        crate::fs_utils::app_log(data_dir, "清理 OAuth 豁免残留：读取 ProxyEnable 失败，保留标记待下次启动重试");
+        return;
+    };
+    if enable.as_deref() == Some("0x1") {
+        let Ok(override_val) = win::reg_query_value(key, "ProxyOverride") else {
+            crate::fs_utils::app_log(data_dir, "清理 OAuth 豁免残留：读取 ProxyOverride 失败，保留标记待重试（不以空表覆盖写）");
+            return;
+        };
+        let current = override_val.unwrap_or_default();
         let remaining: Vec<&str> = current
             .split(';')
             .map(str::trim)
@@ -86,11 +96,21 @@ pub fn enable_oauth_bypass(data_dir: &Path) -> Result<bool, String> {
         // 本软件未启动过 MITM 代理，无需豁免
         return Ok(false);
     };
-    if win::reg_query_value(key, "ProxyEnable").as_deref() != Some("0x1") {
+    // ProxyEnable/ProxyServer 读失败保守按「不匹配」处理（Ok(false) 不改写）：
+    // 无法确认系统代理指向本软件时绝不触碰用户配置
+    if win::reg_query_value(key, "ProxyEnable")
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("0x1")
+    {
         return Ok(false);
     }
     // 仅当系统代理确实指向本软件 MITM 端口时才改写（用户自己的代理不碰）
-    let server = win::reg_query_value(key, "ProxyServer").unwrap_or_default();
+    let server = win::reg_query_value(key, "ProxyServer")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if server != format!("127.0.0.1:{port}") {
         return Ok(false);
     }
@@ -100,7 +120,11 @@ pub fn enable_oauth_bypass(data_dir: &Path) -> Result<bool, String> {
         // 已豁免（幂等）：上次 enable 后未还原
         return Ok(true);
     }
-    let current = win::reg_query_value(key, "ProxyOverride").unwrap_or_default();
+    // 审查修复：ProxyOverride 读失败绝不能按空表覆盖写（会清空用户已有白名单），
+    // 报错跳过本次 enable；值缺失（Ok(None)）= 用户本无白名单，按空表继续
+    let current = win::reg_query_value(key, "ProxyOverride")
+        .map_err(|e| format!("读取系统代理白名单失败，已跳过 OAuth 直连豁免: {e}"))?
+        .unwrap_or_default();
     let existing: Vec<String> = current
         .split(';')
         .map(str::trim)
@@ -133,16 +157,29 @@ pub fn disable_oauth_bypass(data_dir: &Path) -> Result<(), String> {
     if added.is_empty() {
         return Ok(());
     }
-    // 系统代理已被关闭/还原（如 MITM 代理停止时整体还原了快照）时豁免已随之失效，直接清账
-    if win::reg_query_value(key, "ProxyEnable").as_deref() == Some("0x1") {
-        let current = win::reg_query_value(key, "ProxyOverride").unwrap_or_default();
-        let remaining: Vec<&str> = current
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
-            .collect();
-        win::run_reg(key, "ProxyOverride", "REG_SZ", &remaining.join(";"))?;
-        win::notify_wininet_changed();
+    // 系统代理已被关闭/还原（如 MITM 代理停止时整体还原了快照）时豁免已随之失效，直接清账。
+    // 审查修复：读失败不再静默清账——保留 added 清单与标记返 Err 重试，防还原丢失
+    // 导致豁免条目滞留系统代理
+    let enable = win::reg_query_value(key, "ProxyEnable")
+        .map_err(|e| format!("读取 ProxyEnable 失败，保留 OAuth 豁免清单待重试: {e}"))?;
+    match enable {
+        // ProxyEnable 值缺失 = 系统代理从未开启，豁免天然失效，清账
+        None => {}
+        Some(v) if v.as_str() == "0x1" => {
+            let Ok(override_val) = win::reg_query_value(key, "ProxyOverride") else {
+                return Err("读取 ProxyOverride 失败，保留 OAuth 豁免清单待重试（不以空表覆盖写）".into());
+            };
+            let current = override_val.unwrap_or_default();
+            let remaining: Vec<&str> = current
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
+                .collect();
+            win::run_reg(key, "ProxyOverride", "REG_SZ", &remaining.join(";"))?;
+            win::notify_wininet_changed();
+        }
+        // 系统代理已关闭：豁免失效，清账
+        Some(_) => {}
     }
     added.clear();
     let _ = std::fs::remove_file(marker_path(data_dir));
@@ -171,16 +208,28 @@ mod win {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
-    pub(super) fn reg_query_value(key: &str, name: &str) -> Option<String> {
+    pub(super) fn reg_query_value(key: &str, name: &str) -> Result<Option<String>, String> {
         let out = Command::new("reg")
             .args(["query", key, "/v", name])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .ok()?;
+            .map_err(|e| format!("reg query 执行失败: {e}"))?;
+        if !out.status.success() {
+            // 退出码 1 = 值不存在（正常语义），不视为错误
+            if out.status.code() == Some(1) {
+                return Ok(None);
+            }
+            return Err(format!(
+                "reg query 异常退出(code={:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
         let text = String::from_utf8_lossy(&out.stdout);
-        text.lines()
+        Ok(text
+            .lines()
             .find(|l| l.trim_start().starts_with(name))
-            .and_then(|l| l.split_whitespace().last().map(|s| s.to_string()))
+            .and_then(|l| l.split_whitespace().last().map(|s| s.to_string())))
     }
 
     pub(super) fn run_reg(key: &str, name: &str, ty: &str, value: &str) -> Result<(), String> {

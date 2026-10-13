@@ -258,9 +258,10 @@ pub async fn qoder_live_logins(state: State<'_, AppState>) -> Result<QoderLiveLo
 
 // ── 环境检测（M0 侦察结论固化为候选路径；M0 R-1/R-2 缺口闭合后扩展）─────────
 
-/// 0.4.3+ 拆分形态检测：真 IDE 已独立安装于 `%LOCALAPPDATA%\Programs\Qoder CN IDE\`
-/// macOS 适配预留：对应形态需实测（预期为 `/Applications/Qoder CN IDE.app` 是否存在；
-/// Windows 用 exe 存在性判定，macOS 改为 `.app` bundle 目录存在性判定，函数签名不变）
+/// 0.4.3+ 拆分形态检测：真 IDE 已独立安装。
+/// Windows 判定 exe 存在性（`%LOCALAPPDATA%\Programs\Qoder CN IDE\Qoder CN IDE.exe`），
+/// macOS 改为 `.app` bundle 目录存在性判定（审查修复：补齐 mac 分支）。
+#[cfg(target_os = "windows")]
 pub(crate) fn ide_split_installed() -> bool {
     std::env::var("LOCALAPPDATA")
         .ok()
@@ -274,8 +275,20 @@ pub(crate) fn ide_split_installed() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn ide_split_installed() -> bool {
+    Path::new("/Applications/Qoder CN IDE.app").exists()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub(crate) fn ide_split_installed() -> bool {
+    false
+}
+
 /// 过期 IDE 手动路径：指向 `Programs\Qoder CN\Qoder CN.exe`（0.4.3 前该路径是
-/// IDE，现在语义已是 Work 本体）。拆分形态已装时判定过期，忽略手动值走默认候选
+/// IDE，现在语义已是 Work 本体）。拆分形态已装时判定过期，忽略手动值走默认候选。
+/// 审查修复：该过期语义仅存在于 Windows 拆分布局，非 Windows 显式声明恒 false
+#[cfg(target_os = "windows")]
 fn is_stale_ide_manual(p: &Path) -> bool {
     std::env::var("LOCALAPPDATA")
         .ok()
@@ -288,7 +301,14 @@ fn is_stale_ide_manual(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Work 本体已安装检测（0.4.3+ 拆分形态 `%LOCALAPPDATA%\Programs\Qoder CN\`）
+#[cfg(not(target_os = "windows"))]
+fn is_stale_ide_manual(_p: &Path) -> bool {
+    false
+}
+
+/// Work 本体已安装检测（0.4.3+ 拆分形态：Windows `%LOCALAPPDATA%\Programs\Qoder CN\`，
+/// macOS `/Applications/Qoder CN.app`——审查修复：补齐 mac 分支）
+#[cfg(target_os = "windows")]
 fn work_body_installed() -> bool {
     std::env::var("LOCALAPPDATA")
         .ok()
@@ -300,6 +320,16 @@ fn work_body_installed() -> bool {
                 .exists()
         })
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn work_body_installed() -> bool {
+    Path::new("/Applications/Qoder CN.app").exists()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn work_body_installed() -> bool {
+    false
 }
 
 /// IDE exe 候选：settings.qoder_ide_path 人工指定优先，否则默认安装布局。

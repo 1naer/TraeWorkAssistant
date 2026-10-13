@@ -3,9 +3,9 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Local, Timelike};
 
 /// API 请求日志记录器：按日期分文件，直接存储在 logs/ 目录下（文件名 api_YYYY-MM-DD.log）
 ///
@@ -62,6 +62,13 @@ impl ApiLogger {
         // 使用 chrono 本地时间获取精确日期
         let now = Local::now();
         format!("api_{:04}-{:02}-{:02}.log", now.year(), now.month(), now.day())
+    }
+
+    /// 行内时间戳 HH:MM:SS，取本地时区（与文件名 today_filename 同源）。
+    /// 审查修复：原实现 epoch+8h 手算固定东八区，非东八区环境跨日与文件名错位
+    fn local_hms() -> (u32, u32, u32) {
+        let t = Local::now().time();
+        (t.hour(), t.minute(), t.second())
     }
 
     /// 入队一条日志（异步化热路径：仅内存操作，磁盘 IO 由写入线程承担）
@@ -153,14 +160,7 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        let (h, m, s) = Self::local_hms();
 
         let uid_short = &uid[..uid.len().min(12)];
         let ttfb_part = match ttfb_ms {
@@ -187,14 +187,7 @@ impl ApiLogger {
     /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
     /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
     pub fn log_sched_event(&self, event: &str) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        let (h, m, s) = Self::local_hms();
         let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
         self.enqueue(line);
     }
@@ -208,14 +201,7 @@ impl ApiLogger {
         status: u16,
         error: Option<&str>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        let (h, m, s) = Self::local_hms();
 
         let uid_short = &uid[..uid.len().min(12)];
         let mut lines = Vec::new();

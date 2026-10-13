@@ -654,7 +654,10 @@ pub fn update_run_installer(
     // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
     crate::events::emit_logged(&app, "update-installing", serde_json::Value::String(asset_name.clone()), None);
     std::thread::sleep(Duration::from_millis(800));
-    std::process::exit(0);
+    // 审查修复：走 Tauri 退出链（RunEvent::Exit）而非 std::process::exit——
+    // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
+    let _ = app.exit(0);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -456,10 +456,15 @@ export default function QoderAccounts() {
     setScanningIde(true);
     try {
       const r = await api.qoder.ideScan();
+      // 审查修复：凭证落库失败时后端返回 imported/updated=true 且 reason 非空，
+      // success 分支须降级为 warn 展示 reason，否则错误仅 app.log 留痕、用户不可见
+      const credWarn = r.reason ? `，但${r.reason}` : '';
       if (r.imported) {
-        pushToast('success', `已从 IDE 本地存储导入账号：${r.nickname || r.account_id}`);
+        const msg = `已从 IDE 本地存储导入账号：${r.nickname || r.account_id}${credWarn}`;
+        pushToast(credWarn ? 'warn' : 'success', msg);
       } else if (r.updated) {
-        pushToast('success', `IDE 登录态匹配已有账号，凭证已更新：${r.nickname || r.account_id}`);
+        const msg = `IDE 登录态匹配已有账号，凭证已更新：${r.nickname || r.account_id}${credWarn}`;
+        pushToast(credWarn ? 'warn' : 'success', msg);
       } else if (r.found) {
         pushToast('info', r.reason || '已发现 IDE 登录态，无需变更');
       } else {

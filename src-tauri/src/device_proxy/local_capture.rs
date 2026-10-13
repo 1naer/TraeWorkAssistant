@@ -185,6 +185,16 @@ fn capture_from_app_dir(ctx: &ProxyCtx, app_dir: &Path) -> Result<usize, String>
     Ok(found)
 }
 
+/// 临时目录 RAII 清理 guard：扫描路径任意退出（含 `?` 早退）都删目录。
+/// 审查修复：原实现仅成功/复制失败两条路径手动清理，中途出错残留累积。
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// 复制 Cookies 库到临时目录后只读打开（规避客户端运行时文件锁；
 /// -wal/-shm 一并复制避免读到未 checkpoint 的空库），返回命中的账号数
 #[cfg(windows)]
@@ -195,12 +205,9 @@ fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usiz
         .unwrap_or(0);
     let td = std::env::temp_dir().join(format!("aw_trae_ck_{}_{nanos}", std::process::id()));
     std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
+    let _guard = TempDirGuard(td.clone());
     let tmp_db = td.join("Cookies");
-    let copy_res = std::fs::copy(db, &tmp_db).map_err(|e| format!("Cookies 复制失败: {e}"));
-    if copy_res.is_err() {
-        let _ = std::fs::remove_dir_all(&td);
-        return Err(copy_res.unwrap_err());
-    }
+    std::fs::copy(db, &tmp_db).map_err(|e| format!("Cookies 复制失败: {e}"))?;
     for suffix in ["-wal", "-shm"] {
         let side = db.with_file_name(format!("Cookies{suffix}"));
         if side.exists() {
@@ -247,7 +254,7 @@ fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usiz
         }
         Ok(found)
     })();
-    let _ = std::fs::remove_dir_all(&td);
+    // 临时目录由 TempDirGuard 在函数返回时自动清理（含中途 ? 早退路径）
     result
 }
 

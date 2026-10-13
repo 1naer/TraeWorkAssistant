@@ -431,7 +431,9 @@ fn run_task(
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                return Err("跳过：已有签到/成长任务在执行中".into());
+                // skipped_busy：抢不到轮次锁（UI 路径在跑）= 幂等跳过而非失败（对齐
+                // qoder-checkin）——返 Err 会触发当日首败误报通知 + 白耗 Server酱 额度
+                return Ok(json!({ "ok": true, "skipped": "已有签到/成长任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let mut events: Vec<Value> = Vec::new();
             let done = super::wb_checkin::run_checkin_round(
@@ -461,7 +463,8 @@ fn run_task(
         // WorkBuddy 每日成长（任务配置页）：成长三开关驱动，抢轮次锁与 UI 路径互斥
         "wb-growth" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                return Err("跳过：已有签到/成长任务在执行中".into());
+                // skipped_busy：对齐 qoder-checkin/wb-checkin 的幂等跳过（防误报通知）
+                return Ok(json!({ "ok": true, "skipped": "已有签到/成长任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let s = crate::commands::workbuddy::load_settings(st);
             let flags = super::wb_checkin::GrowthOpts {
@@ -469,8 +472,27 @@ fn run_task(
                 lottery: s.growth_lottery,
                 tasks: s.growth_tasks,
             };
-            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值），调度日志记 ok 概要即可
-            super::wb_checkin::run_growth_round(st, &flags, &[], &mut |_| {});
+            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值）。审查修复：失败事件
+            // 此前被空回调丢弃（恒 Ok：当日不重试不通知）——现累计事件，可重试失败返
+            // Err 交 30 分钟冷却重试；永久性凭证失败剔除（对齐 wb-checkin 口径）
+            let mut events: Vec<Value> = Vec::new();
+            super::wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| events.push(ev.clone()));
+            let is_growth_fail = |e: &&Value| {
+                e.get("type").and_then(Value::as_str) == Some("growth")
+                    && e.get("status").and_then(Value::as_str) == Some("fail")
+            };
+            let failed = events.iter().filter(is_growth_fail).count() as i64;
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
+                    is_growth_fail(e) && (m.contains("需重新登录") || m.contains("无可用凭证"))
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                return Err(format!("WB 成长：{retryable} 个账号失败（稍后自动重试）"));
+            }
             Ok(json!({ "ok": true }))
         }
         // Trae JWT 定时续期（issue #27）：与 `--task-run trae-renew` 同款（lazy 48h 惰性门）

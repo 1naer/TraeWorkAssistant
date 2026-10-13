@@ -486,7 +486,35 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
     let trace_id = random_hex(32);
     let (pkce_verifier, code_challenge) = pkce_pair()?;
 
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
+    // 登录设备指纹按平台取真值（审查修复：原实现 mac 硬编码 windows/Windows 与真实
+    // 设备矛盾，有触发服务端风控 20403 风险）。mac 的 x_device_type 字面量具体取值
+    // 待真机抓包最终核实，此处先按平台通用真值分派
+    #[cfg(target_os = "windows")]
+    let (hostname, x_device_type, os_version) = (
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into()),
+        "windows",
+        "Windows".to_string(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    let (hostname, x_device_type, os_version) = {
+        // macOS：主机名 scutil --get ComputerName（回退 hostname 命令），系统版本读 sw_vers
+        let run = |cmd: &str, args: &[&str]| -> Option<String> {
+            std::process::Command::new(cmd)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        (
+            run("scutil", &["--get", "ComputerName"])
+                .or_else(|| run("hostname", &[]))
+                .unwrap_or_else(|| "Mac".into()),
+            "mac",
+            run("sw_vers", &["-productVersion"]).unwrap_or_else(|| "macOS".into()),
+        )
+    };
     let url = format!(
         "https://www.trae.cn/authorization?\
         login_version=1\
@@ -503,7 +531,7 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
         &x_device_id={device_id}\
         &x_machine_id={machine_id}\
         &x_device_brand={hostname}\
-        &x_device_type=windows\
+        &x_device_type={x_device_type}\
         &x_os_version={os_version}\
         &x_env=\
         &x_app_version={app_version}\
@@ -518,7 +546,8 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
         machine_id = machine_id,
         device_id = device_id,
         hostname = urlencoding::encode(&hostname),
-        os_version = urlencoding::encode("Windows"),
+        x_device_type = x_device_type,
+        os_version = urlencoding::encode(&os_version),
         app_version = OAUTH_PAGE_APP_VERSION,
         code_challenge = code_challenge,
     );
@@ -1026,6 +1055,11 @@ fn mask_sensitive(v: &mut serde_json::Value) {
         SENSITIVE.iter().any(|s| kl.contains(s))
     }
     fn mask_str(s: &str) -> String {
+        // 审查修复：短纯数字串（≤12 位）为错误码等业务标识（如 Error.Code="20101"），
+        // 打码会毁掉排障关键信息——豁免不打码；真实凭证（token/jwt 等）远长于此，不受影响
+        if !s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit()) {
+            return s.to_string();
+        }
         let head: String = s.chars().take(6).collect();
         format!("{head}…(len={})", s.chars().count())
     }

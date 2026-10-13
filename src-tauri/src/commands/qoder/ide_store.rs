@@ -324,9 +324,26 @@ pub fn qoder_ide_scan(
             ..Default::default()
         };
         // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
-        // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证
-        qoder_common::save_token_store(&state, &effective_id, &creds)?;
-        crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
+        // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证。
+        // 审查修复：此时池条目已在 with_pool_mut 入账，落库失败再 Err 上抛会跳过
+        // 热重载、造成网关池与 DB 不一致——改为 reason 告警 + app.log 留痕，仍热重载
+        let mut reason = String::new();
+        if let Err(e) = qoder_common::save_token_store(&state, &effective_id, &creds) {
+            reason = format!("凭证落库失败: {e}");
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("Qoder IDE 扫描：{reason}（账号 {effective_id}，池条目已入账）"),
+            );
+        }
+        // 审查修复：落库失败时不再写「已导入」成功日志（误导排查），改为告警措辞
+        if reason.is_empty() {
+            crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
+        } else {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("Qoder IDE 存储账号已发现并导入: {effective_id}，但 {reason}，网关本轮热重载可用、重启后凭证缺失"),
+            );
+        }
         // 新账号/凭证变更联动网关池热重载（fail-open 即时入池调度；服务未运行时 no-op）
         crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
         Ok(QoderIdeScanResult {
@@ -335,7 +352,7 @@ pub fn qoder_ide_scan(
             updated,
             account_id: effective_id,
             nickname,
-            reason: String::new(),
+            reason,
         })
     }
     #[cfg(not(windows))]

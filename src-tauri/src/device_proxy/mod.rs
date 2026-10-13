@@ -375,7 +375,16 @@ async fn handle_conn(
             return;
         }
         ctx.log.log(&format!("CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}"));
-        let acceptor = TlsAcceptor::from(ca.gen_server_config(&host));
+        // 审查修复：叶子证书签发失败（如畸形 host）不再 panic，记日志后关闭该连接
+        let acceptor = match ca.gen_server_config(&host) {
+            Ok(c) => TlsAcceptor::from(c),
+            Err(e) => {
+                ctx.log.log(&format!(
+                    "CONNECT {host}:{port}  [TRAE/MITM] 叶子证书签发失败，关闭连接: {e}"
+                ));
+                return;
+            }
+        };
         // 握手超时（审查修复：原无超时，客户端不发 ClientHello 时任务永久挂起）
         match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(client)).await {
             Ok(Ok(tls)) => {
