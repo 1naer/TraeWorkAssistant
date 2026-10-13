@@ -1378,6 +1378,11 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
     Ok((user_id, user_name))
 }
 
+/// 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中
+fn tail6(s: &str) -> String {
+    s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
 /// OAuth 登录闭环：解析回调 → 换取 accessToken → 获取用户信息 → 保存账号
 // async：内含最多两次 120s 超时的串行网络请求（exchange_token/get_user_info），同步命令会冻结 UI（审查修复）
 #[tauri::command(async)]
@@ -1423,25 +1428,42 @@ pub fn oauth_login(
         format!("Cloud-IDE-JWT {}", access_token)
     };
 
-    // 4. 解析 JWT 获取 user_id
+    // 4. 解析 JWT 获取 user_id（B3，审查 2026-10-13：以 JWT 解析值为权威 uid——
+    // 回调 URL 参数可被用户粘贴/构造篡改，此前 URL 参数优先，构造 userId=<目标uid>
+    // + 他人 code 即可绕过 expect_uid 校验把他人凭证写入目标账号。JWT 由授权服务
+    // 签发不可篡改；两者并存且不一致时拒绝，仅 JWT 有值或 URL 参数恰好一致才放行）
     let jwt_info = jwt::parse(&jwt);
-    let user_id = callback_info
+    let jwt_uid = jwt_info
         .user_id
         .clone()
-        .or_else(|| jwt_info.user_id.clone())
-        .ok_or_else(|| "无法从回调或 JWT 中获取 user_id".to_string())?;
+        .ok_or_else(|| "无法从 JWT 中解析 user_id".to_string())?;
+    let callback_uid = callback_info
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(cb_uid) = callback_uid {
+        if cb_uid != jwt_uid {
+            return Err(format!(
+                "回调 URL 中的账号 uid（尾号 {}）与凭证 JWT 解析结果（尾号 {}）不一致，已拒绝——请确认回调 URL 完整未被修改",
+                tail6(cb_uid),
+                tail6(&jwt_uid)
+            ));
+        }
+    }
+    let user_id = jwt_uid;
 
     // 重新登录防呆：行内「重新登录」携带目标账号 uid，
     // 浏览器误登其他账号时直接拒绝——此刻尚未做任何落库/设备回写，零副作用。
-    // 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中
-    if let Some(expected) = expect_uid.as_deref() {
+    // 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中；
+    // expect_uid 先 trim，空串视为未指定（前端对空输入曾回传 Some("")，导致重登必失败）
+    if let Some(expected) = expect_uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if expected != user_id {
-            let tail = |s: &str| s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>();
             return Err(format!(
                 "登录账号与目标账号不一致：本次授权的账号 uid 尾号 {}，目标账号 uid 尾号 {}。\
                  已取消且未改动任何数据，请确认浏览器中登录的是同一账号后重试（若浏览器当前为其他账号，请先退出登录）",
-                tail(&user_id),
-                tail(expected)
+                tail6(&user_id),
+                tail6(expected)
             ));
         }
     }
@@ -1552,6 +1574,13 @@ pub fn oauth_login(
     // 重新登录拿到新凭证 → 运行中 API 池热重载（全量重建，覆盖单点回填管不到的
     // 陈旧快照：SessionDead 禁用 / 冷却 / 积分 / 新账号缺失；服务未运行时 no-op）
     crate::commands::api_server::reload_pools_if_running(&state, &runtime);
+
+    // 登录闭环完成：清理本机登录会话（PKCE verifier / loginTraceID / 会话设备），
+    // 防止会话状态跨登录残留被重放利用；失败路径不清理（用户可能重试粘贴回调）
+    {
+        let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
 
     Ok(OAuthLoginResult {
         user_id: user_id.clone(),

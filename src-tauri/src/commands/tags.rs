@@ -224,7 +224,8 @@ fn delete_inner(
     }
     // ③ 清引用：api_keys.allowed_tags + api_pool 三池标签筛选
     // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
-    crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
+    // 审查修复（中等项）：modify 返回值（是否清理了引用）不丢弃，留痕可观测
+    let keys_cleaned = crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
         let mut changed = false;
         for k in keys_file.keys.iter_mut() {
             if k.allowed_tags.iter().any(|t| t == id) {
@@ -234,6 +235,12 @@ fn delete_inner(
         }
         changed
     });
+    if keys_cleaned {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("标签 {id} 已删除：同步清理了引用它的 API Key allowed_tags"),
+        );
+    }
     // api_pool RMW 持 POOL_CFG_LOCK（B1，配置叶子锁；此时 defs 锁已释放）
     let pool_changed = {
         let _cfg = crate::commands::api_server::POOL_CFG_LOCK

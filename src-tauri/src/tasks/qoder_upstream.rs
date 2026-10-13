@@ -2438,7 +2438,8 @@ mod tests {
         let t = QoderTranslate::new(lines.into_iter(), slot.clone(), "chat-1", "M");
         let ilines = InterruptibleLines::from_iterator(Box::new(t));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, _fi, _u) = wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M");
+        let (err, sent_any, _fi, _u) =
+            wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M", &std::collections::HashSet::new());
         drop(tx);
         let mut sent = Vec::new();
         while let Ok(frame) = rx.try_recv() {
@@ -2512,7 +2513,10 @@ mod tests {
             let ilines = InterruptibleLines::from_iterator(Box::new(t));
             let (tx, _rx) =
                 tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-            wb_sse::stream_forward_ex(ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M")
+            wb_sse::stream_forward_ex(
+                ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M",
+                &std::collections::HashSet::new(),
+            )
         };
         assert!(err.is_none(), "内容已流出，错误不得上抛换号");
         assert!(sent_any);

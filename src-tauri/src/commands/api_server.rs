@@ -282,6 +282,7 @@ pub async fn do_start(
     let shared = Arc::new(ApiSharedState {
         pool,
         wb_pool,
+        fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
         wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
         wb_sanitize: std::sync::atomic::AtomicBool::new(true),
         // T5.3/T5.5/T5.6③ 开关（api_pool.json，serde default 兼容旧文件）
@@ -725,14 +726,14 @@ fn apply_pool_snapshot(
     // 与分组筛选取交集（D5 池语义：组 ∩ 标签，均空 = 不限）
     let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let trae_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.trae_tag_ids, &tag_map);
-    // 积分快照文件级采集时间（issue #91 缓存保鲜）：rfc3339 → unix 秒。
+    // 积分快照文件级采集时间（issue #91 缓存保鲜）：宽容解析 → unix 秒（B1）。
     // 一次刷新全量写入 credits 与 updated_at，文件级时间戳对全体条目生效；
-    // 池据此判断 reserve 过滤新鲜度（陈旧快照 fail-open，见 pool.rs）
+    // 池据此判断 reserve 过滤新鲜度（陈旧快照 fail-open，见 pool.rs）。
+    // 此前裸用 parse_from_rfc3339，对历史无偏移裸串恒失败 → 恒 None → fail-open
     let credits_fetched_at = credits_file
         .updated_at
         .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| t.timestamp());
+        .and_then(crate::fs_utils::parse_ts_loose);
     let trae_accounts: Vec<_> = match &trae_tag_filter {
         Some(set) => accounts
             .accounts

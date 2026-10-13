@@ -519,16 +519,11 @@ fn run_task(
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
         "qoder-refresh" => super::qoder_refresh::run_task(st),
         // Qoder 会话流水定时合并：早于保留窗（settings.qoder_sessions_compact_days，
-        // 默认 3 天，非法/越界回退 clamp 1..=90）的请求行按 (date, uid, preview)
-        // 合并单行（幂等自愈；纯本地 SQLite 无网络依赖，失败返 Err 交 30 分钟冷却重试）
+        // 解析与 CLI 手工触发同源 super::qoder_sessions_compact_days，审查 F12）的
+        // 请求行按 (date, uid, preview) 合并单行（幂等自愈；纯本地 SQLite 无网络
+        // 依赖，失败返 Err 交 30 分钟冷却重试）
         "qoder-sessions-compact" => {
-            let days = st
-                .settings()
-                .qoder_sessions_compact_days
-                .trim()
-                .parse::<i64>()
-                .unwrap_or(crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS)
-                .clamp(1, 90);
+            let days = super::qoder_sessions_compact_days(st);
             let (merged, deleted) = crate::store::docs::qoder_sessions_compact(
                 &crate::store::db(&st.data_dir),
                 days,

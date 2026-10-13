@@ -132,16 +132,20 @@ fn write_back_pool_balances(state: &AppState, parsed: &Value) {
         let now_ts = chrono::Utc::now().timestamp();
         for acc in accounts {
             let uid = acc.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+            // ok=false（该账号本次查询失败）时不回写 balance/fetched_at/expire_at，
+            // 保留旧值防误清——此前 balance/fetched_at 无条件回写，失败账号旧余额
+            // 被覆写为 None，与下方注释口径相反，并加剧 reserve 过滤 fail-open（S3）
+            let ok = acc.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            if !ok {
+                continue;
+            }
             let bal = acc.get("balance").and_then(|v| v.as_f64());
             if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == uid) {
                 a.credits_balance = bal;
                 a.credits_fetched_at = acc.get("fetched_at").and_then(|v| v.as_str()).map(|s| s.to_string());
                 // 最早积分包到期（issue #28 API 网关调度口径，Buddy 不分包类型）：
-                // 仅成功取数的账号回写，失败（ok=false）保留旧值防误清
-                let ok = acc.get("ok").and_then(Value::as_bool).unwrap_or(true);
-                if ok {
-                    a.credits_expire_at = earliest_pack_expire(acc, now_ts);
-                }
+                // 仅成功取数的账号回写
+                a.credits_expire_at = earliest_pack_expire(acc, now_ts);
             }
         }
         if let Err(e) = save_pool(state, &pool) {

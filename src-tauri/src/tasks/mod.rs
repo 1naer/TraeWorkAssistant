@@ -52,6 +52,19 @@ pub fn parse_task_mode(args: &[String]) -> Option<String> {
     None
 }
 
+/// Qoder 会话流水合并保留窗天数（审查 F12）：统一读 settings.qoder_sessions_compact_days
+/// （非法/缺失回退默认值，越界 clamp 1..=90），调度器与应用内/CLI 手工触发同源，
+/// 防两入口口径漂移
+pub(crate) fn qoder_sessions_compact_days(state: &AppState) -> i64 {
+    state
+        .settings()
+        .qoder_sessions_compact_days
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS)
+        .clamp(1, 90)
+}
+
 /// CLI 任务分发：执行后返回进程退出码。
 /// stdout 末行 JSON（对齐原 python 脚本输出约定，便于排查与双轨对照）；
 /// 成功输出任务结果，失败输出 {"ok":false,"error":...}。
@@ -178,12 +191,15 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             }
         }
         // Qoder 会话流水定时合并（调度器/CLI 共用；纯本地 SQLite 无网络，幂等）。
-        // 不注册 schtasks——本地任务无「应用未启动也要跑」诉求，CLI 入口仅供手工触发/排查
-        "qoder-sessions-compact" => crate::store::docs::qoder_sessions_compact(
-            &crate::store::db(&state.data_dir),
-            crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS,
-        )
-        .map(|(merged, deleted)| serde_json::json!({ "ok": true, "merged": merged, "deleted": deleted })),
+        // 不注册 schtasks——本地任务无「应用未启动也要跑」诉求，CLI 入口仅供手工触发/排查。
+        // 保留天数与调度器同源：读 settings.qoder_sessions_compact_days（审查 F12）
+        "qoder-sessions-compact" => {
+            let days = qoder_sessions_compact_days(state);
+            crate::store::docs::qoder_sessions_compact(&crate::store::db(&state.data_dir), days)
+                .map(|(merged, deleted)| {
+                    serde_json::json!({ "ok": true, "merged": merged, "deleted": deleted, "days": days })
+                })
+        }
         other => {
             eprintln!("未知任务: {other}");
             println!("{}", serde_json::json!({"ok": false, "error": format!("未知任务: {other}")}));

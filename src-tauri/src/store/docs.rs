@@ -379,7 +379,9 @@ mod tests {
             .to_string();
         let ins = |s: &Store, rid: &str, sid: &str, uid: &str, date: &str, ts: i64,
                    model: &str, credits: f64, pt: i64, ct: i64, preview: &str| {
+            // 测试辅助：插入失败应让测试立刻失败，而非静默（unused Result 警告修复）
             qoder_session_insert(s, rid, sid, uid, date, ts, model, credits, pt, ct, 10, true, true, preview, "rec-1")
+                .unwrap();
         };
         // 修复前旧行：同轮同 preview、随机 sid 各异（u1@旧日，3 行）
         ins(&s, "r1", "aaaa", "u1", &old, 1000, "gpt", 1.0, 100, 10, "审查代码");
@@ -1580,8 +1582,11 @@ pub fn qoder_session_insert(
 ) -> Result<(), String> {
     // 防御（审查修复）：request_id 取自上游信封（外部可控字段），"agg:" 为
     // qoder_sessions_compact 聚合行保留前缀（DELETE 排除与 HAVING 判定依据）；
-    // 上游伪造同前缀 id 会经 ON CONFLICT 顶撞/覆盖历史聚合行主键——入口统一换 uuid
-    let request_id = if request_id.starts_with("agg:") {
+    // 上游伪造同前缀 id 会经 ON CONFLICT 顶撞/覆盖历史聚合行主键——入口统一换 uuid。
+    // 判定与 SQLite GLOB（NOT GLOB 'agg:*'，ASCII 大小写敏感）同口径：小写化后
+    // 前缀匹配，AGG:x 等大小写变体同样拦截（此前 starts_with 大小写敏感而
+    // LIKE 不敏感，AGG:x 会落库但永不被合并删除，credits 永久双计——S2）
+    let request_id = if request_id.to_ascii_lowercase().starts_with("agg:") {
         uuid::Uuid::new_v4().to_string()
     } else {
         request_id.to_string()
@@ -1644,6 +1649,9 @@ pub const QODER_SESSIONS_COMPACT_AFTER_DAYS: i64 = 3;
 ///
 /// 返回 (本次合并的会话组数, 删除的原始请求行数)。
 pub fn qoder_sessions_compact(s: &Store, before_days: i64) -> Result<(usize, usize), String> {
+    // 守卫（审查 S1 附带）：pub fn 无调用方保证，负数/0 会把当天活跃会话一并
+    // 合并删除；调度器/设置层已 clamp 1..=90，此处再兜底 clamp 1..=365
+    let before_days = before_days.clamp(1, 365);
     let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(before_days))
         .format("%Y-%m-%d")
         .to_string();
@@ -1668,12 +1676,12 @@ pub fn qoder_sessions_compact(s: &Store, before_days: i64) -> Result<(usize, usi
              FROM qoder_sessions q
              WHERE q.date < ?1
              GROUP BY q.date, q.uid, q.preview
-             HAVING SUM(request_id NOT LIKE 'agg:%') > 0",
+             HAVING SUM(request_id NOT GLOB 'agg:*') > 0",
             [&cutoff],
         )?;
         let deleted = tx.execute(
             "DELETE FROM qoder_sessions
-             WHERE date < ?1 AND request_id NOT LIKE 'agg:%'",
+             WHERE date < ?1 AND request_id NOT GLOB 'agg:*'",
             [&cutoff],
         )?;
         tx.commit()?;

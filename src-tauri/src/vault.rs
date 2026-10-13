@@ -309,11 +309,13 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
                     if a.jwt.trim().is_empty() && !entry.jwt.is_empty() {
                         a.jwt = entry.jwt;
                     }
-                    // RT：与 JWT 独立判断——JSON 无明文即回填 vault。
+                    // RT：与 JWT 独立判断——JSON 无明文即回填 vault（trim 口径与 JWT 一致）。
                     // 不能因 JWT 有捕获明文就 continue 跳过整个账号，否则代理捕获
                     // 写回明文 JWT 后，OAuth 登录拿到的 vault RT 永远回填不上，
                     // 账号会恒显「无 Refresh」（2026-10-11 实测）
-                    if a.refresh_token.as_deref().map_or(true, |s| s.is_empty())
+                    if a.refresh_token
+                        .as_deref()
+                        .map_or(true, |s| s.trim().is_empty())
                         && !entry.refresh_token.is_empty()
                     {
                         a.refresh_token = Some(entry.refresh_token);

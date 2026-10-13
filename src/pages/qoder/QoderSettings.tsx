@@ -547,10 +547,6 @@ export default function QoderSettings() {
                 max={90}
                 value={compactDays}
                 onChange={(e) => setCompactDays(e.target.value)}
-                onBlur={() => {
-                  const n = Math.min(90, Math.max(1, Math.round(Number(compactDays) || 3)));
-                  setCompactDays(String(n));
-                }}
                 className="input h-9 !w-20 text-sm"
               />
               <span className="text-xs text-slate-400">

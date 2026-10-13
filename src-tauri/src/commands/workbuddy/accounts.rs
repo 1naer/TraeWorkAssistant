@@ -677,13 +677,13 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
             global_region: domain.contains(".workbuddy.ai"),
             credits: a.credits_balance,
             credits_expire_at: a.credits_expire_at,
-            // 条目级快照采集时间（issue #91 缓存保鲜）：ISO → unix 秒，
-            // 池用于 reserve 过滤新鲜度判断（陈旧快照 fail-open）
+            // 条目级快照采集时间（issue #91 缓存保鲜）：宽容解析 → unix 秒（B1），
+            // 池用于 reserve 过滤新鲜度判断（陈旧快照 fail-open）。
+            // 此前裸用 parse_from_rfc3339，对历史无偏移裸串恒失败 → 恒 None
             credits_fetched_at: a
                 .credits_fetched_at
                 .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.timestamp()),
+                .and_then(crate::fs_utils::parse_ts_loose),
             needs_relogin: a.needs_relogin,
             group_id: a.group_id.clone(),
         });

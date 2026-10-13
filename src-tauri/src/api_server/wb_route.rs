@@ -418,6 +418,7 @@ pub fn wb_stream_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -462,7 +463,7 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -490,6 +491,7 @@ fn run_wb_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
+    encoded: &std::collections::HashSet<String>,
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -681,7 +683,7 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -849,6 +851,10 @@ fn run_wb_stream(
                         }
                         RetryAction::Fatal => {
                             let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            // 终态记账对齐 SwitchKey/耗尽收尾（审查 F3）：Fatal 是请求
+                            // 终局，此前仅 log_request 导致用量统计页缺口
+                            state.record_usage(true, model, &picked.uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0);
                             state.logger.log_request(
                                 "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
@@ -876,6 +882,7 @@ pub async fn wb_aggregate_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let model_out = model.clone();
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
@@ -1157,6 +1164,10 @@ pub async fn wb_aggregate_chat(
                                 break;
                             }
                             RetryAction::Fatal => {
+                                // 终态记账对齐 SwitchKey 分支（审查 F3）：Fatal 是请求
+                                // 终局，此前仅 log_request 导致用量统计页缺口
+                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0);
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
@@ -1190,6 +1201,7 @@ pub async fn wb_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_out,
+                    &encoded,
                 ),
                 Protocol::OpenAi => resp,
             };
@@ -1248,6 +1260,7 @@ pub async fn wb_tool_exec_chat(
     start_ts: Instant,
     key_id: String,
     guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let model_inner = model.clone();
     // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
@@ -1598,7 +1611,7 @@ pub async fn wb_tool_exec_chat(
     };
 
     let resp_obj = {
-        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model);
+        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model, &encoded);
         if !ws_items.is_empty() {
             let mut output = ws_items;
             if let Some(old) = r.get("output").and_then(|o| o.as_array()).cloned() {

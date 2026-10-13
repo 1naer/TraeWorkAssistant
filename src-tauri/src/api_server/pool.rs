@@ -238,8 +238,13 @@ impl ApiPool {
     }
 
     /// 是否存在积分快照陈旧/缺时间戳的账号（issue #91 启动保鲜判定）：
-    /// 此类账号 reserve 过滤 fail-open 不生效，由 do_start 后台刷新拨新恢复
+    /// 此类账号 reserve 过滤 fail-open 不生效，由 do_start 后台刷新拨新恢复。
+    /// reserve 阈值关闭（0）时新鲜度判定无意义（reserve 过滤恒不生效），短路返回
+    /// false——避免每次启动都触发全量余额刷新的网络副作用（B2，审查 2026-10-13）
     pub fn has_stale_credits(&self) -> bool {
+        if self.reserve_credits() <= 0.0 {
+            return false;
+        }
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         entries
@@ -285,7 +290,8 @@ impl ApiPool {
             }
             if let Some(c) = e.credits {
                 if c > reserve || !e.reserve_filter_active(now) {
-                    total += c;
+                    // max(0)：负积分（对账异常快照）不应拉低/拉负总分影响 smart 排序
+                    total += c.max(0.0);
                 }
             }
             if let Some(exp) = e.credits_expire_at {

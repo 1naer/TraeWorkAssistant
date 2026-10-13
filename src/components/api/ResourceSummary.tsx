@@ -91,8 +91,11 @@ function DispatchCenterCard({
   // per_model 新增绑定行（本地输入态，添加时才落 policy）
   const [newPerModelName, setNewPerModelName] = useState('');
   const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
-  // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），onBlur 才落盘
-  const [reserveDraft, setReserveDraft] = useState<number | null>(null);
+  // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），
+  // onBlur 才落盘。审查 F14 修复：改存原始字符串——旧实现 Number('')=0 使「清空
+  // 重输」直接跳 0，误失焦即静默保存 0（=关闭调度保护）；现空串/非法输入失焦时
+  // 还原策略值不落盘，合法整数才提交（保存侧 fail-closed，无失焦抢跑钳制）
+  const [reserveDraft, setReserveDraft] = useState<string | null>(null);
   // F2：保存请求序号守卫（仅最新一次响应可写状态）
   const saveSeqRef = useRef(0);
 
@@ -160,7 +163,11 @@ function DispatchCenterCard({
     setSaving(true);
     try {
       const next = await api.apiServer.dispatchPolicySet({ ...policy, ...patch });
-      if (seq === saveSeqRef.current) setPolicy(next);
+      if (seq === saveSeqRef.current) {
+        setPolicy(next);
+        // 审查修复（中等项）：写操作必须有可见反馈——成功也提示（对齐 L140 既有口径）
+        toast('success', '调度策略已保存，运行中网关即时生效');
+      }
     } catch (e) {
       if (seq === saveSeqRef.current) {
         toast('error', `调度策略保存失败：${String(e).slice(0, 120)}`);
@@ -297,15 +304,21 @@ function DispatchCenterCard({
               className={`${selectCls} w-20`}
               min={0}
               step={1}
-              value={reserveDraft ?? policy.reserve_credits}
+              value={reserveDraft ?? String(policy.reserve_credits)}
               disabled={saving}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setReserveDraft(Number.isFinite(v) ? v : 0);
-              }}
+              onChange={(e) => setReserveDraft(e.target.value)}
               onBlur={() => {
-                if (reserveDraft != null && reserveDraft !== policy.reserve_credits) {
-                  void savePolicy({ reserve_credits: Math.max(0, reserveDraft) });
+                if (reserveDraft == null) return;
+                const t = reserveDraft.trim();
+                // 空串/非法数值：放弃编辑还原策略值（不静默清零/落盘）；
+                // 接受小数（后端 reserve_credits 为 f64，避免既有小数值无法往返编辑）
+                if (t === '' || !/^\d+(\.\d+)?$/.test(t)) {
+                  setReserveDraft(null);
+                  return;
+                }
+                const v = Math.max(0, Number(t));
+                if (v !== policy.reserve_credits) {
+                  void savePolicy({ reserve_credits: v });
                 }
                 setReserveDraft(null);
               }}

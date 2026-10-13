@@ -308,15 +308,42 @@ impl ModelSources {
     }
 }
 
-/// 跨池回退 warn 日志（§4.5）：`dispatch fallback: model=… preferred=… actual=… reason=…`
+/// 跨池回退 warn 日志（§4.5）：
+/// `dispatch fallback: model=… pool=… preferred=… reason=…`（pool 即 actual）
+/// 审查修复（中等项）：60s 节流——同因回退逐请求落盘会刷爆 app 日志（上游
+/// 故障期间每个请求都触发）；二审细化：按 model|reason 分键限流，
+/// 不同模型/不同因的回退互不抑制，避免观测盲区
 fn log_fallback(state: &ApiSharedState, model: &str, preferred: TargetPool, actual: TargetPool, reason: FallbackReason) {
+    const FALLBACK_LOG_THROTTLE_MS: i64 = 60_000;
+    /// 键上限：模型组合再多也有限（按 model|reason 组合增长），
+    /// 超限整表清理，防极端场景下无界增长
+    const FALLBACK_LOG_MAX_KEYS: usize = 256;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let key = format!("{model}|{}", reason.as_str());
+    let mut last_map = state
+        .fallback_log_last_ms
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&last) = last_map.get(&key) {
+        if now_ms - last < FALLBACK_LOG_THROTTLE_MS {
+            return;
+        }
+    }
+    if last_map.len() >= FALLBACK_LOG_MAX_KEYS {
+        last_map.clear();
+    }
+    last_map.insert(key, now_ms);
+    drop(last_map);
     crate::fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "dispatch fallback: model={} preferred={} actual={} reason={}",
+            "dispatch fallback: model={} pool={} preferred={} reason={}",
             model,
-            preferred.as_str(),
             actual.as_str(),
+            preferred.as_str(),
             reason.as_str(),
         ),
     );
@@ -949,6 +976,7 @@ mod tests {
         let state = Arc::new(ApiSharedState {
             pool: super::super::pool::ApiPool::new(),
             wb_pool: super::super::pool::ApiPool::new(),
+            fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
             wb_enabled: AtomicBool::new(true),
             wb_sanitize: AtomicBool::new(true),
             wb_default_thinking: AtomicBool::new(false),
@@ -1280,7 +1308,7 @@ mod tests {
         let r = f.resolve("glm-5.3").unwrap();
         assert_eq!(r.pool, TargetPool::Trae);
         assert_eq!(r.fallback_from, Some(TargetPool::Buddy));
-        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 preferred=buddy actual=trae reason=no_healthy_account"));
+        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 pool=trae preferred=buddy reason=no_healthy_account"));
     }
 
     /// 双源 + Trae 池耗尽（priority 模式 trae 优先）→ 回退 Buddy
@@ -1758,7 +1786,7 @@ mod tests {
         let r = f.resolve_key("glm-5.3", "k1").unwrap();
         assert_eq!(r.pool, TargetPool::Buddy);
         assert_eq!(r.fallback_from, Some(TargetPool::Trae));
-        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 preferred=trae actual=buddy reason=no_healthy_account"));
+        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 pool=buddy preferred=trae reason=no_healthy_account"));
 
         // fallback 关：绑定池不健康 → 显式报错（不回退）
         let mut p = policy_default();

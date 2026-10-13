@@ -179,8 +179,10 @@ pub fn custom_stream_chat(
             // 可中断行源：stream_forward 停滞期间周期性检查客户端断连
             Ok(reader) => match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
                 Ok(lines) => {
-                    let (error_info, sent_any, up_usage) =
-                        wb_sse::stream_forward(lines, &tx, proto, &chat_id, &model);
+                    // 自定义上游无 namespace 展平编码 → 空集合禁用编码名拆分（审查 F4）
+                    let (error_info, sent_any, up_usage) = wb_sse::stream_forward(
+                        lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(),
+                    );
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = up_usage.as_ref().map(usage_pair).unwrap_or((0, 0));
@@ -342,6 +344,8 @@ pub async fn custom_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_outer,
+                    // 自定义上游无 namespace 展平编码（Responses 分支为防御性兜底）
+                    &std::collections::HashSet::new(),
                 ),
                 Protocol::OpenAi => resp,
             };

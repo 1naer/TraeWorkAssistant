@@ -108,6 +108,11 @@ pub struct ApiSharedState {
     pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
     /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
     pub wb_probe_ok: std::sync::atomic::AtomicI64,
+    /// 跨池回退日志节流（审查中等项 + 二审细化）：key = "model|reason"，
+    /// value = 上次落盘 Unix 毫秒；60s 窗口内同 model 同因回退只落盘一次，
+    /// 防逐请求刷盘放大；不同 model/reason 互不抑制
+    pub fallback_log_last_ms:
+        Mutex<std::collections::HashMap<String, i64>>,
     /// Trae 上游 401 自愈回调（issue #27 方案 B；网关层无 AppState 引用，由启动方注入）：
     /// 入参 user_id，内部走 refresh_jwt_impl 全防护链路强制刷新并持久化。
     /// None（单测/降级构造）时 401 维持原「note_error + 换号」语义
@@ -740,6 +745,7 @@ mod inflight_tests {
             usage_dirty: Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
             trae_jwt_refresh: None,
             trae_enabled: std::sync::atomic::AtomicBool::new(true),
             qoder_pool: pool::ApiPool::new(),

@@ -71,18 +71,27 @@ fn uids_by_gid_all(state: &AppState) -> std::collections::HashMap<String, Vec<St
         }
         Ok(())
     });
-    // Buddy / Qoder：行文档 group_id 字段（读失败静默跳过该池——列表只读展示，
-    // 与原 pool_members 的 fail-open 口径一致，B5 的 fail-closed 仅约束删除路径）
+    // Buddy / Qoder：行文档 group_id 字段（读失败留痕后按空池处理——列表只读展示
+    // 与原 pool_members 的 fail-open 口径一致，B5 的 fail-closed 仅约束删除路径；
+    // 但按 log_dedup_dropped 先例，静默跳过须 app_log 落痕）
     for table in ["wb_accounts", "qoder_accounts"] {
-        for (_, data) in store.rows_all(table).unwrap_or_default() {
-            if let (Some(gid), Some(id)) = (
-                data.get("group_id").and_then(|v| v.as_str()),
-                data.get("id").and_then(|v| v.as_str()),
-            ) {
-                if !gid.is_empty() {
-                    map.entry(gid.to_string()).or_default().push(id.to_string());
+        match store.rows_all(table) {
+            Ok(rows) => {
+                for (_, data) in rows {
+                    if let (Some(gid), Some(id)) = (
+                        data.get("group_id").and_then(|v| v.as_str()),
+                        data.get("id").and_then(|v| v.as_str()),
+                    ) {
+                        if !gid.is_empty() {
+                            map.entry(gid.to_string()).or_default().push(id.to_string());
+                        }
+                    }
                 }
             }
+            Err(e) => crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("shared_groups_list 读 {table} 失败，该池成员按空处理：{e}"),
+            ),
         }
     }
     map
@@ -282,7 +291,8 @@ pub(crate) fn delete_inner(
         refs_changed
     };
     // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
-    crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
+    // 审查修复（中等项）：modify 返回值（是否清理了引用）不丢弃，留痕可观测
+    let keys_cleaned = crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
         let mut changed = false;
         for k in keys_file.keys.iter_mut() {
             if k.allowed_groups.iter().any(|g| g == id) {
@@ -291,7 +301,13 @@ pub(crate) fn delete_inner(
             }
         }
         changed
-    });    // ④ 联动：成员回落 / 池筛选变更都影响调度池；Key 约束展开索引失效
+    });
+    if keys_cleaned {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("分组 {id} 已删除：同步清理了引用它的 API Key allowed_groups"),
+        );
+    }    // ④ 联动：成员回落 / 池筛选变更都影响调度池；Key 约束展开索引失效
     if refs_changed {
         crate::commands::api_server::reload_pools_if_running(state, runtime);
     }

@@ -121,11 +121,55 @@ pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
 }
 
 pub fn now_iso() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    // B1（审查 2026-10-13）：补时区偏移（+08:00）——此前输出的本地裸串无偏移，
+    // DateTime::parse_from_rfc3339 解析恒失败，消费端 credits_fetched_at 恒 None，
+    // reserve 过滤与 24h 陈旧判定整体失效（fail-open）。带偏移后 rfc3339 直接可解析；
+    // 存量裸串由 parse_ts_loose 二级兜底覆盖。
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()
 }
 
 pub fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 宽容时间戳解析 → Unix 秒（B1 修复公共入口）。
+/// 兼容：RFC3339（必须带偏移 Z / ±HH:MM）、本地裸串（空格或 'T' 分隔、无偏移，
+/// 假定东八区——历史 now_ts()/now_iso() 产出形态）、数字字符串时间戳。
+/// 解析失败返回 None。消费 credits_fetched_at / updated_at 等快照时间戳统一走此函数，
+/// 禁止裸用 parse_from_rfc3339（生产端历史数据无偏移会恒解析失败）。
+pub fn parse_ts_loose(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 纯数字：按时间戳秒/毫秒解释（毫秒 ≥1e12）
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        let n: f64 = s.parse().ok()?;
+        return if n >= 1e12 {
+            Some((n / 1000.0) as i64)
+        } else {
+            Some(n as i64)
+        };
+    }
+    let s = s.replace('Z', "+00:00").replace('/', "-");
+    use chrono::TimeZone;
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(&s) {
+        return Some(d.timestamp());
+    }
+    let cn = chrono::FixedOffset::east_opt(8 * 3600)?;
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(&s, fmt) {
+            return cn.from_local_datetime(&d).single().map(|dt| dt.timestamp());
+        }
+    }
+    None
 }
 
 pub fn today_prefix() -> String {
@@ -276,6 +320,35 @@ mod tests {
         assert!(ensure_uid_safe("a/b").is_err());
         assert!(ensure_uid_safe(r"a\b").is_err());
         assert!(ensure_uid_safe("qd-443681d83879.bak/../../etc").is_err());
+    }
+
+    /// B1 回归：生产端时间串必须能被 parse_ts_loose 解析出时间戳——
+    /// rfc3339-only 消费端对无偏移裸串恒 Err 导致 credits_fetched_at 恒 None，
+    /// reserve 过滤 fail-open（issue #91 结构性失效根因）
+    #[test]
+    fn parse_ts_loose_parses_produced_formats() {
+        use chrono::TimeZone;
+        // now_iso() 产出串（含偏移）
+        let iso = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+        assert!(parse_ts_loose(&iso).is_some());
+        // 历史 now_iso() 裸串（无偏移）
+        let bare_iso = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        assert!(parse_ts_loose(&bare_iso).is_some());
+        // 历史 now_ts() 空格分隔裸串
+        assert!(parse_ts_loose(&now_ts()).is_some());
+        // RFC3339 标准形态与 Unix 秒/毫秒（2026-10-13T00:00:00Z = 1791849600）
+        assert_eq!(parse_ts_loose("2026-10-13T00:00:00Z"), Some(1791849600));
+        assert_eq!(parse_ts_loose("1791849600"), Some(1791849600));
+        assert_eq!(parse_ts_loose("1791849600000"), Some(1791849600));
+        // 东八区裸串：2026-10-13 08:00:00 +08:00 = 2026-10-13T00:00:00Z
+        let cn = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let expect = cn.from_local_datetime(
+            &chrono::NaiveDateTime::parse_from_str("2026-10-13 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+        ).single().unwrap().timestamp();
+        assert_eq!(parse_ts_loose("2026-10-13 08:00:00"), Some(expect));
+        // 非法输入
+        assert_eq!(parse_ts_loose(""), None);
+        assert_eq!(parse_ts_loose("not-a-date"), None);
     }
 
     /// 定级回归（2026-10-06）：`path` 逐段严格下钻，`dig` 是「候选键名」全树查找。

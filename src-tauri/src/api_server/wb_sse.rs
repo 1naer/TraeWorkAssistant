@@ -9,7 +9,7 @@
 //!
 //! 输入统一为行迭代器（便于首字超时等上层封装），不直接持有 Reader。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -237,6 +237,7 @@ pub fn stream_forward_ex(
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
     model: &str,
+    encoded: &HashSet<String>,
 ) -> (Option<(i64, String)>, bool, bool, Option<Value>) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
@@ -403,15 +404,20 @@ pub fn stream_forward_ex(
                             "arguments": args,
                         });
                         // 编码名还原为 Codex 只接受的 {name, namespace} 双字段；
-                        // 扁平 function 工具保持单 name 字段（issue #93）
-                        match crate::api_server::wb_responses::split_namespaced(name) {
-                            Some((ns, inner)) => {
-                                item["name"] = json!(inner);
-                                item["namespace"] = json!(ns);
+                        // 仅对请求侧登记的编码名拆分（审查 F4，issue #93）——
+                        // 客户端原生扁平工具名可能天然含 `__`，未登记者保持单 name
+                        if encoded.contains(name.as_str()) {
+                            match crate::api_server::wb_responses::split_namespaced(name) {
+                                Some((ns, inner)) => {
+                                    item["name"] = json!(inner);
+                                    item["namespace"] = json!(ns);
+                                }
+                                None => {
+                                    item["name"] = json!(name);
+                                }
                             }
-                            None => {
-                                item["name"] = json!(name);
-                            }
+                        } else {
+                            item["name"] = json!(name);
                         }
                         let mut added = item.clone();
                         added["status"] = json!("in_progress");
@@ -748,9 +754,10 @@ pub fn stream_forward(
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
     model: &str,
+    encoded: &HashSet<String>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let (error_info, sent_any, _failed_inline, usage) =
-        stream_forward_ex(lines, tx, proto, chat_id, model);
+        stream_forward_ex(lines, tx, proto, chat_id, model, encoded);
     (error_info, sent_any, usage)
 }
 
@@ -1017,7 +1024,7 @@ mod tests {
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
         let start = std::time::Instant::now();
         let (_err, sent_any, _fi, _u) = stream_forward_ex(
-            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m",
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
         );
         assert!(!sent_any, "断连后不得有任何事件下发");
         assert!(
@@ -1126,8 +1133,14 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, usage) =
-            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_1", "glm-5.3");
+        let (err, sent_any, usage) = stream_forward(
+            lines,
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "resp_1",
+            "glm-5.3",
+            &HashSet::new(),
+        );
         assert!(err.is_none());
         assert!(sent_any);
         assert!(usage.is_some());
@@ -1162,8 +1175,14 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, usage) =
-            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_6", "m");
+        let (err, sent_any, usage) = stream_forward(
+            lines,
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "resp_6",
+            "m",
+            &HashSet::from(["multi_agent_v1__spawn_agent".to_string()]),
+        );
         assert!(err.is_none());
         assert!(sent_any);
         assert!(usage.is_some());
@@ -1198,8 +1217,9 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":1001}}",
             "",
         ]);
-        let (err, sent_any, failed_inline, _usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m");
+        let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m", &HashSet::new(),
+        );
         assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
         assert!(sent_any);
         assert!(failed_inline, "流内失败必须以 failed_inline 上报调用方");
@@ -1223,8 +1243,9 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m");
+        let (err, sent_any, failed_inline, usage) = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m", &HashSet::new(),
+        );
         assert!(err.is_none());
         assert!(sent_any);
         assert!(!failed_inline);
@@ -1241,8 +1262,9 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":7}}",
             "",
         ]);
-        let (err, _sent_any, failed_inline, _usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m");
+        let (err, _sent_any, failed_inline, _usage) = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m", &HashSet::new(),
+        );
         assert!(err.is_none());
         assert!(failed_inline);
         drop(tx);
@@ -1258,8 +1280,9 @@ mod tests {
     fn stream_forward_error_before_stream_uplifts() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]);
-        let (err, sent_any, failed_inline, _usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m");
+        let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
+        );
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
         assert!(!sent_any);
         assert!(!failed_inline);
@@ -1277,8 +1300,9 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, _u) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m");
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m", &HashSet::new(),
+        );
         assert!(err.is_none() && sent_any && !failed_inline);
         drop(tx);
         let mut body = String::new();
@@ -1300,7 +1324,9 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let _ = stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m");
+        let _ = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m", &HashSet::new(),
+        );
         drop(tx);
         let mut body = String::new();
         while let Ok(frame) = rx.try_recv() {

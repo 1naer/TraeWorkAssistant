@@ -746,9 +746,9 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -844,6 +844,10 @@ pub async fn responses_api(
             return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e);
         }
     };
+    // 审查 F4：请求侧登记 namespace 分组展平编码名，随执行链下发；回程投影
+    // （流式/非流式/toolexec）仅对集合内命中者做 {name, namespace} 还原——
+    // 客户端原生扁平工具名可能天然含 `__`，无差别拆分会破坏工具分发
+    let encoded_tools = super::wb_responses::encoded_tool_names(&peek);
 
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
@@ -889,6 +893,7 @@ pub async fn responses_api(
             start_ts,
             key_str,
             guard,
+            encoded_tools,
         )
         .await;
     }
@@ -899,9 +904,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard)
+        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard).await
+        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, encoded_tools).await
     }
 }
 
@@ -1080,9 +1085,9 @@ pub async fn messages(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
@@ -1233,9 +1238,9 @@ pub async fn completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
@@ -2957,6 +2962,7 @@ mod tests {
         let state = Arc::new(ApiSharedState {
             pool: super::super::pool::ApiPool::new(),
             wb_pool: super::super::pool::ApiPool::new(),
+            fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
             wb_enabled: std::sync::atomic::AtomicBool::new(true),
             wb_sanitize: std::sync::atomic::AtomicBool::new(true),
             wb_default_thinking: std::sync::atomic::AtomicBool::new(false),

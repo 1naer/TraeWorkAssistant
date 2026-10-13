@@ -177,6 +177,12 @@ pub fn qoder_sessions_query(
 ) -> Result<UsageSessionsResult, String> {
     let page = page.unwrap_or(1).max(1);
     let page_size = page_size.unwrap_or(50).clamp(1, 200);
+    // 审查修复（中等项）：start/end trim 后空串不校验会退化 `date >= ''` 命中全表
+    let start = start.trim().to_string();
+    let end = end.trim().to_string();
+    if start.is_empty() || end.is_empty() {
+        return Err("start/end 日期区间不能为空".into());
+    }
     let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
 
