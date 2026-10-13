@@ -1435,6 +1435,13 @@ pub async fn wb_tool_exec_chat(
                                     if u.get("total_tokens").is_some() {
                                         u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
                                     }
+                                    // 清除遮蔽键：cached_tokens_of 优先读 cache_read_input_tokens
+                                    // 等键，若残留上游单轮值会遮蔽跨轮累计值
+                                    if let Some(obj) = u.as_object_mut() {
+                                        for k in ["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"] {
+                                            obj.remove(k);
+                                        }
+                                    }
                                     u["cache_read_token"] = json!(acc_cached);
                                 }
                                 None => {

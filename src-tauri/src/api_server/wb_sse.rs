@@ -350,6 +350,9 @@ pub fn stream_forward_ex(
                         ))));
                     }
                     let (it, ot) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
+                    // 缓存读 tokens 透传：message_delta 携带 cache_read_input_tokens，
+                    // 对齐 sse.rs solo 管线口径（下游缓存读不恒为 0）
+                    let cached = usage.as_ref().map(cached_tokens_of).unwrap_or(0);
                     // P1 修复：stop_reason 按上游 finish_reason 映射，工具块存在时
                     // 必为 tool_use（原硬编码 end_turn 与已输出的 tool_use 块矛盾）
                     let stop_reason = if !tool_buf.is_empty() {
@@ -357,12 +360,16 @@ pub fn stream_forward_ex(
                     } else {
                         finish_to_stop(&last_finish)
                     };
+                    let mut delta_usage = json!({"input_tokens": it, "output_tokens": ot});
+                    if cached > 0 {
+                        delta_usage["cache_read_input_tokens"] = json!(cached);
+                    }
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
                         "event: message_delta\ndata: {}\n\n",
                         json!({
                             "type":"message_delta",
                             "delta":{"stop_reason":stop_reason,"stop_sequence":null},
-                            "usage":{"input_tokens":it,"output_tokens":ot},
+                            "usage":delta_usage,
                         })
                     ))));
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
@@ -910,6 +917,12 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
         content.push(json!({"type":"text","text":""}));
     }
     let (it, ot) = v.get("usage").map(u64_pair).unwrap_or((0, 0));
+    // 缓存读 tokens 透传：非流式出口同样携带 cache_read_input_tokens
+    let cached = v.get("usage").map(cached_tokens_of).unwrap_or(0);
+    let mut usage = json!({"input_tokens": it, "output_tokens": ot});
+    if cached > 0 {
+        usage["cache_read_input_tokens"] = json!(cached);
+    }
     // P1 修复：stop_reason 读上游 finish_reason 映射（原硬编码 end_turn 丢失
     // tool_use/max_tokens 语义）；有 tool_calls 时强制 tool_use 兜底
     let has_tool_calls = message
@@ -929,7 +942,7 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {"input_tokens": it, "output_tokens": ot},
+        "usage": usage,
     })
 }
 
