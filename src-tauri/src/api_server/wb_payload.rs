@@ -24,6 +24,14 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
             "You are Claude Code, Anthropic's official CLI tool for Claude.".to_string(),
         ),
+        // issue #99 布防：VS Code 扩展（IDE 形态）身份句逗号续接变体——上方规则
+        // 句号结尾，逗号变体（"...for Claude, running inside the VS Code extension."
+        // 等）必然漏匹配；前缀匹配覆盖任意续接。精确触发句以「11128 指纹样本」
+        // 诊断日志核实后经 UI 热更新迭代，无须发版
+        (
+            "You are Claude Code, Anthropic's official CLI for Claude,".to_string(),
+            "You are Claude Code, Anthropic's official CLI tool for Claude,".to_string(),
+        ),
         (
             "Main branch (you will usually use this with PRs)".to_string(),
             "Default branch (you will usually use this with PRs)".to_string(),
@@ -133,13 +141,17 @@ pub struct TemplateMapFile {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TemplateRule {
     pub from: String,
-    pub to: String,
+    /// None（缺省/null）= 停用该规则（从生效表移除，原句透传）；
+    /// Some("")（空串）= 剥离（改写为空串，删除指纹原文）——两种空态必须区分，
+    /// 存量数据 to:"" 反序列化为 Some("")，剥离行为不因合并语义翻转
+    #[serde(default)]
+    pub to: Option<String>,
 }
 
 impl TemplateMapFile {
-    /// 转换为 (from, to) 规则表：剔除空 from；全空 → None（调用方走内置兜底）
-    pub fn into_rules(self) -> Option<Vec<(String, String)>> {
-        let rules: Vec<(String, String)> = self
+    /// 转换为 (from, to) 规则表：剔除空 from；全空 → None（调用方走纯默认表）
+    pub fn into_rules(self) -> Option<Vec<(String, Option<String>)>> {
+        let rules: Vec<(String, Option<String>)> = self
             .templates
             .into_iter()
             .filter(|r| !r.from.is_empty())
@@ -151,6 +163,35 @@ impl TemplateMapFile {
             Some(rules)
         }
     }
+}
+
+/// 合并规则表（issue #99 ⑥）：内置默认表全量生效，自定义表按 from 逐字覆盖
+/// 同名项、其余追加。旧「整体替代」语义的缺陷：默认表新增布防规则（如 VS Code
+/// 逗号变体）后，存量自定义表拿不到新规则，每次发版都需手动同步。
+/// 语义：to = Some(s) 覆盖/追加改写；to = Some("") 剥离（改写为空串，旧行为
+/// 保持）；to = None 停用（从生效表移除该 from 规则，原句透传）。「省略某默认
+/// 规则」不再表示删除——停用请显式保存 to 为 null。
+pub fn merged_template_rules(
+    custom: Option<Vec<(String, Option<String>)>>,
+) -> Vec<(String, String)> {
+    let mut merged = default_template_map();
+    if let Some(rules) = custom {
+        for (from, to) in rules {
+            match to {
+                // 停用：从生效表移除
+                None => merged.retain(|(f, _)| *f != from),
+                // 改写（含空串剥离）：同名覆盖、其余追加
+                Some(t) => {
+                    if let Some(slot) = merged.iter_mut().find(|(f, _)| *f == from) {
+                        slot.1 = t;
+                    } else {
+                        merged.push((from, t));
+                    }
+                }
+            }
+        }
+    }
+    merged
 }
 
 /// 模板映射命中计数（issue #57 指纹反查）：
@@ -188,6 +229,72 @@ pub fn template_hit_note() -> String {
         Some(s) => format!("；模板命中: {s}"),
         None => String::new(),
     }
+}
+
+/// 11128 清洗后仍命中的指纹样本提取（issue #99 诊断闭环）：首条 system 消息
+/// 文本前 300 字符（压缩空白单行化，内嵌引号转单引号）+ 工具名列表（前 10 个，
+/// 缺 function 回退顶层 name——Responses 原生工具形态）。
+/// 用途：目前只知模板命中了什么、不知漏了什么——样本落 app.log 后用户可直接
+/// 反查精确触发句，经 UI「指纹清洗」tab 热更新规则表，无须发版。样本取**清洗前**
+/// 原始请求体（保留原始句式便于逐字配规则），已改写部分由模板命中注记区分；
+/// 工具名列表可识别客户端 harness 形态（如 mcp__ide__* = VS Code 扩展）。
+/// 例外：wb_tool_exec_chat 的样本取自逐轮重建的 chat_body（清洗后形态）——
+/// 漏网句按定义未被任何规则改写、仍原样保留，反查不受影响。
+pub fn fingerprint_sample(body: &[u8]) -> String {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return "body 解析失败".to_string();
+    };
+    // 首条 system 消息文本（string 与 text blocks 两种形态）
+    let system = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| {
+            msgs.iter().find(|msg| {
+                msg.get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| r.eq_ignore_ascii_case("system"))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|msg| msg.get("content"))
+        .map(|c| match c {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    let sys: String = system
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect();
+    let mut out = format!("system=\"{}\"", sys.replace('"', "'"));
+    let tools: Vec<String> = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| t.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .take(10)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !tools.is_empty() {
+        out.push_str(&format!(" tools=[{}]", tools.join(",")));
+    }
+    out
 }
 
 /// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
@@ -559,6 +666,161 @@ mod tests {
         let _ = apply_template_map("no match here", &tpls);
         let again = template_hit_summary().unwrap();
         assert_eq!(again.matches("FP_PROBE_FROM → FP_PROBE_TO").count(), 1);
+    }
+
+    /// 11128 指纹样本提取（issue #99）：首条 system 文本（空白压缩、引号转义、
+    /// 截断 300 字符）+ 工具名列表；非 JSON body 不 panic
+    #[test]
+    fn fingerprint_sample_extracts_system_and_tools() {
+        let body = json!({
+            "messages": [
+                {"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude,  running\ninside the VS Code extension."},
+                {"role":"user","content":"hi"}
+            ],
+            "tools": [
+                {"type":"function","function":{"name":"mcp__ide__getDiagnostics","parameters":{}}},
+                {"type":"function","function":{"name":"read_file","parameters":{}}}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let s = fingerprint_sample(&bytes);
+        assert!(s.starts_with("system=\""), "{s}");
+        // 空白压缩为单空格
+        assert!(s.contains("Claude, running inside the VS Code extension."), "{s}");
+        // 工具名列表（可识别 IDE harness 形态）
+        assert!(s.contains("tools=[mcp__ide__getDiagnostics,read_file]"), "{s}");
+        // 非 JSON body 不 panic
+        assert_eq!(fingerprint_sample(b"not json"), "body 解析失败");
+        // 无 tools → 不输出 tools 段
+        let s2 = fingerprint_sample(&serde_json::to_vec(&json!({
+            "messages":[{"role":"system","content":"sys"}]
+        })).unwrap());
+        assert!(s2.starts_with("system=\"sys\"") && !s2.contains("tools="), "{s2}");
+    }
+
+    /// 指纹样本截断与 blocks 形态 content：300 字符截断、text blocks 拼接、
+    /// 内嵌双引号转单引号（日志单行安全）
+    #[test]
+    fn fingerprint_sample_truncates_and_handles_blocks() {
+        let body = json!({
+            "messages":[{"role":"system","content":[
+                {"type":"text","text":"say \"hi\" "},
+                {"type":"text","text":"x".repeat(400)}
+            ]}]
+        });
+        let s = fingerprint_sample(&serde_json::to_vec(&body).unwrap());
+        assert!(s.starts_with("system=\"say 'hi' x"), "{s}");
+        // 300 字符截断：总长远小于 400 源文本
+        assert!(s.len() < 400, "len={}", s.len());
+        // Responses 原生工具形态（无 function 包裹）回退顶层 name
+        let body2 = json!({
+            "messages":[{"role":"system","content":"s"}],
+            "tools":[{"type":"web_search","name":"web_search"}]
+        });
+        let s2 = fingerprint_sample(&serde_json::to_vec(&body2).unwrap());
+        assert!(s2.contains("tools=[web_search]"), "{s2}");
+    }
+
+    /// issue #99 布防：VS Code 扩展身份句逗号续接变体（现有句号规则必然漏匹配）
+    #[test]
+    fn vscode_identity_comma_variant_rewrite() {
+        let tpl = default_template_map();
+        let v = "You are Claude Code, Anthropic's official CLI for Claude, running inside the VS Code extension.";
+        let out = apply_template_map(v, &tpl);
+        assert!(out.contains("official CLI tool for Claude, running inside"), "{out}");
+        assert!(!out.contains("CLI for Claude,"), "{out}");
+        // 句号形态仍由原规则覆盖，互不干扰
+        let plain = "You are Claude Code, Anthropic's official CLI for Claude.";
+        let out2 = apply_template_map(plain, &tpl);
+        assert!(out2.contains("CLI tool for Claude."), "{out2}");
+    }
+
+    /// issue #99 ⑥ 模板表合并语义：默认表全量生效 + 自定义按 from 覆盖/追加；
+    /// to 空串 = 剥离（改写为空串，旧行为保持）、to null = 停用（从生效表移除）
+    #[test]
+    fn merged_template_rules_overrides_and_extends() {
+        // None = 纯默认；空自定义表 = 纯默认（「恢复默认 = 保存空数组」语义兼容）
+        assert_eq!(
+            merged_template_rules(None).len(),
+            default_template_map().len()
+        );
+        assert_eq!(
+            merged_template_rules(Some(vec![])).len(),
+            default_template_map().len()
+        );
+        // 覆盖同名 from + 追加新规则；默认规则全量保留
+        let custom = vec![
+            (
+                "Main branch (you will usually use this with PRs)".to_string(),
+                Some("Trunk branch (you will usually use this with PRs)".to_string()),
+            ),
+            (
+                "Custom sentence.".to_string(),
+                Some("Custom rewrite.".to_string()),
+            ),
+        ];
+        let merged = merged_template_rules(Some(custom));
+        assert!(merged.iter().any(|(f, t)| f
+            == "Main branch (you will usually use this with PRs)"
+            && t.starts_with("Trunk branch")));
+        assert!(merged
+            .iter()
+            .any(|(f, t)| f == "Custom sentence." && t == "Custom rewrite."));
+        assert!(merged
+            .iter()
+            .any(|(f, _)| f.starts_with("You are Claude Code")));
+        // to 空串 = 剥离（改写为空串）；其余默认规则（含逗号变体）不受影响
+        let merged2 = merged_template_rules(Some(vec![(
+            "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            Some(String::new()),
+        )]));
+        assert!(merged2.iter().any(|(f, t)| f
+            == "You are Claude Code, Anthropic's official CLI for Claude."
+            && t.is_empty()));
+        assert!(merged2
+            .iter()
+            .any(|(f, _)| f.starts_with(
+                "You are Claude Code, Anthropic's official CLI for Claude,"
+            )));
+        // to null = 停用（从生效表移除，原句透传）
+        let merged3 = merged_template_rules(Some(vec![(
+            "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            None,
+        )]));
+        assert!(!merged3
+            .iter()
+            .any(|(f, _)| f == "You are Claude Code, Anthropic's official CLI for Claude."));
+        assert!(merged3
+            .iter()
+            .any(|(f, _)| f.starts_with(
+                "You are Claude Code, Anthropic's official CLI for Claude,"
+            )));
+    }
+
+    /// 存量数据兼容（3.7.11 修复）：旧 JSON 的 to:"" 反序列化为 Some("") = 剥离，
+    /// 不得被合并语义误判为停用；显式缺省/null 才是停用
+    #[test]
+    fn legacy_empty_to_stays_strip_not_tombstone() {
+        // 存量形状：to 为空串 → 剥离规则照常生效
+        let file: TemplateMapFile =
+            serde_json::from_str(r#"{"templates":[{"from":"FP_SENTENCE","to":""}]}"#).unwrap();
+        let merged = merged_template_rules(file.into_rules());
+        assert!(
+            merged.iter().any(|(f, t)| f == "FP_SENTENCE" && t.is_empty()),
+            "存量空 to 行应保持剥离语义，{merged:?}"
+        );
+        // 新形状：to 缺省/null → 停用默认规则
+        let file2: TemplateMapFile =
+            serde_json::from_str(r#"{"templates":[{"from":"You are Codex, based on GPT-5"}]}"#)
+                .unwrap();
+        let merged2 = merged_template_rules(file2.into_rules());
+        assert!(!merged2
+            .iter()
+            .any(|(f, _)| f == "You are Codex, based on GPT-5"));
+        // 其余默认规则不受停用影响
+        assert!(merged2
+            .iter()
+            .any(|(f, _)| f.starts_with("You are Claude Code")));
     }
 
     fn rewrite(v: Value, effort: Option<&str>) -> Value {

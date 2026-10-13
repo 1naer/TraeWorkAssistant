@@ -749,9 +749,15 @@ fn run_qoder_stream(
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{}",
                         tried.len(),
-                        empty_hits
+                        empty_hits,
+                        // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（三池同口径）
+                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                            format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(body_vec))
+                        } else {
+                            String::new()
+                        }
                     ));
                     let err_body = json!({
                         "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
@@ -1324,8 +1330,18 @@ pub async fn qoder_aggregate_chat(
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
-                        let (exhaust_msg, _) =
+                        let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
+                        // [DEBUG] 行，就地补齐；三池同口径）
+                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder 指纹样本: {}",
+                                tried.len(),
+                                empty_hits,
+                                super::wb_payload::fingerprint_sample(&body_vec),
+                            ));
+                        }
                         return Err(exhaust_msg);
                     }
                 },

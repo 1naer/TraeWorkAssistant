@@ -631,6 +631,18 @@ pub fn resolve_target(
                 if let Some((pref, reason)) = fallback_from {
                     log_fallback(state, model, pref, pool, reason);
                 }
+                // issue #99 ④：请求落池原因逐请求可观测——Key 绑定池生效或发生
+                // 跨池回退时，在请求日志流落 [SCHED] 行（紧邻该请求的请求日志行；
+                // log_fallback 另有 60s 节流的 app.log 运维行，此处为逐请求口径）
+                if bind.is_some() || fallback_from.is_some() {
+                    state.logger.log_sched_event(&format!(
+                        "落池: pool={} model={} bind={} fallback_from={}",
+                        pool.as_str(),
+                        model,
+                        bind.unwrap_or("-"),
+                        fallback_from.map(|p| p.0.as_str()).unwrap_or("-"),
+                    ));
+                }
                 if let Some(sk) = &sticky_key {
                     record_sticky(state, sk, pool);
                 }

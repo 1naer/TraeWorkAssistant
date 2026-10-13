@@ -5,10 +5,11 @@
  * DeepSeek Harness 等）按规则改写为中性表述，规避上游渠道级指纹风控
  * （cat-and-mouse：上游黑名单逐字匹配，任何一字改动即绕过）。
  *
- * 数据流：wb_template_map KV（整体替换语义）→ load_templates 每请求读取，
- * 保存即对下一请求生效，无需重启网关。
- * 恢复内置默认 = 保存空 templates 数组（into_rules 全空 → 回退 default_table）。
- * builtin=true 表示当前生效内置默认规则、尚无自定义副本（后端 get 回显）。
+ * 数据流：wb_template_map KV（合并语义：内置默认表始终生效，本表为增量覆盖/
+ * 追加）→ load_templates 每请求读取，保存即对下一请求生效，无需重启网关。
+ * 保存空 templates 数组 = 恢复内置默认；to=null（停用）= 从生效表移除该规则；
+ * to=""（留空）= 剥离（改写为空串，删除指纹原文）。
+ * builtin=true 表示尚无自定义副本、当前生效内置默认规则（后端 get 回显）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus, RotateCcw, Save, ShieldCheck } from 'lucide-react';
@@ -85,7 +86,10 @@ export default function FingerprintSanitizePanel() {
     }
     setSaving(true);
     try {
-      await api.apiServer.templateMapSet(rules.map((r) => ({ from: r.from.trim(), to: r.to.trim() })));
+      // to=null（停用）原样落库；to=""（剥离）保留空串，两者不可混淆
+      await api.apiServer.templateMapSet(
+        rules.map((r) => ({ from: r.from.trim(), to: r.to === null ? null : r.to.trim() })),
+      );
       await load();
       toast('success', '清洗规则已保存，下一条请求即生效');
     } catch (e) {
@@ -95,7 +99,7 @@ export default function FingerprintSanitizePanel() {
     }
   };
 
-  /** 恢复内置默认：保存空数组（into_rules 全空 → 回退 default_template_map） */
+  /** 恢复内置默认：保存空数组（into_rules 全空 → 合并走纯默认表） */
   const resetToBuiltin = async () => {
     setConfirmReset(false);
     setSaving(true);
@@ -134,8 +138,9 @@ export default function FingerprintSanitizePanel() {
             （逐字匹配，无正则），按列表顺序应用。
           </p>
           <p className="mt-1 opacity-80">
-            保存即对下一条请求生效，无需重启网关；
-            {builtin ? '当前生效内置默认规则，保存后成为独立自定义副本。' : '当前为自定义规则副本。'}
+            规则表为增量覆盖：内置默认表始终生效，此处可覆盖、追加或停用（停用 =
+            从生效表移除该规则，原句不再改写）。保存即对下一条请求生效，无需重启网关；
+            {builtin ? '当前生效内置默认规则，保存后成为自定义覆盖副本。' : '当前为自定义覆盖副本（默认表仍在其下生效）。'}
             {savedAt && !builtin && ` 最近保存：${fmtTs(savedAt)}`}
           </p>
         </div>
@@ -180,32 +185,48 @@ export default function FingerprintSanitizePanel() {
 
       {/* 规则行 */}
       <div className="space-y-1.5">
-        {rules.map((r, i) => (
-          <div key={i} className="flex items-center gap-2">
-            <span className="w-6 shrink-0 text-right text-xs tabular-nums text-slate-400">{i + 1}</span>
-            <input
-              value={r.from}
-              onChange={(e) => updateRow(i, { from: e.target.value })}
-              placeholder="原文指纹（逐字子串，如 You are …）"
-              spellCheck={false}
-              className="min-w-0 flex-[2] rounded-md border border-slate-200 bg-white px-2 py-1.5 font-mono text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-            />
-            <span className="shrink-0 text-xs text-slate-400">→</span>
-            <input
-              value={r.to}
-              onChange={(e) => updateRow(i, { to: e.target.value })}
-              placeholder="改写为（留空 = 删除该指纹）"
-              spellCheck={false}
-              className="min-w-0 flex-[2] rounded-md border border-slate-200 bg-white px-2 py-1.5 font-mono text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-            />
-            <button
-              onClick={() => setRules((rs) => rs.filter((_, k) => k !== i))}
-              className="shrink-0 rounded-md px-2 py-1 text-xs text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-900/20"
-            >
-              删除
-            </button>
-          </div>
-        ))}
+        {rules.map((r, i) => {
+          const disabled = r.to === null;
+          return (
+            <div key={i} className={`flex items-center gap-2 ${disabled ? 'opacity-60' : ''}`}>
+              <span className="w-6 shrink-0 text-right text-xs tabular-nums text-slate-400">{i + 1}</span>
+              <input
+                value={r.from}
+                onChange={(e) => updateRow(i, { from: e.target.value })}
+                placeholder="原文指纹（逐字子串，如 You are …）"
+                spellCheck={false}
+                className="min-w-0 flex-[2] rounded-md border border-slate-200 bg-white px-2 py-1.5 font-mono text-xs text-slate-700 outline-none focus:border-brand-400 disabled:bg-slate-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:disabled:bg-zinc-800"
+              />
+              <span className="shrink-0 text-xs text-slate-400">→</span>
+              <input
+                value={disabled ? '' : (r.to ?? '')}
+                onChange={(e) => updateRow(i, { to: e.target.value })}
+                placeholder={disabled ? '已停用（该规则不参与生效表）' : '改写为（留空 = 剥离指纹原文）'}
+                disabled={disabled}
+                spellCheck={false}
+                className="min-w-0 flex-[2] rounded-md border border-slate-200 bg-white px-2 py-1.5 font-mono text-xs text-slate-700 outline-none focus:border-brand-400 disabled:bg-slate-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:disabled:bg-zinc-800"
+              />
+              <label
+                className="flex shrink-0 cursor-pointer select-none items-center gap-1 text-xs text-slate-500 dark:text-zinc-400"
+                title={disabled ? '停用：从生效表移除该规则（原句透传）' : '停用该规则'}
+              >
+                <input
+                  type="checkbox"
+                  checked={disabled}
+                  onChange={(e) => updateRow(i, { to: e.target.checked ? null : '' })}
+                  className="accent-rose-500"
+                />
+                停用
+              </label>
+              <button
+                onClick={() => setRules((rs) => rs.filter((_, k) => k !== i))}
+                className="shrink-0 rounded-md px-2 py-1 text-xs text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-900/20"
+              >
+                删除
+              </button>
+            </div>
+          );
+        })}
         <button
           onClick={() => setRules((rs) => [...rs, { from: '', to: '' }])}
           className="flex w-full items-center justify-center gap-1 rounded-md border border-dashed border-slate-300 py-2 text-xs text-slate-500 transition hover:border-brand-400 hover:text-brand-500 dark:border-zinc-700 dark:text-zinc-400"

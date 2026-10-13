@@ -1059,11 +1059,12 @@ export interface UpdateDownloadProgress {
   percent: number;
 }
 
-// ---- 指纹清洗规则表（wb_template_map KV；整体替换语义，保存即对下一请求生效）----
-// 规则：from → to 子串改写（contains + replace，无正则；from 必填唯一，to 可为空串=删除）
+// ---- 指纹清洗规则表（wb_template_map KV；合并语义：内置默认表始终生效，自定义表增量覆盖/追加）----
+// 规则：from → to 子串改写（contains + replace，无正则；from 必填唯一）
+// to=null 停用该规则（从生效表移除，原句透传）；to="" 剥离（改写为空串，删除指纹原文）
 export interface SanitizeRule {
   from: string;
-  to: string;
+  to: string | null;
 }
 
 // wb_template_map_get 返回：builtin=true 表示当前生效内置默认规则、尚无自定义副本

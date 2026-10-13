@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, ExternalLink } from 'lucide-react';
+import { open as shellOpen } from '@tauri-apps/plugin-shell';
 import { Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -123,8 +124,7 @@ export function OAuthLoginModal({
         toast('warn', `自动回调不可用：${String(err)}`);
       }
       const { url } = await api.oauth.getLoginUrl();
-      const { open: openUrl } = await import('@tauri-apps/plugin-shell');
-      await openUrl(url);
+      await shellOpen(url);
       setStep(2);
     } catch (err) {
       toast('error', `获取登录 URL 失败：${String(err)}`);

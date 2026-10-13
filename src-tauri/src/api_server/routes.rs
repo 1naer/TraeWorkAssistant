@@ -1537,6 +1537,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 11128 诊断样本按请求去重（换号轮换重复命中不重复打样）
+        let mut last_11128_sample: Option<String> = None;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -1775,25 +1777,39 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
                         // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
                         // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
-                        if status == 400
-                            && super::retry::is_illegal_channel_error(&resp_body)
-                            && !sanitize
-                        {
-                            sanitize = true;
-                            state.logger.log_sched_event(&format!(
-                                "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
-                            ));
-                            converted = super::payload::prepare_llm_chat_body(
-                                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
-                                &super::models_sync::load_models(&state.data_dir),
-                                true, &templates,
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            // 断连检测：重试等待期间客户端离开则终止
-                            if tx.is_closed() {
-                                return;
+                        if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                            if !sanitize {
+                                sanitize = true;
+                                state.logger.log_sched_event(&format!(
+                                    "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
+                                ));
+                                converted = super::payload::prepare_llm_chat_body(
+                                    &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                                    &super::models_sync::load_models(&state.data_dir),
+                                    true, &templates,
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                // 断连检测：重试等待期间客户端离开则终止
+                                if tx.is_closed() {
+                                    return;
+                                }
+                                continue;
                             }
-                            continue;
+                            // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本
+                            // + 按请求去重（换号轮换重复命中样本恒定）；Fatal 透传前
+                            // 附排查指引（仅日志，客户端响应体不变）
+                            let sample = super::wb_payload::fingerprint_sample(&body_vec);
+                            if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                last_11128_sample = Some(sample.clone());
+                                state.logger.log_sched_event(&format!(
+                                    "11128 指纹样本: {}{}",
+                                    sample,
+                                    super::wb_payload::template_hit_note()
+                                ));
+                                state.logger.log_sched_event(
+                                    "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                );
+                            }
                         }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
@@ -1916,9 +1932,16 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             let h = (local_ts % 86400) / 3600;
             let m = (local_ts % 3600) / 60;
             let s = local_ts % 60;
+            // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（对齐 wb_route
+            // 口径），供反查漏网触发句
+            let sample_note = if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(&body_vec))
+            } else {
+                String::new()
+            };
             let diag_line = format!(
-                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} pool={} reasons=[{}]",
-                h, m, s, tried.len(), empty_hits, diag.len(), diag_summary.join(", "),
+                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} pool=trae reasons=[{}]{}",
+                h, m, s, tried.len(), empty_hits, diag_summary.join(", "), sample_note,
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
@@ -2029,6 +2052,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 11128 诊断样本按请求去重（换号轮换重复命中不重复打样）
+        let mut last_11128_sample: Option<String> = None;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -2207,21 +2232,35 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     Err((status, resp_body, retry_after)) => {
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次；
                         // 已清洗仍命中 → 走下方 retry_plan 原样 Fatal
-                        if status == 400
-                            && super::retry::is_illegal_channel_error(&resp_body)
-                            && !sanitize
-                        {
-                            sanitize = true;
-                            state.logger.log_sched_event(&format!(
-                                "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
-                            ));
-                            converted = super::payload::prepare_llm_chat_body(
-                                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
-                                &super::models_sync::load_models(&state.data_dir),
-                                true, &templates,
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            continue;
+                        if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                            if !sanitize {
+                                sanitize = true;
+                                state.logger.log_sched_event(&format!(
+                                    "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
+                                ));
+                                converted = super::payload::prepare_llm_chat_body(
+                                    &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                                    &super::models_sync::load_models(&state.data_dir),
+                                    true, &templates,
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                continue;
+                            }
+                            // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本
+                            // + 按请求去重（换号轮换重复命中样本恒定）；Fatal 透传前
+                            // 附排查指引（仅日志，客户端响应体不变）
+                            let sample = super::wb_payload::fingerprint_sample(&body_vec);
+                            if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                last_11128_sample = Some(sample.clone());
+                                state.logger.log_sched_event(&format!(
+                                    "11128 指纹样本: {}{}",
+                                    sample,
+                                    super::wb_payload::template_hit_note()
+                                ));
+                                state.logger.log_sched_event(
+                                    "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                );
+                            }
                         }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
@@ -2330,9 +2369,16 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         );
         // 写入诊断日志
         {
+            // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（对齐 wb_route
+            // 口径），供反查漏网触发句
+            let sample_note = if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(&body_vec))
+            } else {
+                String::new()
+            };
             state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} pool={} reasons=[{}]",
-                tried.len(), empty_hits, diag.len(), diag_summary.join(", "),
+                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} pool=trae reasons=[{}]{}",
+                tried.len(), empty_hits, diag_summary.join(", "), sample_note,
             ));
         }
         Err(AggregateFail::NoHealthy(exhaust_msg))

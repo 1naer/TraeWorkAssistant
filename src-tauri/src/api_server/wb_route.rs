@@ -204,13 +204,15 @@ pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
 
 /// 每请求读取外置映射表（fs_utils::read_json_cached：mtime+size 线程安全缓存，
 /// 免自建缓存结构与 Mutex 内磁盘 IO）；data/ 新路径缺失回退旧根路径（存量数据
-/// 兼容）；文件缺失/损坏/空表用内置兜底
+/// 兼容）；KV 缺失/损坏/空表 = 纯默认。issue #99 ⑥ 合并语义：内置默认表全量
+/// 生效，自定义表按 from 逐字覆盖（merged_template_rules）——默认表新增布防
+/// 规则自动对存量自定义生效，不再被旧「整体替代」语义吞掉
 pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
     // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）
-    crate::store::db(&state.data_dir)
+    let custom = crate::store::db(&state.data_dir)
         .kv_get::<wb_payload::TemplateMapFile>("wb_template_map")
-        .into_rules()
-        .unwrap_or_else(wb_payload::default_template_map)
+        .into_rules();
+    wb_payload::merged_template_rules(custom)
 }
 
 // ==================== 错误分类（WB 上游） ====================
@@ -549,6 +551,7 @@ fn run_wb_stream(
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）
@@ -585,11 +588,19 @@ fn run_wb_stream(
                         .iter()
                         .map(|d| format!("{}({})", d.name, d.reason))
                         .collect();
+                    // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本，
+                    // 供反查漏网触发句（与 11128 诊断同口径，样本 = 清洗前原始请求体）
+                    let sample_note = if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                        format!(" 指纹样本: {}", wb_payload::fingerprint_sample(body_vec))
+                    } else {
+                        String::new()
+                    };
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy reasons=[{}]",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy reasons=[{}]{}",
                         tried.len(),
                         empty_hits,
                         diag_summary.join(", "),
+                        sample_note,
                     ));
                     let err_body = json!({
                         "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
@@ -778,23 +789,38 @@ fn run_wb_stream(
                     // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
                     // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
                     // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
-                    if status == 400
-                        && super::retry::is_illegal_channel_error(&resp_body)
-                        && !sanitize
-                    {
-                        sanitize = true;
-                        state.logger.log_sched_event(&format!(
-                            "11128 强制清洗重试{}", wb_payload::template_hit_note()
-                        ));
-                        converted = wb_payload::prepare_wb_chat_body(
-                            body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                        // 断连检测：重试等待期间客户端离开则终止
-                        if tx.is_closed() {
-                            return;
+                    if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                        if !sanitize {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                            ));
+                            converted = wb_payload::prepare_wb_chat_body(
+                                body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            // 断连检测：重试等待期间客户端离开则终止
+                            if tx.is_closed() {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
+                        // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本 +
+                        // 模板命中注记，差集即漏网触发句 → UI「指纹清洗」tab 热更新；
+                        // 按请求去重（换号轮换重复命中样本恒定，不重复打样）
+                        let sample = wb_payload::fingerprint_sample(body_vec);
+                        if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                            last_11128_sample = Some(sample.clone());
+                            state.logger.log_sched_event(&format!(
+                                "11128 指纹样本: {}{}",
+                                sample,
+                                wb_payload::template_hit_note()
+                            ));
+                            // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
+                            state.logger.log_sched_event(
+                                "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                            );
+                        }
                     }
                     // 分级重试策略表（T2.2/F-33 v1.2）
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
@@ -940,6 +966,7 @@ pub async fn wb_aggregate_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
 
         loop {
             let picked = match first_pick.take() {
@@ -956,8 +983,18 @@ pub async fn wb_aggregate_chat(
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
-                        let (exhaust_msg, _) =
+                        let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
+                        // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
+                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                                tried.len(),
+                                empty_hits,
+                                wb_payload::fingerprint_sample(&body_vec),
+                            ));
+                        }
                         return Err(exhaust_msg);
                     }
                 },
@@ -1105,19 +1142,33 @@ pub async fn wb_aggregate_chat(
                     }
                     Err((status, resp_body, retry_after)) => {
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次
-                        if status == 400
-                            && super::retry::is_illegal_channel_error(&resp_body)
-                            && !sanitize
-                        {
-                            sanitize = true;
-                            state.logger.log_sched_event(&format!(
-                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
-                            ));
-                            converted = wb_payload::prepare_wb_chat_body(
-                                &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            continue;
+                        if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                            if !sanitize {
+                                sanitize = true;
+                                state.logger.log_sched_event(&format!(
+                                    "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                                ));
+                                converted = wb_payload::prepare_wb_chat_body(
+                                    &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                continue;
+                            }
+                            // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本
+                            // + 按请求去重（换号轮换重复命中样本恒定）；Fatal 透传前
+                            // 附排查指引（仅日志，客户端响应体不变）
+                            let sample = wb_payload::fingerprint_sample(&body_vec);
+                            if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                last_11128_sample = Some(sample.clone());
+                                state.logger.log_sched_event(&format!(
+                                    "11128 指纹样本: {}{}",
+                                    sample,
+                                    wb_payload::template_hit_note()
+                                ));
+                                state.logger.log_sched_event(
+                                    "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                );
+                            }
                         }
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -1292,6 +1343,7 @@ pub async fn wb_tool_exec_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
@@ -1487,17 +1539,32 @@ pub async fn wb_tool_exec_chat(
                     Err((status, resp_body, retry_after)) => {
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后重试
                         // （round 回退，不消耗轮次；下一轮循环顶部按新 sanitize 重建请求体）
-                        if status == 400
-                            && super::retry::is_illegal_channel_error(&resp_body)
-                            && !sanitize
-                        {
-                            sanitize = true;
-                            state.logger.log_sched_event(&format!(
-                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
-                            ));
-                            round = round.saturating_sub(1);
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            continue;
+                        if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                            if !sanitize {
+                                sanitize = true;
+                                state.logger.log_sched_event(&format!(
+                                    "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                                ));
+                                round = round.saturating_sub(1);
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                continue;
+                            }
+                            // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本
+                            // + 按请求去重；Fatal 透传前附排查指引（仅日志）
+                            let sample = wb_payload::fingerprint_sample(
+                                &serde_json::to_vec(&chat_body).unwrap_or_default(),
+                            );
+                            if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                last_11128_sample = Some(sample.clone());
+                                state.logger.log_sched_event(&format!(
+                                    "11128 指纹样本: {}{}",
+                                    sample,
+                                    wb_payload::template_hit_note()
+                                ));
+                                state.logger.log_sched_event(
+                                    "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                );
+                            }
                         }
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -1594,7 +1661,21 @@ pub async fn wb_tool_exec_chat(
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
                     let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
-                    super::routes::exhaust_message(empty_hits, tried.len(), healthy_total).0
+                    let (exhaust_msg, exhaust_tag) =
+                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
+                    // tool 消息，样本取首条 system + 工具清单，语义不受影响）
+                    if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                            tried.len(),
+                            empty_hits,
+                            wb_payload::fingerprint_sample(
+                                &serde_json::to_vec(&chat_body).unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    exhaust_msg
                 }))
             }
         }

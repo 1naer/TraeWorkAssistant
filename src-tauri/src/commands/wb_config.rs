@@ -72,9 +72,11 @@ pub fn wb_template_map_set(state: State<AppState>, map: Value) -> Result<(), Str
 
 fn template_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
     // SQLite 化（P2）：kv `wb_template_map`。
-    // 无自定义（KV 缺失或 templates 空 = load_templates 走内置默认）时回显内置
+    // 无自定义（KV 缺失或 templates 空 = load_templates 走纯默认）时回显内置
     // 默认规则并标记 builtin:true——前端「指纹清洗」tab 以此展示生效中规则；
-    // 保存后才成为独立自定义副本（整体替换语义，与 into_rules 口径一致）
+    // 保存后成为自定义覆盖表（合并语义：默认表全量生效，自定义按 from 覆盖/
+    // 追加，to 空串 = 剥离、to null/缺省 = 停用该规则；与 merged_template_rules
+    // 口径一致）
     let file: TemplateMapFile = crate::store::db(data_dir).kv_get("wb_template_map");
     if file.templates.is_empty() {
         let templates: Vec<serde_json::Value> = crate::api_server::wb_payload::default_template_map()
@@ -91,13 +93,14 @@ fn template_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
 }
 
 /// 结构校验：对齐 wb_route::load_templates 的读取形状（TemplateMapFile）——
-/// templates 为 [{from,to}] 数组（两字段均为必填字符串），updated_at 可空
+/// templates 为 [{from,to?}] 数组（from 必填字符串；to 可空：字符串/空串=剥离/
+/// null 或缺省=停用），updated_at 可空
 fn template_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), String> {
     if !map.is_object() {
         return Err("审核模板映射必须是 JSON 对象（含 templates 数组）".into());
     }
     serde_json::from_value::<TemplateMapFile>(map.clone())
-        .map_err(|e| format!("审核模板映射格式不正确（templates[].from/to 均为必填字符串）: {e}"))?;
+        .map_err(|e| format!("审核模板映射格式不正确（templates[].from 必填，to 可为字符串/空串/null）: {e}"))?;
     crate::store::db(data_dir).kv_set("wb_template_map", map)
 }
 
@@ -127,14 +130,17 @@ mod tests {
         assert!(validate_route_config(&json!({"aliases": {"claude-x": "glm-5.3"}})).is_ok());
     }
 
-    /// 校验拒绝畸形模板映射（templates 元素缺 to / 非对象根）
+    /// 校验拒绝畸形模板映射（templates 元素缺 from / 非对象根）；to 缺省/null
+    /// = 停用规则（3.7.11 起合法落库）
     #[test]
     fn template_map_validation_rejects_malformed() {
         let dir = tmp_dir("tpl_invalid");
-        assert!(template_map_set_at(&dir, &json!({"templates": [{"from": "a"}]})).is_err());
+        assert!(template_map_set_at(&dir, &json!({"templates": [{"to": "b"}]})).is_err());
         assert!(template_map_set_at(&dir, &json!([1, 2])).is_err());
         // 拒绝后不得落库
         assert!(crate::store::db(&dir).kv_get_raw("wb_template_map").is_none());
+        // to 缺省 = 停用规则（合法）
+        assert!(template_map_set_at(&dir, &json!({"templates": [{"from": "a"}]})).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -187,6 +193,18 @@ mod tests {
             crate::api_server::wb_payload::default_template_map().len(),
             "回显规则数应与内置默认一致"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 停用规则（to null）落库回读：get 原样回显 null（UI 展示「已停用」态）
+    #[test]
+    fn template_map_tombstone_roundtrip() {
+        let dir = tmp_dir("tpl_tombstone");
+        template_map_set_at(&dir, &json!({"templates": [{"from": "a", "to": null}]})).unwrap();
+        let got = template_map_get_at(&dir).unwrap();
+        assert_eq!(got["builtin"], json!(false));
+        assert_eq!(got["templates"][0]["from"], json!("a"));
+        assert_eq!(got["templates"][0]["to"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
