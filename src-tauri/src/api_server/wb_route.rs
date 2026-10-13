@@ -707,11 +707,16 @@ fn run_wb_stream(
                                 )
                             })
                             .unwrap_or((0, 0));
-                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计
-                        state.record_usage_ttfb(
-                            true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
-                            true, duration_ms, pt, ct, Some(ttfb_ms),
-                        );
+                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计。
+                        // 每请求终态单行（审查问题6）：换号重试（空完成未流出 /
+                        // 错误未流出，对应下方两处 break）为中间态不落账，避免
+                        // requests 虚高；终态（成功 / 就地收尾 / 流内失败透传）恰落一行
+                        if !(error_info.is_some() && !sent_any) {
+                            state.record_usage_ttfb(
+                                true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
+                                true, duration_ms, pt, ct, Some(ttfb_ms),
+                            );
+                        }
                     }
                     match error_info {
                         Some((code, msg)) => {

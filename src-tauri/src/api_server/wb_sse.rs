@@ -806,9 +806,10 @@ pub fn stream_forward_ex(
         sent_any = true;
     }
 
-    // 空完成兜底（issue #57）：EOF 且零内容零错误、客户端仍在线 → 哨兵上抛
-    // （原样收尾会让客户端收到 "empty provider response"）
-    if error_info.is_none() && !has_content && !failed_inline && !tx.is_closed() {
+    // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛；判定与客户端
+    // 在线解耦——断连也上抛，否则调用方误判成功绑粘性（原样收尾会让客户端
+    // 收到 "empty provider response"）
+    if error_info.is_none() && !has_content && !failed_inline {
         error_info = Some((
             super::EMPTY_COMPLETION_CODE,
             super::EMPTY_COMPLETION_MSG.to_string(),

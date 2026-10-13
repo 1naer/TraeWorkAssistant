@@ -326,8 +326,9 @@ fn stream_convert_src(
     }
 
     if !saw_done && error_info.is_none() {
-        if !has_content && !sender.is_closed() {
-            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
+        if !has_content {
+            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）；判定与
+            // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
@@ -462,8 +463,9 @@ fn stream_convert_text_src(
     }
 
     if !saw_done && error_info.is_none() {
-        if !has_content && !sender.is_closed() {
-            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
+        if !has_content {
+            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）；判定与
+            // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
@@ -967,13 +969,17 @@ fn stream_convert_anthropic_src(
         }
     }
 
-    if !saw_done && !disconnected {
+    if !saw_done {
         if message_started || !tools.is_empty() {
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
-            finish_stream!();
+            // （仅发帧前检查断连；断连时发送失败无副作用）
+            if !disconnected {
+                finish_stream!();
+            }
         } else if error_info.is_none() {
             // 空流：以空完成哨兵上抛（原发一个空的合法 message，issue #57 改为
-            // 换号重试，避免客户端收到 "empty provider response"）
+            // 换号重试，避免客户端收到 "empty provider response"）；判定与客户
+            // 端在线解耦——断连也上抛，否则调用方误判成功绑粘性
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
