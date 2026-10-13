@@ -1429,21 +1429,7 @@ pub async fn wb_tool_exec_chat(
                             // 最终回复：usage 写回全部轮次累加值（中间轮消耗计入总账）
                             let mut completion = completion;
                             match completion.get_mut("usage") {
-                                Some(u) => {
-                                    u["prompt_tokens"] = json!(acc_usage.0);
-                                    u["completion_tokens"] = json!(acc_usage.1);
-                                    if u.get("total_tokens").is_some() {
-                                        u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
-                                    }
-                                    // 清除遮蔽键：cached_tokens_of 优先读 cache_read_input_tokens
-                                    // 等键，若残留上游单轮值会遮蔽跨轮累计值
-                                    if let Some(obj) = u.as_object_mut() {
-                                        for k in ["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"] {
-                                            obj.remove(k);
-                                        }
-                                    }
-                                    u["cache_read_token"] = json!(acc_cached);
-                                }
+                                Some(u) => write_back_acc_usage(u, acc_usage, acc_cached),
                                 None => {
                                     completion["usage"] = json!({
                                         "prompt_tokens": acc_usage.0,
@@ -1767,6 +1753,35 @@ fn safe_slice(s: &str, n: usize) -> &str {
     &s[..end]
 }
 
+/// 多轮累计 usage 写回：prompt/completion/total 汇总 + 缓存读累计写回。
+/// 先清除上游单轮残留的遮蔽键再写累计值——cached_tokens_of 宽口径优先读
+/// 顶层别名与嵌套容器（prompt_tokens_details / inputTokensDetails），任何
+/// 正值残留都会让下游读到单轮值而遮蔽跨轮累计值。
+fn write_back_acc_usage(u: &mut Value, acc_usage: (u64, u64), acc_cached: u64) {
+    u["prompt_tokens"] = json!(acc_usage.0);
+    u["completion_tokens"] = json!(acc_usage.1);
+    if u.get("total_tokens").is_some() {
+        u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
+    }
+    if let Some(obj) = u.as_object_mut() {
+        // 顶层键：宽口径全部别名（含 cache_read_token 自身，下方重写累计值）
+        for k in [
+            "cache_read_input_tokens",
+            "cache_read_token",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+        ] {
+            obj.remove(k);
+        }
+        // 嵌套容器整体移除：cached_tokens_of 的兜底来源，残留即遮蔽
+        obj.remove("prompt_tokens_details");
+        obj.remove("inputTokensDetails");
+    }
+    u["cache_read_token"] = json!(acc_cached);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1834,5 +1849,53 @@ mod tests {
         assert_eq!(upstream_msg(r#"{"code":6004,"msg":"腾讯系 msg 字段"}"#).as_deref(), Some("腾讯系 msg 字段"));
         assert_eq!(upstream_msg("not json"), None);
         assert_eq!(upstream_msg("{}"), None);
+    }
+
+    /// 多轮累计 usage 写回：累计值写入 + 残留遮蔽键清除 + 宽口径回读一致
+    #[test]
+    fn write_back_acc_usage_clears_shadow_keys_and_writes_acc() {
+        let mut u = serde_json::json!({
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+            "cache_read_input_tokens": 3,
+            "cache_read_token": 4,
+            "cacheReadInputTokens": 8,
+            "prompt_cache_hit_tokens": 9,
+            "cached_tokens": 6,
+            "cache_read_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": 10},
+            "inputTokensDetails": [{"cached_tokens": 11}],
+        });
+        write_back_acc_usage(&mut u, (15, 7), 42);
+        assert_eq!(u["prompt_tokens"], serde_json::json!(15));
+        assert_eq!(u["completion_tokens"], serde_json::json!(7));
+        assert_eq!(u["total_tokens"], serde_json::json!(22));
+        // 宽口径回读命中累计值，而非任何残留单轮值
+        assert_eq!(cached_tokens_of(&u), 42);
+        // 遮蔽键全部清除，仅剩累计值载体 cache_read_token
+        for k in [
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+            "prompt_tokens_details",
+            "inputTokensDetails",
+        ] {
+            assert!(u.get(k).is_none(), "残留遮蔽键 {k}");
+        }
+        assert_eq!(u["cache_read_token"], serde_json::json!(42));
+    }
+
+    /// usage 原本无 total_tokens 时保持缺省，不强加字段
+    #[test]
+    fn write_back_acc_usage_keeps_total_absent() {
+        let mut u = serde_json::json!({"prompt_tokens": 1, "completion_tokens": 1});
+        write_back_acc_usage(&mut u, (3, 4), 0);
+        assert_eq!(u["prompt_tokens"], serde_json::json!(3));
+        assert_eq!(u["completion_tokens"], serde_json::json!(4));
+        assert!(u.get("total_tokens").is_none());
+        assert_eq!(u["cache_read_token"], serde_json::json!(0));
     }
 }

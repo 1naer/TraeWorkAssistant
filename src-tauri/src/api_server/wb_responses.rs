@@ -11,6 +11,8 @@
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
+use super::wb_sse::cached_tokens_of;
+
 /// Responses 请求 → OpenAI chat completions 内部格式
 ///
 /// 映射：instructions → system；input（string | items[]）→ messages；
@@ -519,18 +521,6 @@ pub fn completion_to_responses(
         },
         "stop_reason": if finish == "tool_calls" { json!("tool_use") } else { json!(null) },
     })
-}
-
-fn cached_tokens_of(u: &Value) -> u64 {
-    [
-        "cache_read_input_tokens",
-        "cache_read_token",
-        "cached_tokens",
-        "cache_read_tokens",
-    ]
-        .iter()
-        .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
-        .unwrap_or(0)
 }
 
 fn u64_pair(u: &Value) -> (u64, u64) {
