@@ -456,7 +456,7 @@ fn fetch_account(
     row["packages"] = json!(p.packages);
     // 订阅周期到期原始毫秒（issue #102 调度兜底键）；sash expiresAt 缺失 → None，
     // 由下方 big_model nextResetAt 分支补齐
-    let mut plan_expires_ms = b
+    let plan_expires_ms = b
         .get("qoderUsage")
         .and_then(|v| v.get("expiresAt"))
         .and_then(Value::as_i64)
@@ -809,6 +809,29 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     Ok(out)
 }
 
+/// 运行池拨新快照收集（issue #102 运行期保鲜）：ok 行且 total 有值才进；
+/// expire 取行内 credits_expire_at（None = 响应未携带，拨新时覆盖旧值不留
+/// stale，对齐 fetch_credits 池回写「键值随每次回写覆盖」口径）
+fn collect_running_pool_snapshot(
+    rows: &[Value],
+) -> std::collections::HashMap<String, (f64, Option<i64>)> {
+    let mut m = std::collections::HashMap::new();
+    for r in rows {
+        if r.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let (Some(aid), Some(total)) = (
+            r.get("user_id").and_then(Value::as_str),
+            r.get("total").and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let expire = r.get("credits_expire_at").and_then(Value::as_i64);
+        m.insert(aid.to_string(), (total, expire));
+    }
+    m
+}
+
 /// 每日快照任务（调度器/CLI 共用；fresh 拉取全部账号 + 快照落库，空池自然空转）
 /// 审查 P2：原实现永不返回 Err（fetch_credits 全路径 Ok），当日全部账号失败时
 /// （无缓存 → 空结果；有缓存 → stale 回退行内全 ok、failed 不可见）快照缺失且
@@ -818,7 +841,12 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
 ///   冷却重试（同日 UPSERT 覆盖，重试成功即补落当日快照）；
 /// - 仅永久失败（无凭证/4xx，401 自愈已试过）→ Ok 停止重试（重试无解，
 ///   全天 48 次 tick 徒劳 + 误报通知），落日志提示人工处理。
-pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
+/// `runtime`：GUI 进程内的网关运行态句柄（调度器/启动保鲜传入）——成功行
+/// 快照三键拨新进 qoder_pool（issue #102 运行期保鲜）；CLI 独立进程传 None
+pub fn run_snapshot_task(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<Value, String> {
     let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
     let n = pool.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
     if n == 0 {
@@ -840,6 +868,19 @@ pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // 运行池三键拨新（issue #102 运行期保鲜）：网关运行中（调度器/启动保鲜传
+    // runtime）时把 ok 行快照同步进 qoder_pool——内存池三键钉死在装配时刻，
+    // 不拨新则签到充值/续期后账号仍被零积分/到期过滤持续排除，直到网关重启
+    // （对齐 Trae issue #67 运行期回写先例）。CLI 独立进程传 None 跳过
+    if let Some(shared) = runtime.and_then(|r| {
+        let g = r.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|rt| rt.shared.clone())
+    }) {
+        let m = collect_running_pool_snapshot(&rows);
+        if !m.is_empty() {
+            shared.qoder_pool.update_credits_snapshot(&m);
+        }
+    }
     let failed: Vec<&Value> = rows
         .iter()
         .filter(|r| r.get("ok").and_then(Value::as_bool) != Some(true))
@@ -875,6 +916,26 @@ pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn collect_running_pool_snapshot_filters_rows() {
+        // issue #102 运行期拨新收集：ok 行 + total 有值才进；expire 透传
+        //（None = 响应未携带，拨新时覆盖旧值不留 stale）
+        let rows = vec![
+            json!({"user_id": "qd-a", "ok": true, "total": 120.0, "credits_expire_at": 1999999999}),
+            json!({"user_id": "qd-b", "ok": true, "total": 5.5}),
+            json!({"user_id": "qd-c", "ok": false, "total": 9.0}),
+            json!({"user_id": "qd-d", "ok": true}),
+            json!({"user_id": "qd-e", "ok": true, "total": null}),
+        ];
+        let m = collect_running_pool_snapshot(&rows);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("qd-a"), Some(&(120.0, Some(1_999_999_999))));
+        assert_eq!(m.get("qd-b"), Some(&(5.5, None)));
+        assert!(!m.contains_key("qd-c"), "失败行剔除");
+        assert!(!m.contains_key("qd-d"), "total 缺失剔除");
+        assert!(!m.contains_key("qd-e"), "total null 剔除");
+    }
 
     /// R-7 抓包样本（2026-09-27 实测，claim 第二活动后 addOnQuota 出现）
     const CAPTURED_SAMPLE: &str = r#"{"displayMode":"qoder","qoderUsage":{"userId":"01a0dff8-cc47-7b64-bd6d-d9cb2aea6792","userType":"personal_professional_trial","usageType":"credits","totalUsagePercentage":0,"isQuotaExceeded":false,"expiresAt":1791673619906,"upgradeUrl":"https://qoder.com/pricing?client=qoder","userQuota":{"total":300,"used":0,"remaining":300,"percentage":0,"unit":"credits"},"addOnQuota":{"total":100,"used":0,"remaining":100,"percentage":0,"unit":"credits","detailUrl":"https://qoder.com/account/usage"},"isPlanQuotaProrated":false}}"#;

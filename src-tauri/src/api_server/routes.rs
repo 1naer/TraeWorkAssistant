@@ -2137,10 +2137,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     // 口径同下方「empty response」（Server 级短冷却）
                                     empty_hits += 1;
                                     state.pool.note_error(&picked.uid, ErrKind::Server);
-                                    state.record_usage(
-                                        false, &model, &picked.uid, &key_id, false, stream,
-                                        duration_ms, 0, 0,
-                                    );
+                                    // 每请求终态单行（审查问题6）：换号是中间态不落账
+                                    // （终局由后续成功行/耗尽 none 行统一落）
                                     state.logger.log_request(
                                         "trae", "POST", proto.log_path(), &model, stream,
                                         502, &picked.uid, duration_ms, &key_name,
@@ -2197,10 +2195,15 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     code,
                                     safe_slice(&msg, 300)
                                 ));
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    duration_ms, 0, 0,
-                                );
+                                // 每请求终态单行（审查问题6）：账号级错误换号是中间态
+                                // 不落账（终局由后续成功行/耗尽 none 行统一落）；请求级
+                                // 错误（kind==None）为终态透传，恰在此落一行
+                                if kind == ErrKind::None {
+                                    state.record_usage(
+                                        false, &model, &picked.uid, &key_id, false, stream,
+                                        duration_ms, 0, 0,
+                                    );
+                                }
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     200, &picked.uid, duration_ms, &key_name,
@@ -2224,10 +2227,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             }
                             _ => {
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    duration_ms, 0, 0,
-                                );
+                                // 每请求终态单行（审查问题6）：换号是中间态不落账
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     502, &picked.uid, duration_ms, &key_name,
@@ -2321,10 +2321,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={}", picked.uid, status));
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
-                                );
+                                // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
+                                // 不落账（对齐流式路径），由终局分支统一落行
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -2339,6 +2337,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             RetryAction::Fatal => {
                                 // 不冷却：请求本身问题（换号无意义），终止并透传上游错误体
                                 let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                                // 终态记账补齐（审查问题6，对齐流式路径/wb/qoder Fatal 口径）：
+                                // Fatal 是请求终局，此前仅 log_request 导致用量统计页缺口
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,

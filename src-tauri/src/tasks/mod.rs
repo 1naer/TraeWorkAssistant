@@ -134,8 +134,9 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 Ok(done)
             }
         }
-        // Qoder 积分快照（调度器/CLI 共用；空池自然空转）
-        "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state),
+        // Qoder 积分快照（调度器/CLI 共用；空池自然空转）。runtime=None：CLI
+        // 独立进程无网关运行态，仅落 doc 快照不做内存池拨新
+        "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state, None),
         // Qoder 凭证 6h 兜底刷新（调度器/CLI 共用；空池空转）
         "qoder-refresh" => qoder_refresh::run_task(state),
         // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）

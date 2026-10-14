@@ -433,8 +433,11 @@ pub async fn do_start(
     //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
     //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
     //     路径，陈旧快照会一直 fail-open）；
-    //   Qoder 池：sync_from_qoder 恒 credits=None（倍率计费无余额概念），
-    //     reserve 对其结构性不生效，无保鲜需求（仅标注）。
+    //   Qoder 池（issue #102）：run_snapshot_task 快照后按 ok 行经
+    //     update_credits_snapshot 三键拨新（credits/expire_at/fetched_at）——
+    //     selectable 零积分与到期过滤均无新鲜度自愈，装配时 Some(0.0)/已过期的
+    //     账号在充值或续期后需拨新才恢复可选（此前注释「恒 credits=None 无保鲜
+    //     需求」随三键透传已过时）。
     // 静默失败不影响启动流程
     {
         let app2 = app.clone();
@@ -446,7 +449,8 @@ pub async fn do_start(
             };
             let trae_stale = shared.pool.has_stale_credits();
             let wb_stale = shared.wb_pool.has_stale_credits();
-            if !trae_stale && !wb_stale {
+            let qoder_stale = shared.qoder_pool.has_zero_or_expired_credits();
+            if !trae_stale && !wb_stale && !qoder_stale {
                 return;
             }
             fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
@@ -498,6 +502,27 @@ pub async fn do_start(
                     Err(e) => fs_utils::app_log(
                         &st2.data_dir,
                         &format!("API服务启动-积分保鲜: WB池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+            if qoder_stale {
+                // 拨新在 run_snapshot_task 内部经 runtime 完成（ok 行三键拨新）；
+                // 永久失效账号（needs_relogin）其内部已落日志，这里只汇总
+                match crate::tasks::qoder_credits::run_snapshot_task(
+                    &st2,
+                    Some(rt_state.inner()),
+                ) {
+                    Ok(v) => {
+                        let n = v.get("accounts").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                        let ok = v.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                        fs_utils::app_log(
+                            &st2.data_dir,
+                            &format!("API服务启动-积分保鲜: Qoder池拨新完成 ok={ok} accounts={n}"),
+                        );
+                    }
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Qoder池刷新失败(不影响使用) {}", e),
                     ),
                 }
             }

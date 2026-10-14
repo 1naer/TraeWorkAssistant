@@ -39,7 +39,7 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             在 Trae 中登录某个账号后，点击该账号行的「保存」图标，
-            系统会关闭 Trae → 精准备份 icube 布局 15 项白名单登录文件（备份/恢复各 13 项，不含 wal/shm；
+            系统会关闭 Trae → 精准备份 icube 布局 15 项白名单登录文件（含 state.vscdb 的 WAL/SHM 边车，存在才拷贝；
             storage.json、state.vscdb、machineid、aha、Network 等）
             → 重新启动 Trae。每个账号的登录态独立存储，互不干扰。
           </p>

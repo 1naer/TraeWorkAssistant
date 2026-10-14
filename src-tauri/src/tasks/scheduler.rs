@@ -535,8 +535,10 @@ fn run_task(
             }
             Ok(done)
         }
-        // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）
-        "qoder-credits-snapshot" => super::qoder_credits::run_snapshot_task(st),
+        // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）；
+        // runtime 传入网关运行态，成功行快照三键拨新进 qoder_pool（issue #102
+        // 运行期保鲜，对齐 trae-credits-snapshot 的 issue #67 口径）
+        "qoder-credits-snapshot" => super::qoder_credits::run_snapshot_task(st, runtime),
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
         "qoder-refresh" => super::qoder_refresh::run_task(st),

@@ -960,8 +960,10 @@ fn migrate_traework_pool(data_dir: &Path) -> Result<(usize, usize), String> {
             legacy += 1;
         } else {
             moved += 1;
-            // 身份标注 best-effort：失败不影响迁移结果
-            annotate_traework_source(&new_pool.join(&base));
+            // 身份标注 best-effort：失败不影响迁移结果（标注池根 sidecar；
+            // 审查修复 2026-10-14：原指向槽内 meta.json，生产 icube 布局
+            // 槽内从无该文件（白名单不含根级 meta.json），恒 no-op）
+            annotate_traework_source(&new_pool.join(format!("{base}.meta.json")));
         }
     }
     // 仅剩运行时标记等杂项时保留；真正空了则删除空目录
@@ -994,12 +996,13 @@ fn rename_no_clobber(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::rename(src, dst)
 }
 
-/// 槽身份标注（best-effort）：已有 `meta.json` 时以原子替换写入
-/// `source: TraeWork-migrated`（临时文件 + rename，防写盘中断损坏 meta）；
-/// 槽内本无 meta.json 则跳过，不凭空创建
-fn annotate_traework_source(slot_dir: &Path) {
-    let meta = slot_dir.join("meta.json");
-    let Ok(t) = std::fs::read_to_string(&meta) else {
+/// 槽身份标注（best-effort）：已有池根 sidecar `<base>.meta.json` 时以原子替换写入
+/// `source: TraeWork-migrated`（临时文件 + rename，防写盘中断损坏 sidecar）；
+/// 槽位本无 sidecar（2026-09-29 sidecar 机制引入前的旧快照）则跳过，不凭空创建。
+/// 审查修复 2026-10-14：原实现读槽目录内的 meta.json——生产 icube 布局槽内从无
+/// 该文件（backup_icube 只拷 15 项白名单，sidecar 位于池根），标注恒 no-op
+fn annotate_traework_source(sidecar: &Path) {
+    let Ok(t) = std::fs::read_to_string(sidecar) else {
         return;
     };
     let mut v = serde_json::from_str::<Value>(&t).unwrap_or_else(|_| json!({}));
@@ -1008,9 +1011,9 @@ fn annotate_traework_source(slot_dir: &Path) {
     }
     v["source"] = json!("TraeWork-migrated");
     if let Ok(s) = serde_json::to_string(&v) {
-        let tmp = slot_dir.join("meta.json.aiwork-tmp");
+        let tmp = sidecar.with_extension("json.aiwork-tmp");
         if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, &meta);
+            let _ = std::fs::rename(&tmp, sidecar);
         }
     }
 }
@@ -1416,13 +1419,13 @@ mod tests {
         assert_eq!(v["trae_cn_path"], json!(fake_exe.to_string_lossy()));
         assert_eq!(v["theme"], json!("dark"));
 
-        // u1 组整组入 profiles_trae：主槽 + 代际 + sidecar，meta 含身份标注且 uid 保留
+        // u1 组整组入 profiles_trae：主槽 + 代际 + sidecar，池根 sidecar 含身份标注且 uid 保留
         let new_pool = dir.join("data").join("profiles_trae");
         assert!(new_pool.join("u1").join("meta.json").exists());
         assert!(new_pool.join("u1.bak").join("snapshot.dat").exists());
         assert!(new_pool.join("u1.meta.json").exists());
         let m1: Value =
-            serde_json::from_str(&std::fs::read_to_string(new_pool.join("u1").join("meta.json")).unwrap())
+            serde_json::from_str(&std::fs::read_to_string(new_pool.join("u1.meta.json")).unwrap())
                 .unwrap();
         assert_eq!(m1["uid"], json!("u1"));
         assert_eq!(m1["source"], json!("TraeWork-migrated"));
@@ -1541,9 +1544,9 @@ mod tests {
             !dir.join("data").join("profiles_trae_work_legacy").exists(),
             "补齐场景不得整组入 legacy"
         );
-        // 主槽身份保留且补齐路径仍走迁入分支（含身份标注）
+        // 主槽身份保留且补齐路径仍走迁入分支（池根 sidecar 含身份标注）
         let m1: Value = serde_json::from_str(
-            &std::fs::read_to_string(new_pool.join("u1").join("meta.json")).unwrap(),
+            &std::fs::read_to_string(new_pool.join("u1.meta.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(m1["uid"], json!("u1"));

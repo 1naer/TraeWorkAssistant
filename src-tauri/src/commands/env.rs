@@ -46,7 +46,8 @@ pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
 /// `--proxy-server` 启动，让 Trae 的流量走本地 MITM 代理（捕获账号/观察请求）。
 #[tauri::command(async)]
 pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    let exe = app_locate_inner(&state, "trae")
+    let loc = app_locate_inner(&state, "trae");
+    let exe = loc
         .exe
         .ok_or("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径")?;
     persist_detected_path(&state, "trae_cn_path", &exe);
@@ -63,8 +64,9 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     // 顶部打开与切换恢复两条路径恒开 Agent 窗口；运行中不写（退出时会被客户端
     // 自身状态覆盖，写了也无效）。
     if !is_running_cn() {
-        let live_dir = std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
-            .join("Trae CN");
+        // 复用 app_locate 的 user_data_dir（与 app_profile/档案表同源，
+        // 审查修复 2026-10-14：原手拼 %APPDATA%\Trae CN 为第三处硬编码）
+        let live_dir = std::path::PathBuf::from(&loc.user_data_dir);
         // best-effort 不阻断打开，但失败落日志（与 restore 路径的 Warn 口径一致，
         // 便于 storage.json 异常时排查「为何开的是 IDE 窗口」）
         if let Err(e) = crate::switcher::icube::apply_agent_window_fixup(&live_dir) {

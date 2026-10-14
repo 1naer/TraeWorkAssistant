@@ -382,7 +382,10 @@ impl UsageFile {
         }
     }
 
-    /// 按桶取最近 N 天（含今日），不足 N 天只返回已有的；按日期升序
+    /// 按桶取最近 N 个日历天（含今日）窗口内有数据的日期；按日期升序。
+    /// 审查修复（用量统计天数选择不对应）：原实现按「有条目的天数」计数
+    /// （skip = len - days）——数据稀疏时「最近 7 天」会把跨月的历史条目也
+    /// 收进来（7 条 ≠ 7 天）；改为日历窗口过滤，7/14/30 天选择与图表严格对应
     pub fn recent_in(&self, days: u32, bucket: UsageBucket) -> Vec<(&String, &DayStats)> {
         let b = match bucket {
             UsageBucket::Trae => &self.days,
@@ -390,10 +393,17 @@ impl UsageFile {
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
         };
-        let mut sorted: Vec<(&String, &DayStats)> = b.iter().collect();
+        // 窗口含今日：days=7 → 今日与此前 6 个日历天（字符串比较口径对齐 trim）
+        let cutoff = (chrono::Local::now().date_naive()
+            - chrono::Duration::days(days.saturating_sub(1) as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut sorted: Vec<(&String, &DayStats)> = b
+            .iter()
+            .filter(|(d, _)| d.as_str() >= cutoff.as_str())
+            .collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
-        let skip = sorted.len().saturating_sub(days as usize);
-        sorted.into_iter().skip(skip).collect()
+        sorted
     }
 }
 
@@ -816,6 +826,27 @@ mod tests {
         assert_eq!(got.last().unwrap().0.as_str(), today_key().as_str());
         // 第一天应早于倒数第二天
         assert!(got[0].0 < got[1].0);
+    }
+
+    #[test]
+    fn recent_in_filters_by_calendar_window_not_entry_count() {
+        // 稀疏数据：今日与 10 天前各一条——「最近 7 天」只应含今日。
+        // 原实现按条目计数（7 条 ≠ 7 天），会把 10 天前的条目收进 7 天窗口，
+        // 前端 7/14/30 天切换图表与选择不对应
+        let mut f = UsageFile::default();
+        let old = (chrono::Local::now().date_naive() - chrono::Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        f.days.insert(old.clone(), DayStats::default());
+        f.days.insert(today_key(), DayStats::default());
+        let got = f.recent_in(7, UsageBucket::Trae);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.as_str(), today_key().as_str());
+        // 30 天窗口两条都在，升序：旧日期在前、今日在后
+        let got30 = f.recent_in(30, UsageBucket::Trae);
+        assert_eq!(got30.len(), 2);
+        assert_eq!(got30[0].0.as_str(), old.as_str());
+        assert_eq!(got30.last().unwrap().0.as_str(), today_key().as_str());
     }
 
     #[test]

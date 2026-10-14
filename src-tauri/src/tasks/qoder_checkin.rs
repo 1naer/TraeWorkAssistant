@@ -531,7 +531,7 @@ fn learn_daily_campaign_ids_lenient(campaigns: &[Value]) -> Vec<(String, String)
     };
     let is_claim_benefit =
         |c: &Value| s_of(c.get("actionType")).to_ascii_uppercase() == "CLAIM_BENEFIT";
-    let mut learn = |pred: &dyn Fn(&Value) -> bool| -> Vec<(String, String)> {
+    let learn = |pred: &dyn Fn(&Value) -> bool| -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         for c in campaigns {
             if pred(c) {
