@@ -70,7 +70,8 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
                     &format!("[qoder] 账号 {id} 凭证需人工处理（{note}），请重新登录或更新 PAT"),
                 );
             }
-            // no_credential / fresh：无需刷新
+            // no_credential / fresh：无需刷新；refresh_busy（H3）：他进程正在
+            // 刷新同账号，本进程沿用现有凭证即可，无需计数
             _ => {}
         }
     }

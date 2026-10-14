@@ -554,8 +554,12 @@ fn run_wb_stream(
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
 
     loop {
-        // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）
+        // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
+        // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，与下方
+        // 轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
+            let duration_ms = start_ts.elapsed().as_millis() as u64;
+            state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -659,8 +663,11 @@ fn run_wb_stream(
 
         let mut same_attempt: u32 = 0;
         loop {
-            // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）
+            // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）。
+            // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                 return;
             }
             let ttfb_start = Instant::now();
@@ -705,6 +712,12 @@ fn run_wb_stream(
                         // 错误未流出，对应下方两处 break）为中间态不落账，避免
                         // requests 虚高；终态（成功 / 就地收尾 / 流内失败透传）恰落一行
                         if !(error_info.is_some() && !sent_any) {
+                            // M4 审查修复：缓存读 tokens 旁路入账（宽口径别名提取；
+                            // 上游未下发得 0 不入账，与 credits「不得伪造」口径一致）
+                            state.record_usage_cached(
+                                super::usage::UsageBucket::Wb,
+                                usage.as_ref().map(cached_tokens_of).unwrap_or(0),
+                            );
                             state.record_usage_ttfb(
                                 true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
                                 true, duration_ms, pt, ct, Some(ttfb_ms),
@@ -797,8 +810,10 @@ fn run_wb_stream(
                                 body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                             );
                             std::thread::sleep(std::time::Duration::from_millis(200));
-                            // 断连检测：重试等待期间客户端离开则终止
+                            // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                             if tx.is_closed() {
+                                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
                             }
                             continue;
@@ -826,7 +841,10 @@ fn run_wb_stream(
                             same_attempt += 1;
                             std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
                             // 断连检测：重试等待期间客户端离开则终止，不再占用该账号并发槽
+                            // （审查 M5：补记失败终态用量）
                             if tx.is_closed() {
+                                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
                             }
                             continue;
@@ -1090,6 +1108,11 @@ pub async fn wb_aggregate_chat(
                                 r["model"] = json!(model);
                                 // 宽口径提取（别名 + 字符串数字形态，审查 P2）
                                 let (pt, ct) = r.get("usage").map(u64_pair).unwrap_or((0, 0));
+                                // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                                state.record_usage_cached(
+                                    super::usage::UsageBucket::Wb,
+                                    r.get("usage").map(cached_tokens_of).unwrap_or(0),
+                                );
                                 // F-76① TTFT 入账
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.wb_pool.note_success(win_uid);
@@ -1640,6 +1663,13 @@ pub async fn wb_tool_exec_chat(
                 // completion 写回值为最终账号跨轮累加（acc_usage），维持不变
                 let (pt, ct) = completion.get("usage").map(u64_pair).unwrap_or((0, 0));
                 let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
+                // M4 审查修复：缓存读 tokens 旁路入账——聚合终态 usage 经
+                // write_back_acc_usage 写回 cache_read_token，cached_tokens_of
+                // 键集覆盖该键可直接提取；未下发得 0 不入账
+                state.record_usage_cached(
+                    super::usage::UsageBucket::Wb,
+                    completion.get("usage").map(cached_tokens_of).unwrap_or(0),
+                );
                 // F-76① TTFT 入账：最终轮首字耗时
                 state.record_usage_ttfb(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
                 state.logger.log_request_ttfb(

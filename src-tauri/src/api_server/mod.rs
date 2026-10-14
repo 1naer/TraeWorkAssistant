@@ -246,6 +246,26 @@ impl ApiSharedState {
             .push((usage::UsageBucket::Custom, day));
     }
 
+    /// 记录一次上游缓存读 tokens 测量（M4 审查修复：DayStats 新增 cached_tokens
+    /// 维度的旁路入口——record_usage 系列签名被 15+ 调用点依赖，不扩参；
+    /// 上游未下发 usage 的调用方不调用本方法，0 值不入账不标脏）
+    pub fn record_usage_cached(&self, bucket: usage::UsageBucket, cached: u64) {
+        if cached == 0 {
+            return;
+        }
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_cached_in(bucket, cached);
+        let day = usage::today_key();
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((bucket, day));
+    }
+
     /// 记录一次 Qoder 上游请求用量（独立 qoder_days 桶，与 Trae/WB/Custom 侧分账）；
     /// uid 用 Qoder 账号 uid，落盘策略与 record_usage 相同。
     /// `credits`/`original_credits`：上游 usage 中的积分测量（issue #82 T2），

@@ -180,6 +180,11 @@ pub fn custom_stream_chat(
                     {
                         // 宽口径提取（别名 + 字符串数字形态，审查 P2）
                         let (pt, ct) = up_usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
+                        // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                        state.record_usage_cached(
+                            super::usage::UsageBucket::Custom,
+                            up_usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0),
+                        );
                         state.record_usage_custom(
                             &model, &key_id, error_info.is_none(), true,
                             duration_ms, pt, ct,
@@ -298,6 +303,11 @@ pub async fn custom_aggregate_chat(
                 r["model"] = json!(model);
                 // 宽口径提取（别名 + 字符串数字形态，审查 P2）
                 let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
+                // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                state.record_usage_cached(
+                    super::usage::UsageBucket::Custom,
+                    r.get("usage").map(wb_sse::cached_tokens_of).unwrap_or(0),
+                );
                 state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct);
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms,

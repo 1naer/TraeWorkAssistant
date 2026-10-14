@@ -356,8 +356,11 @@ pub async fn do_start(
                     // 网关侧走 Server 熔断可自愈；仅永久失效（凭证缺失/过期需重登/
                     // PAT 被拒/refresh_token 被拒）走 SessionDead 永久禁用
                     return Err(match status {
-                        "refresh_failed" => format!(
-                            "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态，稍后自动恢复)",
+                        // refresh_busy（H3）：跨进程刷新锁被他进程持有——暂态，
+                        // 必须与 refresh_failed 同走熔断可自愈，否则会被误标
+                        // SessionDead 永久禁用（误标恰是 H3 要消除的后果）
+                        "refresh_failed" | "refresh_busy" => format!(
+                            "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态或他进程正在刷新，稍后自动恢复)",
                             crate::tasks::qoder_common::TRANSIENT_ERR_TAG
                         ),
                         _ => format!("qoder 凭证缺失(id={acct_id}, status={status})"),

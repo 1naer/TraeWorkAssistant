@@ -643,10 +643,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
       }));
+      // 审查 Low：消费后端 failed_permanent（凭证终态失败，重试注定无效）——
+      // 可重试数 = failed - empty - permanent（口径对齐调度器 retryable 判定），
+      // 文案明示其中哪些需重新登录/更新 PAT，防用户对终态失败反复手点重试；
+      // 级别：含终态失败同样 warn（需要用户行动，不降级 success）
+      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty));
+      const retryable = failed - empty - permanent;
       get().pushToast(
-        failed - empty > 0 ? 'warn' : 'success',
+        retryable > 0 || permanent > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
-          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : ''),
+          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : ''),
       );
       return;
     }

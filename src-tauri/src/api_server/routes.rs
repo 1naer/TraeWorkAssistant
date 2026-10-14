@@ -463,17 +463,27 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     }))
 }
 
-/// /healthz（T2.3/F-32）：无健康账号（两个池都没有）→ 503，供探活/看门狗
+/// /healthz（T2.3/F-32）：三池均无可用账号 → 503，供探活/看门狗。
+/// H1 修复（审查）：旧口径仅 Trae ∨ WB 且不查 hard_credit/积分过期/零积分——
+/// 仅部署 Qoder 账号或全部账号 hard_credit 冷却时探活恒 503（可能触发误重启）。
+/// 改用 has_selectable()（= pool::selectable 口径：健康 + 未禁用 + 未冷却 +
+/// 积分未过期且非零），三池 × enabled 开关，与 /v1/models 徽章判定同源
 pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
-    let pool = state.pool.status_list();
-    let wb_pool = state.wb_pool.status_list();
-    let solo_ok = pool.iter().any(|p| !p.disabled && !p.cooling);
+    let trae_enabled = state.trae_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let solo_ok = trae_enabled && state.pool.has_selectable();
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let wb_ok = wb_pool.iter().any(|p| !p.disabled && !p.cooling);
-    if solo_ok || (wb_enabled && wb_ok) {
+    let wb_ok = wb_enabled && state.wb_pool.has_selectable();
+    let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let qoder_ok = qoder_enabled && state.qoder_pool.has_selectable();
+    if solo_ok || wb_ok || qoder_ok {
         (
             StatusCode::OK,
-            axum::Json(json!({ "status": "ok", "solo_available": solo_ok, "wb_available": wb_ok })),
+            axum::Json(json!({
+                "status": "ok",
+                "solo_available": solo_ok,
+                "wb_available": wb_ok,
+                "qoder_available": qoder_ok,
+            })),
         )
             .into_response()
     } else {
@@ -1545,8 +1555,14 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
-            // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽
+            // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽。
+            // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
+            // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
             if tx.is_closed() {
+                state.record_usage(
+                    false, &model, "none", &key_id, false, true,
+                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                );
                 return;
             }
             // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
@@ -1689,6 +1705,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         };
                         if !rotating {
                             let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
+                            // M4 审查修复：缓存读 tokens 旁路入账（宽口径别名提取；
+                            // 上游未下发得 0 不入账，与 credits「不得伪造」口径一致）
+                            state.record_usage_cached(
+                                super::usage::UsageBucket::Trae,
+                                up_usage.as_ref().map(super::wb_sse::cached_tokens_of).unwrap_or(0),
+                            );
                             state.record_usage_ttfb(
                                 false, &model, &win_uid, &key_id, error_info.is_none(), true,
                                 duration_ms, pt, ct, ttfb_ms,
@@ -1797,8 +1819,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     true, &templates,
                                 );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
-                                // 断连检测：重试等待期间客户端离开则终止
+                                // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                                 if tx.is_closed() {
+                                    state.record_usage(
+                                        false, &model, &picked.uid, &key_id, false, stream,
+                                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    );
                                     return;
                                 }
                                 continue;
@@ -1825,8 +1851,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
-                                // 断连检测：重试等待期间客户端离开则终止
+                                // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                                 if tx.is_closed() {
+                                    state.record_usage(
+                                        false, &model, &picked.uid, &key_id, false, stream,
+                                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    );
                                     return;
                                 }
                                 continue;
@@ -2153,6 +2183,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 }
                                 // 用量记账（成功：token 数从聚合响应 usage 提取）
                                 let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
+                                // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                                state.record_usage_cached(
+                                    super::usage::UsageBucket::Trae,
+                                    r.get("usage").map(super::wb_sse::cached_tokens_of).unwrap_or(0),
+                                );
                                 state.record_usage(
                                     false, &model, &picked.uid, &key_id, true, stream,
                                     duration_ms, pt, ct,

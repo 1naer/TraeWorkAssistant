@@ -717,8 +717,15 @@ fn run_qoder_stream(
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
     loop {
-        // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）
+        // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）。
+        // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
+        // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
+            state.record_usage_qoder(
+                model, "none", key_id, false, true,
+                start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                &session_ctx(&peek),
+            );
             return;
         }
         // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -860,8 +867,14 @@ fn run_qoder_stream(
         #[allow(unused_assignments)]
         let mut hedge_taken = false;
         loop {
-            // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）
+            // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）。
+            // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
+                state.record_usage_qoder(
+                    model, &picked.uid, key_id, false, true,
+                    start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                    &session_ctx(&peek),
+                );
                 return;
             }
             // F-76① TTFT 采样（同 wb_route：各次尝试独立计时，竞速胜者首字即 TTFB）
@@ -914,17 +927,11 @@ fn run_qoder_stream(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    let (pt, ct) = usage
-                        .as_ref()
-                        .map(|u| {
-                            (
-                                u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                u.get("completion_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                            )
-                        })
-                        .unwrap_or((0, 0));
+                    // M1 修复（审查）：as_u64 窄口径对字符串/浮点数字段形态静默
+                    // 得 0——改用 wb_sse::u64_pair 宽口径（与 wb/Trae 记账同源）
+                    let (pt, ct) = usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
+                    // M4：缓存读 tokens 同源宽口径提取，终态旁路记账（0 值不入账）
+                    let cached = usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0);
                     let (credits, original_credits) = extract_billing(usage.as_ref());
                     // 审查修复（中等项）：流式记账对齐非流式「每请求一行」口径——
                     // 不再逐尝试记账（原每次尝试记一条，换号重试致 requests/errors
@@ -975,6 +982,12 @@ fn run_qoder_stream(
                                         note_model_cooldown(model, secs);
                                         queue_same += 1;
                                         if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                            // 审查 M5：断连为请求终局，补记失败终态用量
+                                            state.record_usage_qoder(
+                                                model, &win_uid, key_id, false, true,
+                                                start_ts.elapsed().as_millis() as u64, 0, 0,
+                                                None, None, None, &session_ctx(&peek),
+                                            );
                                             return; // 客户端断连：提前退出
                                         }
                                         continue;
@@ -1027,6 +1040,7 @@ fn run_qoder_stream(
                                 break;
                             }
                             // 就地收尾终局：记 usage（部分成功按实际 usage 落账）
+                            state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
                             state.record_usage_qoder(
                                 model,
                                 &win_uid,
@@ -1062,7 +1076,8 @@ fn run_qoder_stream(
                             clear_model_cooldown(model); // 审查修复：成功即清模型级冷却
                             state.qoder_pool.note_success(&win_uid);
                             // 成功终局：记 usage（审查修复——原逐尝试记账已移除，
-                            // 成功行在此统一落账）
+                            // 成功行在此统一落账）；M4：缓存读 tokens 旁路同落
+                            state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
                             state.record_usage_qoder(
                                 model,
                                 &win_uid,
@@ -1106,6 +1121,12 @@ fn run_qoder_stream(
                                 Duration::from_millis(delay_ms.min(60_000)),
                                 Some(tx),
                             ) {
+                                // 审查 M5：断连为请求终局，补记失败终态用量
+                                state.record_usage_qoder(
+                                    model, &picked.uid, key_id, false, true,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    None, None, None, &session_ctx(&peek),
+                                );
                                 return;
                             }
                             continue;
@@ -1149,6 +1170,12 @@ fn run_qoder_stream(
                                 note_model_cooldown(model, secs);
                                 queue_same += 1;
                                 if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                    // 审查 M5：断连为请求终局，补记失败终态用量
+                                    state.record_usage_qoder(
+                                        model, &picked.uid, key_id, false, true,
+                                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                                        None, None, None, &session_ctx(&peek),
+                                    );
                                     return; // 客户端断连：提前退出
                                 }
                                 continue;
@@ -1454,21 +1481,16 @@ pub async fn qoder_aggregate_chat(
                         match (resp, error) {
                             (Some(mut r), None) => {
                                 r["model"] = json!(model);
-                                let (pt, ct) = r
-                                    .get("usage")
-                                    .map(|u| {
-                                        (
-                                            u.get("prompt_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0),
-                                            u.get("completion_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0),
-                                        )
-                                    })
-                                    .unwrap_or((0, 0));
+                                // M1 修复（审查）：as_u64 窄口径改 wb_sse::u64_pair
+                                // 宽口径（字符串/浮点形态不再静默得 0）
+                                let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
                                 let (credits, original_credits) =
                                     extract_billing(r.get("usage"));
+                                // M4：缓存读 tokens 旁路记账（成功终局，0 值不入账）
+                                state.record_usage_cached(
+                                    super::usage::UsageBucket::Qoder,
+                                    r.get("usage").map(wb_sse::cached_tokens_of).unwrap_or(0),
+                                );
                                 state.record_usage_qoder(
                                     &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
                                     Some(ttfb_ms),
@@ -1630,7 +1652,10 @@ pub async fn qoder_aggregate_chat(
                                     }
                                     note_model_cooldown(&model, secs);
                                     queue_same += 1;
-                                    std::thread::sleep(Duration::from_secs(secs));
+                                    // 审查 Low：对齐同函数其余非流式退避点，统一走
+                                    // sleep_interruptible(None)（分段等待，非流式无
+                                    // 下行通道传 None，语义等同整段 sleep，仅封装统一）
+                                    sleep_interruptible(Duration::from_secs(secs), None);
                                     continue;
                                 }
                                 let kind = classified.kind.to_err_kind();

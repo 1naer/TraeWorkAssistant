@@ -20,17 +20,12 @@ pub const RETENTION_DAYS: i64 = 90;
 pub struct KeyId(pub String);
 
 /// 从上游 token_usage 事件中提取 (prompt_tokens, completion_tokens)，
-/// 兼容 OpenAI / Anthropic 两种字段命名；缺失时返回 0
+/// 兼容 OpenAI / Anthropic 两种字段命名；缺失时返回 0。
+/// M2 修复（审查）：as_u64 窄口径对字符串/浮点数字段形态（"123"、123.0）静默
+/// 得 0——委托 wb_sse::u64_pair 宽口径（u64 → i64 → f64 非负 → 字符串 parse），
+/// 别名键集一致，签名不变
 pub fn extract_tokens(u: &serde_json::Value) -> (u64, u64) {
-    let get = |keys: &[&str]| -> u64 {
-        keys.iter()
-            .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
-            .unwrap_or(0)
-    };
-    (
-        get(&["prompt_tokens", "input_tokens"]),
-        get(&["completion_tokens", "output_tokens"]),
-    )
+    super::wb_sse::u64_pair(u)
 }
 
 /// 通用计数器：请求数 / 成功数 / 失败数
@@ -103,6 +98,11 @@ fn percentile(samples: &[u64], p: f64) -> Option<u64> {
     Some(v[idx.min(v.len() - 1)])
 }
 
+/// 桶键（审查 Low 修复）：模型名来自请求体（客户端可控），截断防键空间放大
+fn bucket_key(s: &str) -> String {
+    s.chars().take(200).collect()
+}
+
 /// 单日统计：汇总 + 分维度计数
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct DayStats {
@@ -118,6 +118,10 @@ pub struct DayStats {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
+    /// 缓存读 tokens 累计（M4 审查修复：上游 usage 的 cache_read_input_tokens
+    /// 等别名宽口径提取；上游未下发不入账，与 credits「不得伪造」口径一致）
+    #[serde(default)]
+    pub cached_tokens: u64,
     /// 累计耗时（毫秒），用于计算平均耗时
     #[serde(default)]
     pub duration_ms_total: u64,
@@ -172,15 +176,20 @@ impl DayStats {
         } else {
             self.non_stream.add(ok);
         }
-        self.prompt_tokens += prompt_tokens;
-        self.completion_tokens += completion_tokens;
-        self.duration_ms_total += duration_ms;
-        self.models.entry(model.to_string()).or_default().add(ok);
+        // 审查 Low 修复：u64 累加一律 saturating——恶意/异常上游回传超大 usage
+        // 累加溢出会回绕出小值，统计失真且难察觉
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
+        self.duration_ms_total = self.duration_ms_total.saturating_add(duration_ms);
+        // 审查 Low 修复：模型名来自请求体（客户端可控），无上限会撑爆 HashMap
+        // 键空间（每请求一个新键）——截断作桶键，防键空间放大
+        let model_key = bucket_key(model);
+        self.models.entry(model_key.clone()).or_default().add(ok);
         self.accounts.entry(uid.to_string()).or_default().add(ok);
         self.keys.entry(key_id.to_string()).or_default().add(ok);
         // 延迟样本（F-76）：总耗时全量采样，TTFT 仅在有值时采样
         self.latency.push_total(duration_ms, SAMPLE_CAP_DAY);
-        let m = self.model_latency.entry(model.to_string()).or_default();
+        let m = self.model_latency.entry(model_key).or_default();
         m.push_total(duration_ms, SAMPLE_CAP_MODEL);
         if let Some(t) = ttfb_ms {
             self.latency.push_ttfb(t, SAMPLE_CAP_DAY);
@@ -190,8 +199,8 @@ impl DayStats {
         // 导致前端 Key 表「今日已用(次/tok)」的 token 部分恒为空）
         {
             let kt = self.key_tokens.entry(key_id.to_string()).or_insert((0, 0));
-            kt.0 += prompt_tokens;
-            kt.1 += completion_tokens;
+            kt.0 = kt.0.saturating_add(prompt_tokens);
+            kt.1 = kt.1.saturating_add(completion_tokens);
         }
     }
 
@@ -204,12 +213,19 @@ impl DayStats {
             let c = c.max(0.0);
             self.credits += c;
             if c > 0.0 {
-                *self.model_credits.entry(model.to_string()).or_default() += c;
+                *self.model_credits.entry(bucket_key(model)).or_default() += c;
             }
         }
         if let Some(o) = original {
             self.original_credits += o.max(0.0);
         }
+    }
+
+    /// 记录一次缓存读 tokens 测量（M4 审查修复）：与 record 分离的旁路入口——
+    /// record/record_usage 系列签名被 15+ 调用点依赖，不扩参；上游未下发
+    /// usage 的调用方不调用本方法（不伪造）
+    pub fn record_cached(&mut self, cached: u64) {
+        self.cached_tokens = self.cached_tokens.saturating_add(cached);
     }
 }
 
@@ -373,6 +389,16 @@ impl UsageFile {
         d.record_credits(model, credits, original);
     }
 
+    /// 按桶记录一次缓存读 tokens 测量到当日 entry（M4 审查修复：
+    /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）
+    pub fn record_cached_in(&mut self, bucket: UsageBucket, cached: u64) {
+        let day = today_key();
+        self.bucket_mut(bucket)
+            .entry(day)
+            .or_default()
+            .record_cached(cached);
+    }
+
     /// 裁剪保留期之外的历史日期（各桶同规则）
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
@@ -529,6 +555,8 @@ pub struct UsageDayView {
     pub stream_requests: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// 缓存读 tokens 累计（M4 审查修复：上游未下发时为 0）
+    pub cached_tokens: u64,
     /// 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零）
     pub credits: f64,
     /// 上游计费原值（original_credits，峰谷折扣前）
@@ -605,6 +633,7 @@ impl UsageDayView {
             stream_requests: d.stream.requests,
             prompt_tokens: d.prompt_tokens,
             completion_tokens: d.completion_tokens,
+            cached_tokens: d.cached_tokens,
             credits: d.credits,
             original_credits: d.original_credits,
             avg_duration_ms: if d.total.requests > 0 {

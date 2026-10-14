@@ -895,7 +895,9 @@ pub fn run_snapshot_task(
             || r
                 .get("http_status")
                 .and_then(Value::as_i64)
-                .is_some_and(|s| (400..500).contains(&s))
+                // 审查 M13：429 是限流暂态（退避/换时段即恢复），归永久会让
+                // 调度器全天放弃该账号；其余 4xx（401 自愈已试过）仍为永久
+                .is_some_and(|s| (400..500).contains(&s) && s != 429)
     };
     let permanent = failed.iter().filter(|r| is_permanent(r)).count();
     let transient = failed.len() - permanent;
