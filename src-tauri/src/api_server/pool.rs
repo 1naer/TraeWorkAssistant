@@ -255,13 +255,16 @@ impl ApiPool {
     /// Qoder 池启动保鲜判定（issue #102）：是否存在会被 selectable 持续排除的
     /// 钉死快照——零/负余额（零积分过滤无新鲜度门槛，充值后不拨新不恢复）或
     /// 积分已到期（续期后同理）。与 has_stale_credits 的 reserve 新鲜度口径互补：
-    /// 后者 reserve=0 时短路 false，覆盖不到本判定的两种场景
+    /// 后者 reserve=0 时短路 false，覆盖不到本判定的两种场景。
+    /// disabled（needs_relogin）账号不参与判定——刷新注定 401 永久失败，
+    /// 计入只会让每次启动都触发注定失败的全池刷新（噪音 + 无谓网络请求）
     pub fn has_zero_or_expired_credits(&self) -> bool {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         entries.values().any(|e| {
-            e.credits.is_some_and(|c| c <= 0.0)
-                || e.credits_expire_at.is_some_and(|exp| exp > 0 && exp < now)
+            !e.disabled
+                && (e.credits.is_some_and(|c| c <= 0.0)
+                    || e.credits_expire_at.is_some_and(|exp| exp > 0 && exp < now))
         })
     }
 
@@ -2106,6 +2109,17 @@ mod tests {
         m2.insert("qd-0".to_string(), (9.9, Some(1)));
         pool.update_credits_snapshot(&m2);
         assert!(pool.has_zero_or_expired_credits());
+        // disabled（needs_relogin）+ 零余额 → 不触发：刷新注定 401 永久失败，
+        // 计入只会让每次启动都跑注定失败的全池刷新
+        pool.sync_from_qoder(
+            &[crate::api_server::pool::QoderSyncAccount {
+                uid: "qd-0".into(), name: String::new(), access_token: "tk".into(),
+                machine_id: String::new(), needs_relogin: true,
+                credits: Some(0.0), credits_expire_at: Some(1), credits_fetched_at: Some(1),
+            }],
+            &["qd-0".to_string()],
+        );
+        assert!(!pool.has_zero_or_expired_credits(), "disabled 账号不参与保鲜判定");
     }
 
     #[test]

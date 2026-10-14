@@ -627,9 +627,10 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
     // 409 CAMPAIGN_NOT_ACTIVE（issue #66 健壮性②）：明确归因为「候选 id 错」
     // 而非账号/网络错——盲发到已过期的每日活动 id 的特征形态，给准确提示
     //（旧实现落通用「（HTTP 409）{head}」不可读，也与账号级失败无法区分）。
-    // issue #105 修复后该形态会在当轮触发重学+重试，此处文案同步对齐
+    // issue #105 修复后该形态会当轮重学并视情补一轮盲发（学得新 id 才重试），
+    // 此处文案同步对齐（产空不重试，不宣称「已重试」）
     if code == 409 && raw.contains("CAMPAIGN_NOT_ACTIVE") {
-        return "每日活动 id 已过期（409 CAMPAIGN_NOT_ACTIVE，活动每日轮换）——已触发当轮重学重试".into();
+        return "每日活动 id 已过期（409 CAMPAIGN_NOT_ACTIVE，活动每日轮换）——已尝试当轮重学（未学得新候选时不再重试）".into();
     }
     let head: String = raw.chars().take(120).collect();
     format!("（HTTP {code}）{head}")
