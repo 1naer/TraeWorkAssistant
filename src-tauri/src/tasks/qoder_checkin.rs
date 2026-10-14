@@ -1088,7 +1088,8 @@ fn known_daily_fallback(
 /// 一次（learn_from_min_headers），拿到新 id 立即重试盲发——同轮自愈，不等
 /// 调度器下一轮（旧实现 409 后只能等 30 分钟起步的退避重试，且主列表视野对
 /// 容器形态不可见 CLAIMABLE 时永远收敛不了）。
-/// 注意：过期候选已在首轮盲发中从 learned/table 剔除，重试候选天然只含新 id。
+/// 注意：宽松档补学不校验时间窗，可能学回本轮已被 409 剔除的过期 id——合并前
+/// 按首轮候选全集快照（learned ∪ table）过滤，重试候选只含未试过的新 id。
 fn fallback_with_relearn(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1098,18 +1099,29 @@ fn fallback_with_relearn(
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
 ) -> FallbackOutcome {
+    // 快照本轮已盲发过的候选全集：409 剔除只动 learned/table，本快照不受影响
+    let mut attempted: Vec<String> = learned.iter().map(|(c, _)| c.clone()).collect();
+    for (cid, _) in table.iter() {
+        if !attempted.iter().any(|c| c == cid) {
+            attempted.push(cid.clone());
+        }
+    }
     let outcome = known_daily_fallback(agent, headers, urls, learned, table);
     if let FallbackOutcome::Failed(m, _) = &outcome {
         if m.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
             let before = learned.len();
-            let found = learn_from_min_headers(
+            let found: Vec<(String, String)> = learn_from_min_headers(
                 state,
                 agent,
                 access_token,
                 urls,
                 chrono::Utc::now().timestamp(),
-            );
+            )
+            .into_iter()
+            .filter(|(cid, _)| !attempted.iter().any(|c| c == cid))
+            .collect();
             merge_learned(learned, found);
+            // 过滤后 merge 仍增长 = 确有未试过的新 id 才值得重试盲发
             if learned.len() > before {
                 return known_daily_fallback(agent, headers, urls, learned, table);
             }
@@ -1123,6 +1135,8 @@ fn fallback_with_relearn(
 /// id 直接惠及后续账号，campaign id 全局有效与账号无关）。
 /// `table`：本轮共享的盲发候选常量表（conf 覆盖表 + 内置表，PR #106 移植），
 /// 409 过期 id 剔除跨账号生效。
+/// `shared`：GUI 进程内网关运行态（None = CLI 独立进程），CREDITS 奖励增量回写
+/// qoder_pool（见尾部回写注释）。
 fn process_account(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1130,6 +1144,7 @@ fn process_account(
     opts: &QoderCheckinOpts,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
+    shared: Option<&std::sync::Arc<crate::api_server::ApiSharedState>>,
 ) -> Value {
     let aid = s_of(acct.get("id"));
     let name = acct
@@ -1475,6 +1490,19 @@ fn process_account(
             reward = None;
         }
     }
+    // 签到奖励运行期回写（对齐 qoder_credits::run_snapshot_task 的 issue #102 口径）：
+    // CREDITS 奖励是真实入账，拨进网关 qoder_pool 防止「签到充值成功后账号仍被零积分
+    // 过滤持续排除到下次快照」（默认 every_hours 2h / daily 档最长约 13.5h）。
+    // 仅回写 credits 增量 + fetched_at，expire 以快照为准不动；未到账降级已置
+    // reward=None 天然不回写；非 CREDITS 活动（BOGO 等）金额不进余额无法归因，
+    // 不回写；差值兜底采信（reward 从余额差值派生）同样覆盖
+    if all_credits {
+        if let (Some(shared), Some(r)) = (shared, reward) {
+            if r > 0.0 {
+                shared.qoder_pool.apply_credits_delta(&aid, r);
+            }
+        }
+    }
     let status_txt = match kind.as_str() {
         "success" => "success",
         "already" => "already",
@@ -1530,7 +1558,15 @@ fn process_account(
 
 /// 签到整轮：逐账号串行处理，事件经 emit 回调逐条输出（NDJSON 管线复用）。
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/调度静默路径直接消费。
-pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut dyn FnMut(&Value)) -> Value {
+/// `runtime`：GUI 进程内网关运行态句柄（调度器/启动补签/GUI 手签传入，对齐
+/// qoder_credits::run_snapshot_task）——CREDITS 奖励增量回写 qoder_pool；
+/// CLI 独立进程传 None 跳过
+pub fn run_checkin_round(
+    state: &AppState,
+    opts: &QoderCheckinOpts,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    emit: &mut dyn FnMut(&Value),
+) -> Value {
     // 跨进程互斥（审查 P1）：schtasks CLI（--task-run qoder-checkin）与应用内调度器
     // 默认同为 10:15 触发，双进程对同账号并发 ensure_fresh 会以同一 refresh_token
     // 刷新（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败方幂等跳过
@@ -1578,12 +1614,25 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     let mut campaign_table = load_campaign_table(state);
     // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
     let gap_secs = crate::models::effective_checkin_gap(state.settings().qoder_checkin_gap_secs);
+    // 网关运行态共享句柄（对齐 run_snapshot_task 提取模式）：网关未启动时为 None
+    let shared = runtime.and_then(|r| {
+        let g = r.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|rt| rt.shared.clone())
+    });
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
-        let mut ev = process_account(state, &agent, acct, opts, &mut learned_ids, &mut campaign_table);
+        let mut ev = process_account(
+            state,
+            &agent,
+            acct,
+            opts,
+            &mut learned_ids,
+            &mut campaign_table,
+            shared.as_ref(),
+        );
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);

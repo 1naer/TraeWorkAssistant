@@ -283,6 +283,8 @@ export interface TraeWorkMigrationReport {
   finished_at_ms: number;
   /** 迁移明细条目（settings 键退役/承接 + 快照池搬迁摘要，用户可读文案） */
   notes: string[];
+  /** settings 步处置结果（结构化字段，新版报告才有；null/缺失 = 无 trae_path 存量） */
+  settings_note?: string | null;
   /** 整组迁入 profiles_trae 的组数 */
   moved_groups: number;
   /** 同名冲突整组保留至 profiles_trae_work_legacy 的组数 */

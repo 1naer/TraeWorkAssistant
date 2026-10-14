@@ -508,7 +508,7 @@ fn run_task(
                 return Ok(json!({ "ok": true, "skipped": "已有 Qoder 签到任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let opts = super::qoder_checkin::QoderCheckinOpts::daily();
-            let done = super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {});
+            let done = super::qoder_checkin::run_checkin_round(st, &opts, runtime, &mut |_| {});
             // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
             // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
             // 计入重试只会全天无效重试 + 当日首败误报通知——按 failed - failed_empty_campaigns

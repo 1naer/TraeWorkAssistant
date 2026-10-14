@@ -23,8 +23,10 @@ export default function TraeWorkMigrationGuide() {
   const dismiss = useAppStore((s) => s.dismissTraeworkGuide);
   if (!report) return null;
 
-  // settings 步明细（含「trae_path」关键字的 note 即为旧安装路径设置的处置结果）
-  const settingsNote = report.notes.find((n) => n.includes('trae_path'));
+  // settings 步明细：优先消费结构化 settings_note（后端新版报告直传）；
+  // 旧版报告（升级前已落 kv）无该字段时回退子串匹配，不误显「已跳过」
+  const settingsNote =
+    report.settings_note ?? report.notes.find((n) => n.includes('trae_path'));
   const finishedAt = new Date(report.finished_at_ms).toLocaleString();
 
   const steps: { icon: typeof Search; title: string; detail: string }[] = [

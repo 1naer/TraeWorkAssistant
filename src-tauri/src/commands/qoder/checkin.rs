@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -51,7 +51,10 @@ pub fn qoder_checkin_start(
             let _guard = round;
             // panic 不外泄线程：捕获后记录，exit 终态照常下发（否则前端运行态永挂）
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                qoder_checkin::run_checkin_round(&state2, &o, &mut |ev| emit_qoder_event(&app2, ev));
+                // 网关运行态句柄（镜像 api_server.rs 先例）：CREDITS 奖励增量回写
+                // qoder_pool，防签到充值后被零积分过滤排除到下次快照
+                let rt = app2.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+                qoder_checkin::run_checkin_round(&state2, &o, Some(rt.inner()), &mut |ev| emit_qoder_event(&app2, ev));
             }));
             // P3 审查修复：panic 轮次的 exit 终态 ok=false——此前恒 true 会把「签到线程
             // 崩溃」上报为成功轮次（结果失真）；前端仅按 type=="exit" 复位运行态，
@@ -292,7 +295,9 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
         };
         let opts = QoderCheckinOpts::daily();
         fs_utils::app_log(&state2.data_dir, "Qoder 启动补签：开始核验签到状态");
-        let done = qoder_checkin::run_checkin_round(&state2, &opts, &mut |_| {});
+        // 网关运行态句柄（镜像 api_server.rs 先例）：CREDITS 奖励增量回写 qoder_pool
+        let rt = app2.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let done = qoder_checkin::run_checkin_round(&state2, &opts, Some(rt.inner()), &mut |_| {});
         // skipped_busy：轮次锁已获取但跨进程锁被占（如 schtasks 同刻触发），幂等跳过；
         // failed=0 本就不会触发失败推送，此处仅修正日志可读性（不再误记「成功 0 失败 0」）
         let msg = if done["skipped_busy"].as_bool().unwrap_or(false) {

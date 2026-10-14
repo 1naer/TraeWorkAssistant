@@ -125,7 +125,7 @@ export default function Accounts() {
   const [exportConfirming, setExportConfirming] = useState(false);
   // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
   // （桥挂死/事件丢失/后台线程 panic）时 switchingTo/savingLogin 会永久非空——全部切换/保存/
-  // 续期/重置按钮被禁用、appMenu 不再弹出，用户感知为「点击切换账号无反应」。90s 后解除
+  // 续期/重置按钮被禁用，用户感知为「点击切换账号无反应」。90s 后解除
   // 按钮互斥并清空 store 进行中状态（issue #44：仅页面级解锁会让 spinner/「切换中…」
   // 永久显示；事件迟到仍会正常提示结果）。
   const [lockTimedOut, setLockTimedOut] = useState(false);

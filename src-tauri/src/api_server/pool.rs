@@ -449,6 +449,23 @@ impl ApiPool {
         }
     }
 
+    /// Qoder 签到奖励运行期增量回写：credits += delta 并拨新 fetched_at，
+    /// expire 以快照为准不动，不触碰冷却/inflight/禁用等运行态（对齐
+    /// update_credits_snapshot 的拨新纪律）。修复「签到充值成功后账号仍被
+    /// 零积分过滤持续排除到下次快照」（every_hours 2h / daily 档最长约 13.5h
+    /// 的排除窗口）；池内不存在的账号静默跳过（与两回写方法同口径）
+    pub fn apply_credits_delta(&self, uid: &str, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            let base = e.credits.unwrap_or(0.0).max(0.0);
+            e.credits = Some((base + delta).max(0.0));
+            e.credits_fetched_at = Some(now_ts());
+        }
+    }
+
     /// 从 WorkBuddy 账号同步池（T2.1/F-28）：WB 上游账号进同一调度引擎，
     /// 携带区域/企业域信息供上游 headers 使用
     pub fn sync_from_wb(&self, accounts: &[WbSyncAccount], enabled: &[String]) {

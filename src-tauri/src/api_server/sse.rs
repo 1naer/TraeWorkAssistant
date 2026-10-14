@@ -940,6 +940,12 @@ fn stream_convert_anthropic_src(
                     usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    // 上游偶发双完成（sibling 两转换器同款守卫）：二次完成会重发全部
+                    // tool_use 块 + message_delta/message_stop，对 Claude Code 等严格
+                    // 客户端属协议违规——首帧后静默忽略后续完成事件
+                    if saw_done {
+                        continue;
+                    }
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }
