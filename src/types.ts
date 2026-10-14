@@ -103,7 +103,7 @@ export interface AccountView {
   credit_packs?: CreditPackDetail[];
 }
 
-// ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
+// ---- 积分消耗历史（Trae query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
 export interface UsageDayStat {
   /** 本地自然日 YYYY-MM-DD */
   date: string;
@@ -254,7 +254,7 @@ export interface DiscoveredAccount {
   dc_uid?: string | null;
   /** Cloud-IDE uid 是否经本机使用证据确认（false 时 user_id 实为 dc uid，不可入池） */
   uid_confident: boolean;
-  /** TraeWork | Trae */
+  /** 恒 "Trae"（TraeWork 已并入 Trae，双应用收敛见 docs/completed/Trae双应用合并适配调整方案.md） */
   app: string;
   app_label: string;
   in_pool: boolean;
@@ -278,9 +278,15 @@ export interface AppEntitlement {
   last_sync_time: number | null;
 }
 
-export interface LocalEntitlement {
-  work: AppEntitlement | null;
-  cn: AppEntitlement | null;
+/** TraeWork 合并迁移升级引导报告（后端迁移完成后落 kv，首启弹窗展示；关闭后不再弹） */
+export interface TraeWorkMigrationReport {
+  finished_at_ms: number;
+  /** 迁移明细条目（settings 键退役/承接 + 快照池搬迁摘要，用户可读文案） */
+  notes: string[];
+  /** 整组迁入 profiles_trae 的组数 */
+  moved_groups: number;
+  /** 同名冲突整组保留至 profiles_trae_work_legacy 的组数 */
+  legacy_groups: number;
 }
 
 /** 积分明细条目（仅剩余 > 0 且未过期的积分包） */
@@ -355,7 +361,6 @@ export interface Settings {
   checkin_skip_expired: boolean;
   retry: number;
   notify: string;
-  trae_path: string | null;
   trae_cn_path: string | null;
   doubao_path: string | null;
   /** 豆包会话续期保活端点（null = 用 doubao.com 首页滑动续期） */

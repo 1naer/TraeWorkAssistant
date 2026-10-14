@@ -10,6 +10,7 @@ use tauri::{AppHandle, State};
 use crate::jwt;
 use crate::models::{CreditRecord, DeviceMap, Settings};
 use crate::state::AppState;
+use crate::store::migrate::TraeWorkMigrationReport;
 
 pub const INVITE_LINK: &str =
     "https://www.trae.cn/work-fission/4CP3KDBT5W9A?utm_source=copy_link&utm_medium=friends_invite";
@@ -734,6 +735,26 @@ pub fn startup_notice_take(state: State<AppState>) -> Option<String> {
         let _ = store.kv_delete("startup_notice");
     }
     msg
+}
+
+// ---------------- TraeWork 合并迁移升级引导 ----------------
+
+/// 升级引导拉取：有迁移报告（`traework_merge_report`）且用户未关闭过 → 返回报告；
+/// 关闭过（「已读」标记）或无报告（全新安装/迁移未跑）→ None。
+/// 报告本身不清除——「不再展示」只由已读标记管，报告保留供日后复查。
+#[tauri::command]
+pub fn traework_migration_guide(state: State<AppState>) -> Option<TraeWorkMigrationReport> {
+    let store = crate::store::db(&state.data_dir);
+    if store.kv_get::<bool>("traework_merge_guide_dismissed") {
+        return None;
+    }
+    store.kv_get::<Option<TraeWorkMigrationReport>>("traework_merge_report")
+}
+
+/// 用户关闭升级引导：落「已读」标记（幂等），之后启动不再展示
+#[tauri::command]
+pub fn traework_migration_guide_dismiss(state: State<AppState>) -> Result<(), String> {
+    crate::store::db(&state.data_dir).kv_set("traework_merge_guide_dismissed", &true)
 }
 
 #[tauri::command]

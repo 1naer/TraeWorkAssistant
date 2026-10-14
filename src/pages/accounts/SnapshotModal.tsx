@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { ArchiveRestore, DatabaseBackup, Trash2 } from 'lucide-react';
 import { Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
-import { cn } from '../../lib/cn';
 import type { ProfileInfo } from '../../types';
 
 function ProfileSize({ bytes }: { bytes: number }) {
@@ -31,8 +30,6 @@ export function ProfileModal({
   profiles,
   profileActive,
   profileProgress,
-  profileApp,
-  onSwitchApp,
   onBackup,
   onRestore,
   onDelete,
@@ -42,8 +39,6 @@ export function ProfileModal({
   profiles: ProfileInfo[];
   profileActive: boolean;
   profileProgress: string[];
-  profileApp: 'TraeWork' | 'Trae';
-  onSwitchApp: (app: 'TraeWork' | 'Trae') => void;
   onBackup: (slot: string) => void;
   onRestore: (slot: string) => void;
   onDelete: (slot: string) => Promise<void>;
@@ -51,32 +46,6 @@ export function ProfileModal({
   return (
     <Modal open={open} onClose={onClose} title="登录态快照管理" size="xl">
       <div className="space-y-3">
-        {/* 目标应用切换：快照按应用隔离存储（profiles / profiles_trae），F-03 参数化 */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-500 dark:text-zinc-400">目标应用</span>
-          <div className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700">
-            {([
-              { app: 'TraeWork', label: 'Trae Work' },
-              { app: 'Trae', label: 'Trae CN' },
-            ] as const).map((opt) => (
-              <button
-                key={opt.app}
-                disabled={profileActive}
-                onClick={() => {
-                  if (opt.app !== profileApp) onSwitchApp(opt.app);
-                }}
-                className={cn(
-                  'px-3 py-1 text-xs transition',
-                  profileApp === opt.app
-                    ? 'bg-brand-600 text-white'
-                    : 'bg-white text-slate-600 hover:bg-slate-50 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700',
-                )}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
         {profileActive && (
           <div className="rounded-lg border border-brand-300 bg-brand-50 p-3 dark:border-brand-700 dark:bg-brand-900/20">
             <div className="mb-1 text-xs font-medium text-brand-700 dark:text-brand-300">

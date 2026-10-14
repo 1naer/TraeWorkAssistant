@@ -1,11 +1,11 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.7.11
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.7.12
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae Work（WorkBuddy）/ Trae（Trae CN IDE）/ Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom 四池调度**，每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom 四池调度**，每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
 
 ## 2. Quick Start
 
@@ -75,7 +75,7 @@ ai-work-assistant/
 │       │   ├── auth.rs           # API Key 鉴权（Bearer + x-api-key 双风格）
 │       │   ├── models_sync.rs    # 模型列表配置化（api_models.json）+ 官网 batch_get_detail_param 同步
 │       │   └── api_logger.rs     # API 请求日志
-│       └── commands/             # env / cert / proxy / accounts / checkin / switch / misc / profile / api_server / oauth / trae_apps(双应用发现) / process(三级关闭) / updater / wb_config(wb 手工配置读写)；workbuddy/ 为目录模块（common/accounts/checkin/credits/cli/chatdata/oauth/env_reset，mod.rs pub use 保持命令路径不变）
+│       └── commands/             # env / cert / proxy / accounts / checkin / switch / misc / profile / api_server / oauth / trae_apps(本机 Trae 账号发现) / process(三级关闭) / updater / wb_config(wb 手工配置读写)；workbuddy/ 为目录模块（common/accounts/checkin/credits/cli/chatdata/oauth/env_reset，mod.rs pub use 保持命令路径不变）
 │       └── tasks/                # 后台业务直调模块（trae_checkin / wb_checkin / wb_common / wb_credits / doubao_session / doubao_quota / doubao_chats / ui_click）
 │           ├── trae_checkin.rs   # 批量签到（vault 解密内存传递，无子进程）
 │           ├── wb_checkin.rs     # WorkBuddy 签到/成长/续期（run_checkin_round / run_growth_round / run_renew_only）
@@ -98,9 +98,8 @@ ai-work-assistant/
 
 | 模块 | 命令 | 说明 |
 |---|---|---|
-| 环境 | `env_check` → `EnvStatus` | `installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿）。**提速修订（2026-10-07）**：版本号改 `pe_version` 直读 PE 版本资源（原 powershell 子进程 1.2s+/次 → 1.9ms，按 mtime 缓存命中 0.14ms），运行态改 `switcher::proc::any_running` 进程表枚举 + 2s TTL（原 tasklist 261ms/次 → 18ms），`app_locate` 注册表/进程兜底两级加 3s TTL——同一轮界面切换里概览页与顶栏重复探测不再重复掏子进程 |
-| 环境 | `open_trae_website()` / `open_trae_app()` | 打开 Trae 官网 / 启动 Trae Work（代理注入时优雅关闭进程最长 5s，async） |
-| 环境 | `env_check_trae_cn()` / `open_trae_cn_app()` | Trae CN IDE 环境检测 / 启动（双应用支持） |
+| 环境 | `env_check_trae_cn()` → `EnvStatus` | Trae（Trae CN）环境检测：`installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿）。**提速修订（2026-10-07）**：版本号改 `pe_version` 直读 PE 版本资源（原 powershell 子进程 1.2s+/次 → 1.9ms，按 mtime 缓存命中 0.14ms），运行态改 `switcher::proc::any_running` 进程表枚举 + 2s TTL（原 tasklist 261ms/次 → 18ms），`app_locate` 注册表/进程兜底两级加 3s TTL——同一轮界面切换里概览页与顶栏重复探测不再重复掏子进程。**双应用合并（2026-10-14）**：原 Trae Work `env_check` / `open_trae_app` 已随合并退役，由本命令与 `open_trae_cn_app` 承接 |
+| 环境 | `open_trae_website()` / `open_trae_cn_app()` | 打开 Trae 官网 / 启动 Trae（代理注入时优雅关闭进程最长 5s，async） |
 | 证书 | `cert_status` / `cert_install` | 安装走 UAC `certutil -addstore -f Root` |
 | 代理 | `proxy_start(port)` / `proxy_stop()` / `proxy_status()` | ProxyStatus：`running/port/captured/started_at` |
 | 账号 | `accounts_list` → `AccountView[]` | 聚合 JWT / 分组 / 设备 / 积分 / 今日 |
@@ -117,11 +116,11 @@ ai-work-assistant/
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }`；失败自动重试最多 2 轮（30s/90s，T5） |
 | 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，checkin_results 表，保留 90 天）；写入方 = `trae_checkin::run_round` 末尾统一落库（UI 手动/托盘/静默/应用内调度器/CLI `--task-run checkin` 全路径覆盖；UI 路径重试轮合并后由 `run_checkin_worker` 再落一次，同 uid 同日以最后一次为准，双写幂等） |
-| 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae_work\|trae\|doubao\|workbuddy` |
+| 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae\|doubao\|workbuddy\|codebuddy`（缺省 trae） |
 | 环境 | `open_doubao_app()` | 启动豆包桌面版（复用 app_locate 豆包档案探测） |
-| 切换 | `switch_account(userId)` | 调 `switcher::run_action(Switch)`（进程内直调，三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
+| 切换 | `switch_account(userId)` | 调 `switcher::run_action(Switch)`（进程内直调，三级关闭策略）；`target_app` 支持 Trae/Doubao/WorkBuddy/CodeBuddy/Qoder/QoderWork |
 | 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射）；仅 icube 布局 |
-| 保存 | `save_current_login(userId)` | 调 `switcher::run_action(SaveCurrentLogin)`；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
+| 保存 | `save_current_login(userId)` | 调 `switcher::run_action(SaveCurrentLogin)`；`target_app` 支持 Trae/Doubao/WorkBuddy/CodeBuddy/Qoder/QoderWork |
 | 快照 | `profile_list(targetApp?, fresh?)` → `ProfileInfo[]` | 列出快照槽；`target_app` 决定根目录 profiles / profiles_trae / profiles_doubao / profiles_codebuddy。**性能（2026-10-07）**：体积统计（`dir_stats` 递归整棵快照目录）改「缓存 + 多槽并行 + `spawn_blocking`」——CodeBuddy 档实测 18,372 目录 / 13,659 文件 / 300MB，单线程 4.89s、4 线程 1.64s（耗时几乎全在逐目录 `read_dir`：只遍历不取 metadata 同样 4.87s），原实现是同步命令逐槽串行 → 打开快照管理卡 UI 数秒。缓存键 = 槽位目录绝对路径，`mtime` 仅作尽力而为失效信号（NTFS 只在**直接子项**增删时更新槽位目录时间戳，且更新有延迟），正确性由 TTL 300s + 显式失效（`switcher::backup_current` 出口统一 `invalidate_profile_stats`——保存当前登录态/切换/备份/恢复回退 last 槽全部写槽路径一次收口，删除后同样失效）保证；`fresh=true` 绕过缓存（前端「刷新列表」按钮）。埋点 `[profiles] 快照体积统计 …` 仅在实际计算时落一行 |
 | 快照 | `profile_backup(userId)` / `profile_restore(userId)` / `profile_delete(slot)` | 手动备份/恢复/删除；`target_app` 同上 |
 | 快照 | `profile_format_size(...)` | 快照体积格式化 |
@@ -145,8 +144,8 @@ ai-work-assistant/
 | 豆包 | `doubao_export_chats(userId)` | **D2 对话记录导出**：Rust 直调 `tasks/doubao_chats.rs`（原 python `--export --uid X` 语义，stdout 末行 JSON 契约不变）；走官方 IM 接口 `POST www.doubao.com/im/chain/recent_conv`（cmd 3200 会话列表，conv_version=0 首跳 limit≤50）+ `im/chain/single`（cmd 3100 单会话消息，anchor_index=2^53-1 起翻页，index_in_conv 为字符串需 int 转换）；必需 Cookie：sessionid/sessionid_ss/sid_tt + sid_guard + **ttwid**（登录校验），sid_guard/ttwid 必须以 Set-Cookie 下发的 **URL 编码原样**发送（原始 | 形式报 712010702，_cookie_enc 兼容两种存储形式），query 必须含设备指纹 web_id/tea_uuid/fp（缺失报 712010702）+ 头 agw-js-conv:str + UA SamanthaDoubao；输出 markdown+json 到 data/exports/doubao_chats_<uid>_<ts>.*；正文提取 content_block text_block → tts_content/brief 兜底；池内凭证过期（客户端重新登录后 sessionid 轮换）时需重开代理自动回写 |
 | 日志 | `proxy_logs_list(...)` / `proxy_log_detail(...)` | 代理请求日志列表 / 详情。**性能（2026-10-07 实测）**：改为「条目索引 + 按需读字节」——`proxy_req_*.log` 目录实测 11 文件 / 230MB / 35.9k 条，原实现每次把**全部文件**读成 String 并逐条 parse（最后才 `skip/take` 取当前页 30 条），翻页 / 改日期 / 改关键字都重来一遍；现每文件维护 mtime+size 增量的条目索引（字节区间 + 首行时间戳，定长数组无堆分配），时间筛选走内存、仅为当前页那 30 条读字节区间，11 个文件分 4 路并行：列表首屏（冷建索引）285ms / 热命中 12ms / 深翻页 9ms / 关键字 569ms（旧等价路径约 850ms+ 且每页重算）；详情由「读完整文件（单文件最大 60MB）」改为只读该条区间。两命令均改 `#[tauri::command(async)]`（不占 UI 线程）。**id 口径修正**：id = 文件内**原始**非空分块序号，与 detail 取序号方式一致（原实现 index 只在通过筛选时自增，带筛选时列表 id 与详情错位、点开是另一条） |
 | 文件 | `read_text_file(path)` / `write_text_file(...)` | 前端通用文本读写（read 有 10MB 上限 + 常规文件校验） |
-| 双应用 | `apps_accounts_discover` / `apps_account_add` / `apps_entitlement_read` | 本机 Trae Work + Trae CN 账号自动发现 / 入池 / 套餐读取（F-08，见 §5.1）；`apps_account_add` 增 `uidConfident?` 参数（false 时拒绝入池，杜绝 dc uid 误入池，命令层把关） |
-| 双应用 | `refresh_pay_status(...)` / `accounts_backfill_dc_ids(...)` | 会员支付状态刷新 / 已有账号回填 dc id |
+| 账号发现 | `apps_accounts_discover` / `apps_account_add` / `apps_entitlement_read` | 本机 Trae 账号自动发现 / 入池 / 套餐读取（F-08，见 §5.1；双应用合并后数据源单目录 `%APPDATA%\Trae CN`）；`apps_account_add` 增 `uidConfident?` 参数（false 时拒绝入池，杜绝 dc uid 误入池，命令层把关） |
+| 账号发现 | `refresh_pay_status(...)` / `accounts_backfill_dc_ids(...)` | 会员支付状态刷新 / 已有账号回填 dc id |
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start()` / `api_server_stop()` / `api_server_status()` | API 网关启停（端口/默认模型由设置页提供；鉴权统一走 API Keys 列表） |
@@ -207,11 +206,11 @@ ai-work-assistant/
 | Qoder | `qoder_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（kind 标记 `aiwork-qoder-pool`；凭证是否随行由用户勾选，含凭证导出前端强确认；分组定义随载荷导出，导入按 id 幂等合并 + 幽灵 group_id 回落未分组） |
 | Qoder | `qoder_env_reset_items()` / `qoder_env_reset(items)` | Qoder 环境残留清理清单 + 程序化清理（执行前关闭 Qoder IDE 与 Work 客户端——本体进程同名 "Qoder CN.exe" 一并覆盖；9 项含 QoderWork 客户端 `%APPDATA%\com.qodercn.app.stable` 的 Local State + Network\Cookies；单项失败不中断） |
 
-### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
+### 5.1 Trae 账号发现与双 uid 体系（F-08，trae_apps.rs；双应用合并适配 2026-10-14）
 
-- 数据源：`%APPDATA%\TRAE SOLO CN`（Trae Work）与 `%APPDATA%\Trae CN`（Trae CN IDE）各自的 `User\globalStorage\storage.json` / `state.vscdb`。
+- 数据源：`%APPDATA%\Trae CN`（Trae 单客户端，原 Trae Work 数据目录 `%APPDATA%\TRAE SOLO CN` 已随官方双应用合并退役）的 `User\globalStorage\storage.json` / `state.vscdb`。
 - **两套 uid 体系不通用（红线）**：`iCubeAuthInfo://icube-dc:<uid>` 键名中的 uid 是**账户中心（dc）id 空间**；账号池 / JWT `data.id` 用的是 **Cloud-IDE id 空间**。同一登录账号两者数值不同，直接混用会导致重复入池。
-- 当前登录账号的 Cloud-IDE uid 由使用痕迹推导（Trae CN 看 `icube_gtm.users` 键名；Trae Work 看 state.vscdb `solo.mobile.allowControl` per-uid 最新 `updatedTime` + 键名证据计数），推导失败时回退展示 dc uid 并标记 `uid_confident=false`、**禁止入池**。
+- 当前登录账号的 Cloud-IDE uid 由使用痕迹推导（三级链：① storage.json `icube_gtm.users` 键名（权重最高）→ ② 客户端日志探测（原 Trae Work 专属 `solo.mobile.allowControl` 证据源已随双应用合并退役）→ ③ 证据与桥标记按 hybrid 规则合并取优），推导失败时回退展示 dc uid 并标记 `uid_confident=false`、**禁止入池**。
 
 ### 5.2 API 网关双上游与 WorkBuddy 适配（批次 2，T2.1~T2.4/T2.7）
 
@@ -295,7 +294,7 @@ ai-work-assistant/
 │   ├── doubao_chats/             # 豆包对话数据备份（<uid>/，按 profile 分层）
 │   ├── exports/                  # 导出产物（doubao_chats_<uid>_<ts>.md/.json 等）
 │   ├── certs/                    # 自签 CA（ca.cer / ca.crt / ca.key）
-│   ├── profiles/                 # 登录态快照（Trae Work）
+│   ├── profiles/                 # 旧 Trae Work 快照槽（已退役——存量由启动迁移并入 profiles_trae，目标主槽冲突整组保留于 profiles_trae_work_legacy）
 │   │   ├── current_account.txt   # 当前活跃账号 ID
 │   │   └── <user_id>/            # 精准备份的 9 类核心文件
 │   ├── profiles_trae/            # Trae CN 快照槽
@@ -313,11 +312,11 @@ ai-work-assistant/
 
 - **进程内直调**：`switcher::run_action(RunArgs, &ProgressSink)`——原 powershell 子进程管道已下线，NDJSON 行 `{"stage","status","message","time"}` 语义与 `*-done {success,raw}` 由 TauriSink/CliSink 一步到位，前端契约不变。
 - **全局互斥**：并发 run_action 直接拒绝（「已有切换/备份操作进行中」），命令层预检（JWT/会话/守卫 uid）在前。
-- **入参**：`action: Switch/SaveCurrentLogin/BackupCurrent/RestoreOnly/ResetMachineId/ResetDeviceIds/KeepAlive`；`user_id`（Reset*/KeepAlive 可空，经 ensure_uid_safe 白名单）；`target_app: trae_work|trae|doubao|workbuddy|codebuddy`；`proxy_port>0` 注入 `--proxy-server`（C1）；`include_indexeddb`（C4：备份纳入 `Default/IndexedDB`）；`expected_current_uid`（防误覆盖守卫）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、`~/.codebuddy` 无 account-snapshot 时确认步 skip+warn。
+- **入参**：`action: Switch/SaveCurrentLogin/BackupCurrent/RestoreOnly/ResetMachineId/ResetDeviceIds/KeepAlive`；`user_id`（Reset*/KeepAlive 可空，经 ensure_uid_safe 白名单）；`target_app: Trae|Doubao|WorkBuddy|CodeBuddy|Qoder|QoderWork`；`proxy_port>0` 注入 `--proxy-server`（C1）；`include_indexeddb`（C4：备份纳入 `Default/IndexedDB`）；`expected_current_uid`（防误覆盖守卫）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、`~/.codebuddy` 无 account-snapshot 时确认步 skip+warn。
 - **CLI 任务模式**：`--task-run doubao-keepalive`（schtasks 直调主 exe；启动器 `task_doubao_renew.cmd` 启动期原地迁移，内容不含 trae-switch-bridge.ps1 即跳过）。
 - **精准备份**：仅复制 9 类核心登录文件（storage.json / state.vscdb / machineid / aha / Network 等），非全量镜像。
-- **Switch 流程**：预检查目标快照 → 关闭 Trae Work → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
-- **SaveCurrentLogin 流程**：关闭 Trae Work → 精准备份到 userId 槽位 → 启动。
+- **Switch 流程**：预检查目标快照 → 关闭目标应用 → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
+- **SaveCurrentLogin 流程**：关闭目标应用 → 精准备份到 userId 槽位 → 启动。
 - storage.json 路径：`User\globalStorage\storage.json`，键名为点号形态整体键（`telemetry.machineId`，非嵌套对象）。
 - **豆包数据目录**：`%LOCALAPPDATA%\Doubao\User Data`（Trae 系用 `%APPDATA%`）；备份项含 Local State / Network/Cookies* / Local Storage/leveldb / Session Storage / DoubaoStorage / saman_app_state / saman_shell_db_storage，`Last Version`（C3 版本基线）。
 - **C3 快照元数据与校验**：备份时写 `snapshot_meta.json`（`schemaVersion=1` / createdAt / chromiumVersion / includeIndexedDB）并复制 `Last Version`；恢复前 `Test-SnapshotIntegrity` 三层校验——① schemaVersion ≠ 1 直接中止（无元数据文件的旧快照仅 warn 并跳过）② leveldb 缺 CURRENT 或 CURRENT 指向的 MANIFEST 缺失 → 中止 ③ 快照版本 ≠ 当前安装版本 → 仅 warn 继续恢复。
@@ -411,7 +410,7 @@ ai-work-assistant/
 - **API Key**：留空时跳过鉴权；配置时在前端掩码显示（前 4 + 后 4 + ****）。鉴权头支持 `Authorization: Bearer <key>`（OpenAI 风格）与 `x-api-key: <key>`（Anthropic 风格）双风格。
 - **凭证展示（黑盒审查修复，2026-09-12）**：列表接口 `AccountView.jwt` 与豆包 `session_id/sid_guard/ttwid` 一律 `mask_secret` 掩码下发；完整值经 `account_get_jwt` / `doubao_account_get_credential` 按需获取。user_id 作路径段统一过 `fs_utils::ensure_uid_safe` 字符集白名单（豆包对话备份/快照/账号删除/桥 -UserId 全覆盖）。
 - **导出路径白名单（2026-09-12）**：`write_text_file` 拒绝系统目录（Windows/Program Files）与用户/公共启动文件夹，数据目录外拒绝可执行/脚本类扩展名（.exe/.bat/.ps1 等 16 类），仅放行常规数据导出（.json/.txt/.csv 等）——前端「账号导出」功能不受影响。
-- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`（与 `data/api_models.json` 同源，官网同步后无需重启即可见最新列表）、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）、`POST /v1/responses`（Codex Responses API，F-40 批次4，仅 WB 上游模型）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务，扣通用积分（product_id 208）。
+- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`（与 `data/api_models.json` 同源，官网同步后无需重启即可见最新列表）、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）、`POST /v1/responses`（Codex Responses API，F-40 批次4，仅 WB 上游模型）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae 账号入池即被同一网关服务，扣通用积分（product_id 208）。
 - **Codex Responses 投影（F-40，批次4）**：`api_server/wb_responses.rs`（7 单测）——请求投影 instructions→system、input items（message/function_call/function_call_output/reasoning 跳过）→ messages、tools 平铺→function 包裹、max_output_tokens→max_tokens、reasoning.effort→reasoning_effort；流式投影在 `wb_sse.rs` `Protocol::Responses` 分支（response.created → output_item.added → output_text.delta → output_item.done → response.completed，错误→response.failed，无 [DONE] 帧）。Codex CLI `~/.codex/config.toml` 直配：`model_provider` 的 `base_url = "http://127.0.0.1:<port>/v1"`、`wire_api = "responses"`。脱敏沿用全局 wb_sanitize 开关与既有审核退回管线。
 - **区域路由（F-36，批次4）**：token domain 含 `.workbuddy.ai` → Global 账号，chat 全走 `www.workbuddy.ai`（wb_upstream 双域名常量 + 单测）；billing/积分（credits 三件套）、签到/成长中心（checkin 脚本 `_urls()`）、活动接口（activity_info）、官方用量（usage_official）均按账号区域切换域名；plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
 - **批次5 网关增强（T5.2~T5.6/T5.8）**：

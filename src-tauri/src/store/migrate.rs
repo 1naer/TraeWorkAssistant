@@ -7,6 +7,9 @@
 //!
 //! 全部条目处理完且零失败才置 `PRAGMA user_version = 1`；明细落
 //! `data/backup/migration_manifest.json`。失败不阻断启动（返回摘要由调用方写日志）。
+//!
+//! 另含 TraeWork 双应用合并存量迁移（`migrate_traework_merge`，独立 kv 标记幂等，
+//! Trae 运行中自动跳过下次重试；见 docs/completed/Trae双应用合并适配调整方案.md §5.8）。
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -749,6 +752,281 @@ fn import_sticky_bindings_value(store: &Store, v: &Value) -> Result<(), String> 
     docs::sticky_bindings_save(store, v)
 }
 
+// ── TraeWork 双应用合并存量迁移（方案 §5.8）─────────────────────────────────
+
+const TRAEWORK_MERGE_MARKER: &str = "traework_merge_migrated";
+
+/// 升级引导报告 kv 键：迁移完成后写入（前端首启弹「升级引导」展示迁移流程与结果，
+/// 关闭后由独立「已读」标记不再展示，报告本身保留）
+const TRAEWORK_MERGE_REPORT: &str = "traework_merge_report";
+
+/// TraeWork 合并迁移升级引导报告（迁移明细 + 槽组计数，供前端升级引导弹窗）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TraeWorkMigrationReport {
+    pub finished_at_ms: i64,
+    /// 迁移明细条目（settings 步 note + 快照池步摘要，用户可读文案）
+    pub notes: Vec<String>,
+    /// 整组迁入 profiles_trae 的组数
+    pub moved_groups: usize,
+    /// 同名冲突整组保留至 profiles_trae_work_legacy 的组数
+    pub legacy_groups: usize,
+}
+
+/// 双应用合并存量迁移入口（每次启动调用）：
+/// ① settings kv `trae_path` 退役（可承接为 `trae_cn_path`）；
+/// ② 旧快照池 `data/profiles` 按槽整组搬迁至 `data/profiles_trae`（目标主槽已存在
+///    → 整组入 `data/profiles_trae_work_legacy` 保留，绝不覆盖）；
+/// ③ kv 标记 `traework_merge_migrated` 幂等；④ 真正空了的旧池目录删除。
+///
+/// 安全语义：Trae 客户端运行中则跳过（有存量才提示，下次启动重试）；移动而非复制，
+/// 任一步失败即中止并保留原状，下次启动重试。返回摘要由调用方写日志；无事发生返回 None。
+pub fn migrate_traework_merge(data_dir: &Path) -> Option<String> {
+    let store = db(data_dir);
+    if store.kv_get::<bool>(TRAEWORK_MERGE_MARKER) {
+        return None;
+    }
+    if crate::switcher::proc::any_running(&["Trae CN", "TRAE SOLO CN"]) {
+        // 运行中：仅当确有存量才提示跳过，否则静默（下次启动廉价复查，不置标记）。
+        // 旧 TRAE SOLO CN 一并检测：用户尚未卸载旧客户端且正在运行时同样暂缓搬迁，
+        // 保守对齐 §5.8「复用优雅关闭语义」
+        if traework_merge_pending(&store, data_dir) {
+            return Some("TraeWork 合并迁移跳过：Trae 客户端正在运行，将在下次启动重试".into());
+        }
+        return None;
+    }
+    migrate_traework_merge_inner(&store, data_dir)
+}
+
+/// 迁移主体（无进程检测，供单测直调）：settings 步 + 快照池步，全部成功才置标记。
+fn migrate_traework_merge_inner(store: &Store, data_dir: &Path) -> Option<String> {
+    let mut notes: Vec<String> = Vec::new();
+    match migrate_traework_settings(store) {
+        Ok(Some(note)) => notes.push(note),
+        Ok(None) => {}
+        Err(e) => {
+            return Some(format!(
+                "TraeWork 合并迁移中止（settings）：{e}；原状保留，下次启动重试"
+            ))
+        }
+    }
+    let (moved_groups, legacy_groups) = match migrate_traework_pool(data_dir) {
+        Ok((moved, legacy)) => {
+            if moved > 0 || legacy > 0 {
+                notes.push(format!("快照槽迁入 profiles_trae {moved} 组、legacy 保留 {legacy} 组"))
+            }
+            (moved, legacy)
+        }
+        Err(e) => {
+            return Some(format!(
+                "TraeWork 合并迁移中止（快照池）：{e}；原状保留，下次启动重试"
+            ))
+        }
+    };
+    // 升级引导报告（仅完成时落，中止/跳过不落——下次启动重试成功后才有）：前端首启
+    // 弹窗展示迁移流程与结果。写失败仅无引导，不影响迁移结果
+    if !notes.is_empty() {
+        let _ = store.kv_set(
+            TRAEWORK_MERGE_REPORT,
+            &TraeWorkMigrationReport {
+                finished_at_ms: chrono::Utc::now().timestamp_millis(),
+                notes: notes.clone(),
+                moved_groups,
+                legacy_groups,
+            },
+        );
+    }
+    // 标记写失败无害：下次重跑两步均为空操作后补置
+    let _ = store.kv_set(TRAEWORK_MERGE_MARKER, &true);
+    if notes.is_empty() {
+        return None;
+    }
+    Some(format!("TraeWork 合并迁移完成：{}", notes.join("；")))
+}
+
+/// Trae 运行中时的存量探测：settings 含 `trae_path` 键（读取/解析失败按有存量处理）
+/// 或旧快照池非空 → true
+fn traework_merge_pending(store: &Store, data_dir: &Path) -> bool {
+    match store.kv_get_raw_checked("app_settings") {
+        Ok(Some(raw)) => {
+            if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(&raw) {
+                if o.contains_key("trae_path") {
+                    return true;
+                }
+            }
+        }
+        // 读失败（数据库异常等）fail-closed 按有存量处理，等下轮重试；
+        // Ok(None)（全新安装无 app_settings）不算存量，继续看旧池目录
+        Err(_) => return true,
+        Ok(None) => {}
+    }
+    match std::fs::read_dir(data_dir.join("data").join("profiles")) {
+        Ok(mut rd) => rd.next().is_some(),
+        Err(_) => false,
+    }
+}
+
+/// settings 步：从 kv `app_settings` 原文移除 `trae_path`；若其非空、`trae_cn_path`
+/// 为空/缺失且路径存在为文件 → 承接为 `trae_cn_path`（绝不覆盖既有值）。
+/// 键缺失或 app_settings 非对象 → Ok(None)（不动）。回写失败上抛，原值保留。
+fn migrate_traework_settings(store: &Store) -> Result<Option<String>, String> {
+    let raw = match store.kv_get_raw_checked("app_settings")? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let mut obj = match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(o)) => o,
+        _ => return Ok(None),
+    };
+    let old = obj.remove("trae_path");
+    if old.is_none() {
+        return Ok(None);
+    }
+    let mut note = "trae_path 键已删除".to_string();
+    if let Some(p) = old.unwrap().as_str() {
+        if !p.trim().is_empty() {
+            let cn = obj.get("trae_cn_path").and_then(|v| v.as_str()).unwrap_or("");
+            if cn.trim().is_empty() && Path::new(p).is_file() {
+                // 承接守卫：trae_path 是退役 Trae Work 的专属键，其值可能指向未卸载的
+                // 旧客户端（TRAE SOLO CN.exe）——承接会让「打开 Trae」静默拉起旧 exe，
+                // 且 app_locate 一级命中压制自动探测。按文件名判 solo 拒绝承接，
+                // 留空走 env.rs 自动探测（默认路径/注册表/进程）
+                let fname = Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if fname.contains("solo") {
+                    note = "trae_path 指向已退役的 Trae Solo 客户端，已丢弃（不承接，走自动探测）".to_string();
+                } else {
+                    obj.insert("trae_cn_path".into(), json!(p));
+                    note = "trae_path 已承接为 trae_cn_path（原键删除）".to_string();
+                }
+            }
+        }
+    }
+    let out =
+        serde_json::to_string(&Value::Object(obj)).map_err(|e| format!("序列化失败: {e}"))?;
+    store.kv_set_raw("app_settings", &out)?;
+    Ok(Some(note))
+}
+
+/// 快照池步：`data/profiles` 内按槽 base 名整组搬迁（主槽目录 + `<base>.meta.json`
+/// sidecar + `<base>.bak`/`.bak2` 代际）；`current_account*` 运行时标记与杂散文件
+/// 留原池。目标主槽已存在且组内仍含主槽条目（新旧同 uid 冲突）→ 整组入
+/// `profiles_trae_work_legacy`；否则入 `profiles_trae`（含上轮部分成功后仅剩
+/// sidecar/代际的补齐场景）并 best-effort 写入 sidecar `source: TraeWork-migrated`。
+/// 返回 (迁入组数, legacy 组数)。
+fn migrate_traework_pool(data_dir: &Path) -> Result<(usize, usize), String> {
+    let old_pool = data_dir.join("data").join("profiles");
+    if !old_pool.exists() {
+        return Ok((0, 0));
+    }
+    let new_pool = data_dir.join("data").join("profiles_trae");
+    let legacy_pool = data_dir.join("data").join("profiles_trae_work_legacy");
+    let mut groups: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = Default::default();
+    let rd = std::fs::read_dir(&old_pool).map_err(|e| format!("读取旧快照池失败: {e}"))?;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("current_account") {
+            continue; // 运行时标记留旧池，不属于任何槽
+        }
+        if p.is_dir() || name.ends_with(".meta.json") {
+            groups.entry(slot_base_name(&name)).or_default().push(p);
+        }
+        // 其他杂散文件留原池
+    }
+    let mut moved = 0usize;
+    let mut legacy = 0usize;
+    for (base, items) in groups {
+        // 冲突判定：① 目标主槽存在且本次组内仍含主槽条目（新旧同 uid 真冲突）→ 整组入
+        // legacy。② legacy 池已存在该 base 主槽（上轮已判冲突整组入 legacy 后，本轮
+        // 只剩 sidecar/代际残留）→ 剩余条目必须继续入 legacy：若按「补齐」入新池会
+        // 把同组拆散、孤儿 sidecar 散落新池根部。③ 主槽不在 items 且 legacy 无主槽
+        // （上轮已迁入新池）才是真正的补齐：剩余 sidecar/代际迁入新池，
+        // rename_no_clobber 防覆盖
+        let has_main = items
+            .iter()
+            .any(|p| p.file_name().map(|n| n.to_string_lossy() == base).unwrap_or(false));
+        let conflict = (has_main && new_pool.join(&base).exists())
+            || legacy_pool.join(&base).exists();
+        let dst_root = if conflict { &legacy_pool } else { &new_pool };
+        std::fs::create_dir_all(dst_root).map_err(|e| format!("创建目标池失败: {e}"))?;
+        for src in &items {
+            let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+            rename_no_clobber(src, &dst_root.join(&name))
+                .map_err(|e| format!("搬迁 {name} 失败: {e}"))?;
+        }
+        if conflict {
+            legacy += 1;
+        } else {
+            moved += 1;
+            // 身份标注 best-effort：失败不影响迁移结果
+            annotate_traework_source(&new_pool.join(&base));
+        }
+    }
+    // 仅剩运行时标记等杂项时保留；真正空了则删除空目录
+    try_remove_empty_pool(&old_pool);
+    Ok((moved, legacy))
+}
+
+/// 槽 base 名：依次剥 `.meta.json` sidecar 与 `.bak2`/`.bak` 代际后缀
+fn slot_base_name(name: &str) -> String {
+    let mut s = name.to_string();
+    for suf in [".meta.json", ".bak2", ".bak"] {
+        if let Some(stripped) = s.strip_suffix(suf) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+    s
+}
+
+/// 移动且绝不覆盖：目标已存在（重试残留等）时加时间戳后缀
+fn rename_no_clobber(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.exists() {
+        let stamped = format!(
+            "{}_{}",
+            dst.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
+        return std::fs::rename(src, dst.with_file_name(stamped));
+    }
+    std::fs::rename(src, dst)
+}
+
+/// 槽身份标注（best-effort）：已有 `meta.json` 时以原子替换写入
+/// `source: TraeWork-migrated`（临时文件 + rename，防写盘中断损坏 meta）；
+/// 槽内本无 meta.json 则跳过，不凭空创建
+fn annotate_traework_source(slot_dir: &Path) {
+    let meta = slot_dir.join("meta.json");
+    let Ok(t) = std::fs::read_to_string(&meta) else {
+        return;
+    };
+    let mut v = serde_json::from_str::<Value>(&t).unwrap_or_else(|_| json!({}));
+    if !v.is_object() {
+        v = json!({});
+    }
+    v["source"] = json!("TraeWork-migrated");
+    if let Ok(s) = serde_json::to_string(&v) {
+        let tmp = slot_dir.join("meta.json.aiwork-tmp");
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, &meta);
+        }
+    }
+}
+
+/// 旧池清理：目录不存在或非空时不动；确为空目录才删除
+fn try_remove_empty_pool(pool: &Path) {
+    match std::fs::read_dir(pool) {
+        Ok(mut rd) => {
+            if rd.next().is_none() {
+                let _ = std::fs::remove_dir(pool);
+            }
+        }
+        Err(_) => {}
+    }
+}
+
 // ── 工具 ─────────────────────────────────────────────────────────────────────
 
 fn parse_then(
@@ -1087,6 +1365,221 @@ mod tests {
 
         // 幂等：二次调用跳过
         assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写一个快照槽（`<name>/meta.json`，含 uid/savedAt）
+    fn write_slot(pool: &Path, name: &str, uid: &str) {
+        let dir = pool.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = json!({ "uid": uid, "savedAt": 1_700_000_000_000i64 });
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn traework_merge_moves_slots_and_migrates_settings() {
+        let dir = tmp_dir("traework_merge");
+        let store = db(&dir);
+
+        // settings 承接：trae_path 指向真实文件、无 trae_cn_path → 承接
+        let fake_exe = dir.join("fake").join("Trae CN.exe");
+        std::fs::create_dir_all(fake_exe.parent().unwrap()).unwrap();
+        std::fs::write(&fake_exe, "exe").unwrap();
+        store
+            .kv_set_raw(
+                "app_settings",
+                &json!({ "trae_path": fake_exe.to_string_lossy(), "theme": "dark" }).to_string(),
+            )
+            .unwrap();
+
+        // 旧池：u1 完整组（主槽 + 代际 + sidecar）、u2 冲突组、运行时标记
+        let old_pool = dir.join("data").join("profiles");
+        write_slot(&old_pool, "u1", "u1");
+        std::fs::create_dir_all(old_pool.join("u1.bak")).unwrap();
+        std::fs::write(old_pool.join("u1.bak").join("snapshot.dat"), "x").unwrap();
+        std::fs::write(old_pool.join("u1.meta.json"), r#"{"uid":"u1"}"#).unwrap();
+        write_slot(&old_pool, "u2", "u2");
+        std::fs::create_dir_all(old_pool.join("u2.bak2")).unwrap();
+        std::fs::write(old_pool.join("u2.meta.json"), r#"{"uid":"u2"}"#).unwrap();
+        std::fs::write(old_pool.join("current_account.txt"), "u2").unwrap();
+        // 新池预置 u2 主槽（不同身份）→ u2 冲突
+        write_slot(&dir.join("data").join("profiles_trae"), "u2", "u2new");
+
+        let summary = migrate_traework_merge_inner(&store, &dir).unwrap();
+        assert!(summary.contains("trae_cn_path"), "settings 承接摘要: {summary}");
+        assert!(summary.contains("1 组"), "搬迁计数摘要: {summary}");
+
+        // settings：trae_path 删除、trae_cn_path 承接、其余键保留
+        let raw = store.kv_get_raw("app_settings").unwrap();
+        assert!(!raw.contains("trae_path"));
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["trae_cn_path"], json!(fake_exe.to_string_lossy()));
+        assert_eq!(v["theme"], json!("dark"));
+
+        // u1 组整组入 profiles_trae：主槽 + 代际 + sidecar，meta 含身份标注且 uid 保留
+        let new_pool = dir.join("data").join("profiles_trae");
+        assert!(new_pool.join("u1").join("meta.json").exists());
+        assert!(new_pool.join("u1.bak").join("snapshot.dat").exists());
+        assert!(new_pool.join("u1.meta.json").exists());
+        let m1: Value =
+            serde_json::from_str(&std::fs::read_to_string(new_pool.join("u1").join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(m1["uid"], json!("u1"));
+        assert_eq!(m1["source"], json!("TraeWork-migrated"));
+        // u2 冲突：整组入 legacy，目标主槽不被覆盖
+        let legacy = dir.join("data").join("profiles_trae_work_legacy");
+        assert!(legacy.join("u2").join("meta.json").exists());
+        assert!(legacy.join("u2.bak2").exists());
+        assert!(legacy.join("u2.meta.json").exists());
+        let m_l: Value =
+            serde_json::from_str(&std::fs::read_to_string(legacy.join("u2").join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(m_l["uid"], json!("u2"), "旧槽整组入 legacy 且身份保留");
+        let m222: Value = serde_json::from_str(
+            &std::fs::read_to_string(new_pool.join("u2").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m222["uid"], json!("u2new"), "冲突组绝不覆盖既有主槽");
+        assert!(!new_pool.join("u2.bak2").exists(), "旧组代际未混入新池");
+        // 运行时标记留旧池 → 旧池非空不删
+        assert!(old_pool.join("current_account.txt").exists());
+        assert!(old_pool.exists());
+
+        // 升级引导报告：完成时落 kv，计数与本次搬迁一致、明细非空
+        let report: Value = serde_json::from_str(&store.kv_get_raw("traework_merge_report").unwrap())
+            .unwrap();
+        assert_eq!(report["moved_groups"], json!(1));
+        assert_eq!(report["legacy_groups"], json!(1));
+        assert!(!report["notes"].as_array().unwrap().is_empty());
+        assert!(report["finished_at_ms"].as_i64().unwrap() > 0);
+
+        // 幂等：二次调用跳过
+        assert!(migrate_traework_merge_inner(&store, &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn traework_merge_settings_edge_and_empty_pool_cleanup() {
+        // 场景 A：trae_cn_path 已有值 → 即使 trae_path 指向真实文件也不覆盖
+        let dir_a = tmp_dir("traework_edge_a");
+        let store_a = db(&dir_a);
+        let fake_exe = dir_a.join("fake").join("Trae CN.exe");
+        std::fs::create_dir_all(fake_exe.parent().unwrap()).unwrap();
+        std::fs::write(&fake_exe, "exe").unwrap();
+        store_a
+            .kv_set_raw(
+                "app_settings",
+                &json!({
+                    "trae_path": fake_exe.to_string_lossy(),
+                    "trae_cn_path": "C:/already/exe"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let s = migrate_traework_merge_inner(&store_a, &dir_a).unwrap();
+        assert!(!s.contains("承接"), "已有值不覆盖: {s}");
+        let v: Value =
+            serde_json::from_str(&store_a.kv_get_raw("app_settings").unwrap()).unwrap();
+        assert_eq!(v["trae_cn_path"], json!("C:/already/exe"), "既有 trae_cn_path 保留");
+        assert!(v.get("trae_path").is_none(), "trae_path 键删除");
+        let _ = std::fs::remove_dir_all(&dir_a);
+
+        // 场景 B：trae_path 指向不存在路径 → 不承接仅删键；空池搬迁后目录删除；幂等
+        let dir_b = tmp_dir("traework_edge_b");
+        let store_b = db(&dir_b);
+        store_b
+            .kv_set_raw(
+                "app_settings",
+                &json!({ "trae_path": "C:/no/such/Trae CN.exe" }).to_string(),
+            )
+            .unwrap();
+        write_slot(&dir_b.join("data").join("profiles"), "u3", "u3");
+        let s = migrate_traework_merge_inner(&store_b, &dir_b).unwrap();
+        assert!(!s.contains("承接"), "无效路径不承接: {s}");
+        let v: Value =
+            serde_json::from_str(&store_b.kv_get_raw("app_settings").unwrap()).unwrap();
+        assert!(v.get("trae_cn_path").is_none());
+        assert!(v.get("trae_path").is_none());
+        // 旧池仅剩 u3（无运行时标记）→ 搬走后空目录删除
+        assert!(!dir_b.join("data").join("profiles").exists(), "空旧池应删除");
+        assert!(dir_b.join("data").join("profiles_trae").join("u3").exists());
+        // 幂等：二次调用跳过
+        assert!(migrate_traework_merge_inner(&store_b, &dir_b).is_none());
+        let _ = std::fs::remove_dir_all(&dir_b);
+
+        // 全新安装：无 trae_path、无旧池 → 两次调用均 None，且不落升级引导报告
+        let dir_c = tmp_dir("traework_fresh");
+        let store_c = db(&dir_c);
+        assert!(migrate_traework_merge_inner(&store_c, &dir_c).is_none());
+        assert!(migrate_traework_merge_inner(&store_c, &dir_c).is_none());
+        assert!(store_c.kv_get_raw("traework_merge_report").is_none());
+        let _ = std::fs::remove_dir_all(&dir_c);
+    }
+
+    #[test]
+    fn traework_merge_retry_moves_remaining_entries_to_new_pool() {
+        // 上轮部分成功（主槽已迁走）后重试：剩余 sidecar 应补齐入新池而非误入 legacy
+        let dir = tmp_dir("traework_retry");
+        let store = db(&dir);
+        let old_pool = dir.join("data").join("profiles");
+        let new_pool = dir.join("data").join("profiles_trae");
+        write_slot(&old_pool, "u1", "u1");
+        std::fs::write(old_pool.join("u1.meta.json"), r#"{"uid":"u1"}"#).unwrap();
+        // 模拟上轮部分失败：主槽已手动迁到新池，sidecar 留在旧池
+        std::fs::create_dir_all(&new_pool).unwrap();
+        std::fs::rename(old_pool.join("u1"), new_pool.join("u1")).unwrap();
+
+        let summary = migrate_traework_merge_inner(&store, &dir).unwrap();
+        assert!(
+            summary.contains("profiles_trae 1 组"),
+            "补齐应计入迁入而非 legacy: {summary}"
+        );
+
+        // sidecar 补齐入新池，不拆散入 legacy
+        assert!(new_pool.join("u1.meta.json").exists(), "sidecar 应补齐入新池");
+        assert!(
+            !dir.join("data").join("profiles_trae_work_legacy").exists(),
+            "补齐场景不得整组入 legacy"
+        );
+        // 主槽身份保留且补齐路径仍走迁入分支（含身份标注）
+        let m1: Value = serde_json::from_str(
+            &std::fs::read_to_string(new_pool.join("u1").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m1["uid"], json!("u1"));
+        assert_eq!(m1["source"], json!("TraeWork-migrated"));
+        // 旧池已空 → 删除
+        assert!(!old_pool.exists(), "补齐完成后空旧池应删除");
+        // 幂等：二次调用跳过
+        assert!(migrate_traework_merge_inner(&store, &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn traework_merge_settings_rejects_solo_client_path() {
+        // trae_path 指向真实存在但为退役 Solo 客户端的文件 → 拒绝承接、仅删键
+        let dir = tmp_dir("traework_solo_guard");
+        let store = db(&dir);
+        let solo_exe = dir.join("fake").join("TRAE SOLO CN.exe");
+        std::fs::create_dir_all(solo_exe.parent().unwrap()).unwrap();
+        std::fs::write(&solo_exe, "exe").unwrap();
+        store
+            .kv_set_raw(
+                "app_settings",
+                &json!({ "trae_path": solo_exe.to_string_lossy(), "theme": "dark" }).to_string(),
+            )
+            .unwrap();
+
+        let summary = migrate_traework_merge_inner(&store, &dir).unwrap();
+        assert!(summary.contains("丢弃"), "Solo 路径应拒绝承接: {summary}");
+
+        let v: Value =
+            serde_json::from_str(&store.kv_get_raw("app_settings").unwrap()).unwrap();
+        assert!(v.get("trae_cn_path").is_none(), "不得承接 Solo 路径为 trae_cn_path");
+        assert!(v.get("trae_path").is_none(), "trae_path 键仍应删除");
+        assert_eq!(v["theme"], json!("dark"), "其余设置保留");
+        // 幂等：二次调用跳过
+        assert!(migrate_traework_merge_inner(&store, &dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

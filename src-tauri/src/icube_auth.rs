@@ -104,12 +104,12 @@ pub struct DeviceCredential {
     pub private_key_pem: String,
     pub machine_id: String,
     pub app_version: String,
-    /// 来源客户端（Trae CN / TRAE SOLO CN 等），诊断日志用
+    /// 来源客户端（恒 Trae CN，双应用合并后唯一客户端），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
 }
 
-/// 扫描本机各 Trae 客户端 storage.json 提取设备凭证（多个客户端各有一套）。
+/// 扫描本机 Trae 客户端（双应用合并后唯一客户端）storage.json 提取设备凭证。
 /// 找不到/解密失败返回空表——DeviceProof 不可用时调用方回落无 proof 变体。
 pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     let Some(appdata) = std::env::var("APPDATA").ok() else {
@@ -119,7 +119,7 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for app in ["Trae CN", "TRAE SOLO CN", "Trae", "Trae Work"] {
+    for app in ["Trae CN"] {
         let path = std::path::PathBuf::from(&appdata)
             .join(app)
             .join("User")

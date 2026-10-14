@@ -35,9 +35,9 @@ Bridge        Tauri Commands（src-tauri/src/commands/，注册表见 main.rs `g
  ├─ env / cert / proxy        环境检测、CA 证书、MITM 代理生命周期
  ├─ accounts / oauth / jwt    账号 CRUD、OAuth 登录、JWT 解析与刷新
  ├─ checkin / misc / process  签到编排、schtasks（chcp 65001）、三级进程关闭
- ├─ switch / profile          登录态切换、快照管理（target_app 七应用参数化）
+ ├─ switch / profile          登录态切换、快照管理（target_app 六应用参数化）
  ├─ doubao                    豆包账号池 / 凭证 / 保活 / 额度 / 对话备份导出
- ├─ trae_apps                 双应用账号自动发现（dc id 与 Cloud-IDE id 双体系）
+ ├─ trae_apps                 本机 Trae 账号自动发现（dc id 与 Cloud-IDE id 双体系）
  ├─ qoder/                    Qoder 命令域（F-80）：accounts（PAT 导入）/ oauth（设备流登录）
  │                            / ide_store（IDE·Work 登录态扫描）/ checkin / credits / groups
  │                            / data_io（AES-256-GCM 导入导出）/ env_reset / cli_status
@@ -158,8 +158,8 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 
 ### 5.3 `switcher/`（登录态切换器，原 PS 切换桥 Rust 化）
 
-- Action：`Switch / SaveCurrentLogin / ResetMachineId / ResetDeviceIds / BackupCurrent / RestoreOnly / KeepAlive`；入参 `target_app: TraeWork|Trae|Doubao|WorkBuddy|CodeBuddy|Qoder|QoderWork`（七应用档案表，`switcher/mod.rs::TargetApp`，未知值回退 TraeWork）、`proxy_port`（>0 注入 `--proxy-server`）、`include_indexeddb`、`expected_current_uid`（防误覆盖守卫）、`machine_id_override`（F-80 Qoder 专用）。
-- icube 布局（Trae 双应用 + Qoder IDE）：精准备份核心文件清单由档案表 `icube_items` 驱动（Trae 系 15 项 / Qoder 用 `QODER_IDE_ITEMS`，数据目录实测 `%APPDATA%\QoderCN`）；chromium 布局（豆包）：白名单目录快照 + `snapshot_meta.json`（schemaVersion=1）+ 完整性三层校验 + `.bak` 单代回滚 + ExpectedCurrentUid 防误覆盖守卫；authfile 布局（WorkBuddy/CodeBuddy）：L1 auth 文件 + L2 storage/user-* + L3（仅 CodeBuddy）vscdb 登录真源（含 -wal/-shm 边车）；**electron_root 布局（Qoder Work，2026-10-02 实测新增）**：数据目录 `%APPDATA%\com.qodercn.app.stable` 根级 Network/Cookies + Local State + Preferences 会话快照，与豆包多 Profile 布局不同构故独立管线，`graceful_wait_secs=8` 等 leveldb 落盘；进程名 `Qoder CN` 与 IDE 壳同名 → **精确匹配只停 Work 本体**（wildcard 会误杀 Qoder CN IDE），与 Qoder IDE 为两套独立登录态。
+- Action：`Switch / SaveCurrentLogin / ResetMachineId / ResetDeviceIds / BackupCurrent / RestoreOnly / KeepAlive`；入参 `target_app: Trae|Doubao|WorkBuddy|CodeBuddy|Qoder|QoderWork`（六应用档案表，`switcher/mod.rs::TargetApp`，未知值直接报错，TraeWork 别名已随双应用合并退役，存量持久化字符串由 store 迁移改写）、`proxy_port`（>0 注入 `--proxy-server`）、`include_indexeddb`、`expected_current_uid`（防误覆盖守卫）、`machine_id_override`（F-80 Qoder 专用）。
+- icube 布局（Trae + Qoder IDE）：精准备份核心文件清单由档案表 `icube_items` 驱动（Trae 系 15 项 / Qoder 用 `QODER_IDE_ITEMS`，数据目录实测 `%APPDATA%\QoderCN`）；chromium 布局（豆包）：白名单目录快照 + `snapshot_meta.json`（schemaVersion=1）+ 完整性三层校验 + `.bak` 单代回滚 + ExpectedCurrentUid 防误覆盖守卫；authfile 布局（WorkBuddy/CodeBuddy）：L1 auth 文件 + L2 storage/user-* + L3（仅 CodeBuddy）vscdb 登录真源（含 -wal/-shm 边车）；**electron_root 布局（Qoder Work，2026-10-02 实测新增）**：数据目录 `%APPDATA%\com.qodercn.app.stable` 根级 Network/Cookies + Local State + Preferences 会话快照，与豆包多 Profile 布局不同构故独立管线，`graceful_wait_secs=8` 等 leveldb 落盘；进程名 `Qoder CN` 与 IDE 壳同名 → **精确匹配只停 Work 本体**（wildcard 会误杀 Qoder CN IDE），与 Qoder IDE 为两套独立登录态。
 - **Qoder 设备指纹覆写（F-80 §5.10.2）**：`switch_profile` 在 `is_qoder` 分支从账号池取 `device_profile.machine_id`（`commands/qoder/common.rs::machine_id_of`）→ `Session.machine_id_override` → 切号/恢复成功后、启动前 `apply_fingerprint_override` → `switcher/machine.rs::apply_qoder_fingerprint` 写三处：① `machineid` 文件（无 BOM 32-hex）② `storage.json` 的 `telemetry.machineId / sqmId / devDeviceId` ③ `state.vscdb ItemTable` 的 `storage.serviceMachineId`。指纹由 `tasks/qoder_device.rs::QoderDeviceProfile` 在**入池时生成一次、永不轮换**（`machine_id = sha256(uuid4)[..32]`、`device_id/umid = uuid4`、随机 `machine_token`）；`merge_device_profile` 三级优先：真实捕获 > 绑定指纹 + 现场随机 machine_token > 不注入；`ensure_pool_profiles` 持池锁惰性回填。
 - 当前登录账号探测：icube 布局以命令层预探测为唯一可靠源（Qoder 保存链经 vscdb `secret://userInfo` 解密传入；池 id 为 `qd-<hex>` 形态不可混用 Trae uid），空才回退日志探测（仅 Trae 系）；QoderWork 由 `live_work_account_id` 解密 `auth.v1.dat` 预探测。
 - 保存前预检登录会话（Cookie 存在性检测），未登录态拒绝入槽；全局互斥拒绝并发切换。
@@ -180,7 +180,7 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 
 - 鉴权：API Keys 列表（T2/T15），`Authorization: Bearer` + `x-api-key` 双风格；未配置启用 Key 时不鉴权；超日配额 429；`ck_` 子 Key 支持 `allowed_accounts` 上游白名单 + `schedule_mode`（expire_first/dedicated）+ 按日统计。
 - 请求侧统一转 OpenAI 内部格式复用池调度；响应侧按协议分别输出；WB 上游 reasoning_content 已透传（Anthropic 侧映射 thinking block）。
-- 账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务（通用积分 208）。
+- 账号池 app 无关：Trae 账号入池即被同一网关服务（通用积分 208）。
 - **Qoder 池（v3.7.0）**：命中 Qoder 源模型时由 `qoder_route.rs` 执行，上游为 Qoder agent 网关（非 OpenAI 兼容协议，需 COSY 签名 + 请求体加密 + SSE 信封翻译，详见 §5.6 与附录 C）。
 
 ### 5.5 四池调度与统一模型目录（v3.3.x 起，v3.7.0 扩为四池）

@@ -2,7 +2,7 @@ import { CheckCircle2, Loader2, Plus, RefreshCw } from 'lucide-react';
 import { Badge, Modal } from '../../components/ui';
 import type { DiscoveredAccount } from '../../types';
 
-/** F-08 自动发现弹框：展示本机 Trae Work / Trae 登录账号，一键加入账号池 */
+/** F-08 自动发现弹框：展示本机 Trae 登录账号，一键加入账号池 */
 export function DiscoverModal({
   open,
   scanning,
@@ -20,16 +20,16 @@ export function DiscoverModal({
   onAdd: (d: DiscoveredAccount) => void;
   onRescan: () => void;
 }) {
-  const apps = ['TraeWork', 'Trae'] as const;
+  const apps = ['Trae'] as const;
   const notInPool = discovered?.filter((d) => !d.in_pool).length ?? 0;
   return (
     <Modal open={open} onClose={onClose} title="扫描本机登录账号" size="lg">
       <div className="space-y-3 text-sm">
         <p className="text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
-          扫描本机 Trae Work（TRAE SOLO CN）与 Trae 的 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code> 与
+          扫描本机 Trae 客户端的 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code> 与
           {' '}<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">state.vscdb</code>，
           识别当前已登录账号（Cloud-IDE uid，与账号池同体系）。未入池的账号可一键加入
-          （先以占位形式入库，之后启动代理打开对应应用时，JWT 会被自动捕获回填）。
+          （先以占位形式入库，之后启动代理打开 Trae 时，JWT 会被自动捕获回填）。
         </p>
 
         {scanning && (
@@ -40,7 +40,7 @@ export function DiscoverModal({
 
         {!scanning && discovered && discovered.length === 0 && (
           <div className="py-4 text-center text-sm text-slate-400">
-            未发现已登录账号（两个应用均未登录或未安装）
+            未发现已登录账号（Trae 未登录或未安装）
           </div>
         )}
 

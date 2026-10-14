@@ -129,7 +129,7 @@ pub fn running_exe_exact(names: &[&str]) -> Option<std::path::PathBuf> {
 }
 
 /// Stop-Trae 对译：三级关闭。
-/// 自身/父进程排除逻辑不再需要：精确映像名匹配（TRAE SOLO CN.exe 等）永不命中
+/// 自身/父进程排除逻辑不再需要：精确映像名匹配（Trae CN.exe 等）永不命中
 /// ai-work-assistant.exe；旧版进程名「Trae Work 助手」的兼容排除为死代码，删除
 ///（8.2 #2 有意差异）。
 pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), String> {
@@ -401,12 +401,9 @@ mod tests {
         assert!(name_matches(&p, "DOUBAO.EXE"));
         assert!(name_matches(&p, "Doubao"));
         assert!(!name_matches(&p, "DoubaoUpdate.exe"));
-        let tw = prof(TargetApp::TraeWork);
-        assert!(name_matches(&tw, "TRAE SOLO CN.exe"));
-        assert!(name_matches(&tw, "Trae.exe"));
-        // Trae 档案的白名单不含 Trae CN（防串台）
         let trae = prof(TargetApp::Trae);
         assert!(name_matches(&trae, "Trae CN.exe"));
+        // 白名单外（TRAE SOLO CN 随 Trae Work 退役）拒绝
         assert!(!name_matches(&trae, "TRAE SOLO CN.exe"));
         // 自身应用不应命中任何白名单
         let cb = prof(TargetApp::CodeBuddy);
@@ -416,9 +413,8 @@ mod tests {
     #[test]
     fn list_procs_不误杀前缀相似进程() {
         // 本测试进程名（ai-work-assistant 或其测试变体）不在任何白名单内；
-        // TraeWork 白名单含 "Trae"——若按前缀匹配会误命中 ai-work-assistant，
-        // 精确匹配则不会
-        let p = prof(TargetApp::TraeWork);
+        // Trae 白名单 "Trae CN" 与其无交集——精确映像名匹配永不误命中
+        let p = prof(TargetApp::Trae);
         let procs = list_procs(&p);
         // 自身测试进程绝不应命中任何档案白名单
         assert!(procs.iter().all(|(_, exe)| {

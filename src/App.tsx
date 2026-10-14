@@ -28,6 +28,7 @@ import QoderCheckin from './pages/qoder/QoderCheckin';
 import QoderApiService from './pages/qoder/QoderApiService';
 import QoderSettings from './pages/qoder/QoderSettings';
 import ApiManagerModal from './components/api/ApiManagerModal';
+import TraeWorkMigrationGuide from './components/TraeWorkMigrationGuide';
 
 function renderView(view: string) {
   switch (view) {
@@ -132,6 +133,8 @@ export default function App() {
       <Toaster />
       {/* 全局 API 管理弹窗（任意 activeApp 视图均可打开，unified-api-gateway-design §5.2） */}
       <ApiManagerModal />
+      {/* Trae 双应用合并升级引导（首启有迁移报告时弹出，关闭落标记后不再展示） */}
+      <TraeWorkMigrationGuide />
     </div>
   );
 }

@@ -49,10 +49,9 @@ function GatewayButton() {
   );
 }
 
-/** Trae 专区顶栏：双应用安装状态 + 证书/代理/API 网关 + 打开应用 */
+/** Trae 专区顶栏：应用安装状态 + 证书/代理/API 网关 + 打开应用 */
 function TraeTopBar() {
   const env = useAppStore((s) => s.env);
-  const envCn = useAppStore((s) => s.envCn);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const proxy = useAppStore((s) => s.proxy);
   const apiStatus = useAppStore((s) => s.apiStatus);
@@ -60,31 +59,19 @@ function TraeTopBar() {
   const stopProxy = useAppStore((s) => s.stopProxy);
 
   const openTrae = async () => {
-    await useAppStore.getState().openTraeWithProxy();
-  };
-  const openTraeCn = async () => {
-    await useAppStore.getState().openTraeCn();
+    await useAppStore.getState().openTrae();
   };
 
   return (
     <>
       <div className="flex items-center gap-2">
-        {envCn?.installed ? (
-          <Badge tone="green" title={envCn.version ? `Trae 当前版本：v${envCn.version}` : '未检测到 Trae 版本号'}>
+        {env?.installed ? (
+          <Badge tone="green" title={env.version ? `Trae 当前版本：v${env.version}` : '未检测到 Trae 版本号'}>
             <MonitorCheck size={13} /> Trae 已安装
           </Badge>
         ) : (
           <Badge tone="red">
             <MonitorX size={13} /> Trae 未安装
-          </Badge>
-        )}
-        {env?.installed ? (
-          <Badge tone="green" title={env.version ? `Trae Work 当前版本：v${env.version}` : '未检测到 Trae Work 版本号'}>
-            <MonitorCheck size={13} /> Trae Work 已安装
-          </Badge>
-        ) : (
-          <Badge tone="red">
-            <MonitorX size={13} /> Trae Work 未安装
           </Badge>
         )}
         {certInstalled ? (
@@ -104,11 +91,8 @@ function TraeTopBar() {
         </Badge>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={openTraeCn} className="btn-outline" title="打开 Trae CN IDE">
+        <button onClick={openTrae} className="btn-outline" title="打开 Trae（未安装时打开下载页）">
           <ExternalLink size={15} /> 打开 Trae
-        </button>
-        <button onClick={openTrae} className="btn-outline">
-          <ExternalLink size={15} /> {env?.installed ? '打开 Trae Work' : '下载 Trae Work'}
         </button>
         {proxy.running ? (
           <button onClick={stopProxy} className="btn-outline">

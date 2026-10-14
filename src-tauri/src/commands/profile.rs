@@ -18,35 +18,35 @@ pub struct ProfileInfo {
     pub last_modified: String,
 }
 
-/// profiles 根目录：%APPDATA%\AIWorkAssistant\data\profiles\（Trae Work）
-/// 或 data\profiles_trae\（Trae CN IDE）、data\profiles_doubao\（豆包）、
-/// data\profiles_codebuddy\（CodeBuddy 桌面）、data\profiles_workbuddy\（WorkBuddy 桌面，
-/// authfile 布局）——profiles_workbuddy 由切换桥按 -TargetApp WorkBuddy 写入，
-/// 此处映射保证通用快照命令（list/backup/restore/delete）与桥同源，防误操作 TraeWork 快照
+/// profiles 根目录：data\profiles_trae\（Trae CN，2026-10-14 合并后默认域）、
+/// data\profiles_doubao\（豆包）、data\profiles_codebuddy\（CodeBuddy 桌面）、
+/// data\profiles_workbuddy\（WorkBuddy 桌面，authfile 布局）——profiles_workbuddy
+/// 由切换桥按 -TargetApp WorkBuddy 写入，此处映射保证通用快照命令
+/// （list/backup/restore/delete）与桥同源，防误操作他应用快照
 fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
     match target_app {
-        Some("Trae") => state.data_dir.join("data").join("profiles_trae"),
         Some("Doubao") => state.data_dir.join("data").join("profiles_doubao"),
         Some("CodeBuddy") => state.data_dir.join("data").join("profiles_codebuddy"),
         Some("WorkBuddy") => state.data_dir.join("data").join("profiles_workbuddy"),
         Some("Qoder") => state.data_dir.join("data").join("profiles_qoder"),
         Some("QoderWork") => state.data_dir.join("data").join("profiles_qoder_work"),
-        _ => state.data_dir.join("data").join("profiles"),
+        // Trae 域（含默认）：合并后唯一 TRAE 客户端，池恒 profiles_trae
+        _ => state.data_dir.join("data").join("profiles_trae"),
     }
 }
 
-/// 归一化 target_app：仅接受 "Trae"（Trae CN IDE）/ "Doubao"（豆包）/ "CodeBuddy"（CodeBuddy 桌面）/
-/// "WorkBuddy"（WorkBuddy 桌面，authfile 布局）/ "Qoder"（Qoder CN IDE）/
-/// "QoderWork"（Qoder Work 独立客户端，electron-root 布局），其余一律视为 TraeWork
+/// 归一化 target_app：仅接受 "Trae"（Trae CN，默认）/ "Doubao"（豆包）/
+/// "CodeBuddy"（CodeBuddy 桌面）/ "WorkBuddy"（WorkBuddy 桌面，authfile 布局）/
+/// "Qoder"（Qoder CN IDE）/ "QoderWork"（Qoder Work 独立客户端，electron-root 布局），
+/// 其余一律视为 Trae
 fn normalize_target_app(target_app: Option<&str>) -> &'static str {
     match target_app {
-        Some("Trae") => "Trae",
         Some("Doubao") => "Doubao",
         Some("CodeBuddy") => "CodeBuddy",
         Some("WorkBuddy") => "WorkBuddy",
         Some("Qoder") => "Qoder",
         Some("QoderWork") => "QoderWork",
-        _ => "TraeWork",
+        _ => "Trae",
     }
 }
 
@@ -262,7 +262,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// 列出所有已保存的登录态快照（target_app: TraeWork=TRAE SOLO CN / Trae=Trae CN IDE）
+/// 列出所有已保存的登录态快照（target_app: Trae=Trae CN，合并后唯一 TRAE 客户端）
 ///
 /// 性能（2026-10-07）：体积统计改「缓存 + 多槽并行 + spawn_blocking」——体积要遍历整棵
 /// 快照目录（CodeBuddy 档实测 18,372 目录 / 13,659 文件，单线程 4.9s / 4 线程 1.7s），
@@ -399,7 +399,7 @@ pub fn profile_backup(
     };
     let args = RunArgs {
         action: Action::BackupCurrent,
-        target_app: TargetApp::parse(target),
+        target_app: TargetApp::parse(target)?,
         user_id: Some(user_id),
         proxy_port: None,
         include_indexeddb: include_idb,
@@ -459,7 +459,7 @@ pub fn profile_restore(
     };
     let args = RunArgs {
         action: Action::RestoreOnly,
-        target_app: TargetApp::parse(target),
+        target_app: TargetApp::parse(target)?,
         user_id: Some(user_id),
         proxy_port: None,
         include_indexeddb: include_idb,

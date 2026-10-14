@@ -12,7 +12,8 @@ import type {
   CreditsDailySnapshot,
   EnvStatus,
   GroupView,
-  LocalEntitlement,
+  AppEntitlement,
+  TraeWorkMigrationReport,
   LogLine,
   ProfileInfo,
   ProxyStatus,
@@ -73,7 +74,6 @@ interface AppState {
   /** 侧边栏应用切换（trae = 现有菜单；buddy = 后期扩展置灰；doubao = 豆包页） */
   activeApp: AppKey;
   env: EnvStatus | null;
-  envCn: EnvStatus | null;
   certInstalled: boolean;
   proxy: ProxyStatus;
   apiStatus: ApiServiceStatus | null;
@@ -100,12 +100,13 @@ interface AppState {
   profiles: ProfileInfo[];
   profileProgress: string[];
   profileActive: boolean;
-  /** 快照管理当前查看的目标应用：TraeWork=TRAE SOLO CN / Trae=Trae CN IDE（F-03 参数化） */
-  profileApp: 'TraeWork' | 'Trae';
-  /** 本机两个 Trae 应用当前登录账号的套餐信息（storage.json 明文，零 API） */
-  localEntitlement: LocalEntitlement | null;
+  /** 本机 Trae 客户端当前登录账号的套餐信息（storage.json 明文，零 API） */
+  localEntitlement: AppEntitlement | null;
   /** 全局 API 管理弹窗（unified-api-gateway-design §5.2；任意 activeApp 视图均可打开） */
   showApiManager: boolean;
+  /** Trae 双应用合并升级引导弹窗（首启有迁移报告时弹出，关闭落标记后不再展示） */
+  traeworkGuideOpen: boolean;
+  traeworkGuide: TraeWorkMigrationReport | null;
 
   init: () => Promise<void>;
   setView: (v: ViewKey) => void;
@@ -129,14 +130,14 @@ interface AppState {
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
-  setProfileApp: (app: 'TraeWork' | 'Trae') => Promise<void>;
   refreshLocalEntitlement: () => Promise<void>;
   setShowApiManager: (v: boolean) => void;
+  /** 关闭升级引导：立即收起弹窗并落「已读」标记；标记写失败以 toast 明示（下次启动会再弹） */
+  dismissTraeworkGuide: () => Promise<void>;
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
-  openTraeWithProxy: () => Promise<void>;
-  openTraeCn: () => Promise<void>;
+  openTrae: () => Promise<void>;
   addAccount: (name: string, jwt: string, groupId?: string) => Promise<void>;
   deleteAccount: (userId: string, deleteProfile: boolean) => Promise<void>;
   updateAccount: (userId: string, name?: string, jwt?: string) => Promise<void>;
@@ -148,15 +149,15 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
+  switchTo: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
   /** issue #44：看门狗超时后清空切换/保存进行中状态——解除 spinner/「切换中…」永挂；
       迟到的 done 事件仍会正常提示结果（onSwitchDone 对 null 幂等） */
   clearSwitchLocks: () => void;
   /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
   openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
+  saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
-  resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
+  resetDeviceIds: (targetApp?: 'Trae') => Promise<void>;
   startCheckin: (opts: {
     scope: string;
     user_ids?: string[];
@@ -203,7 +204,6 @@ function defaultSettings(): Settings {
     checkin_skip_expired: true,
     retry: 1,
     notify: 'toast',
-    trae_path: null,
     trae_cn_path: null,
     doubao_path: null,
     doubao_renew_url: 'https://www.doubao.com/info/v2/',
@@ -315,7 +315,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   view: 'dashboard',
   activeApp: 'trae',
   env: null,
-  envCn: null,
   certInstalled: false,
   proxy: { running: false, port: 0, captured: 0, started_at: null },
   apiStatus: null,
@@ -339,9 +338,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   profiles: [],
   profileProgress: [],
   profileActive: false,
-  profileApp: 'TraeWork',
   localEntitlement: null,
   showApiManager: false,
+  traeworkGuideOpen: false,
+  traeworkGuide: null,
 
   init: async () => {
     // StrictMode 下 effect 会执行两次（dev）：两次 init 同步并发启动，旧的「先注销旧监听」
@@ -486,11 +486,28 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch {
       /* 静默失败 */
     }
+    // Trae 双应用合并升级引导：有迁移报告且未关闭过 → 弹窗展示迁移流程与结果；
+    // 关闭时后端落「已读」标记，之后启动不再展示。失败静默（引导不阻塞启动）
+    try {
+      const report = await api.misc.traeworkMigrationGuide();
+      if (report) set({ traeworkGuide: report, traeworkGuideOpen: true });
+    } catch {
+      /* 静默失败 */
+    }
   },
 
   setView: (v) => set({ view: v }),
   setActiveApp: (app) => set({ activeApp: app, view: APP_HOME_VIEW[app] }),
   setShowApiManager: (v) => set({ showApiManager: v }),
+  dismissTraeworkGuide: async () => {
+    // 先收起弹窗再落标记：标记写失败（下次启动会再弹）不静默，toast 明示
+    set({ traeworkGuideOpen: false });
+    try {
+      await api.misc.traeworkMigrationGuideDismiss();
+    } catch (e) {
+      get().pushToast('error', `保存升级引导关闭标记失败，下次启动可能再次弹出: ${String(e)}`);
+    }
+  },
 
   applyCheckinEvent: (e) => {
     // F5：done 解除看门狗，其余事件（start/retry/account）到达即续期
@@ -680,13 +697,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       get().pushToast('error', `环境检测失败：${String(err)}`);
     }
-    // Trae CN IDE 环境检测（独立应用，失败不影响主检测）
-    try {
-      const envCn = await api.env.checkCn();
-      set({ envCn });
-    } catch {
-      set({ envCn: null });
-    }
   },
   refreshCert: async () => {
     try {
@@ -817,10 +827,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `停止代理失败：${String(err)}`);
     }
   },
-  openTraeWithProxy: async () => {
+  openTrae: async () => {
     const env = get().env;
     if (!env?.installed) {
-      get().pushToast('info', '未检测到 Trae Work 安装，正在打开下载页…');
+      get().pushToast('info', '未检测到 Trae 安装，正在打开下载页…');
       try {
         await api.env.openSite();
       } catch (err) {
@@ -828,32 +838,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return;
     }
-    // 确保代理在请求路径上：未运行则先启动，否则打开 Trae Work 也不会走代理、无法捕获账号
-    let port: number | undefined = get().proxy.running ? get().proxy.port : undefined;
-    if (!port) {
-      // 可能残留端口为 0 的无效代理，先停掉再以有效端口重启
-      if (get().proxy.running) {
-        try { await get().stopProxy(); } catch { /* ignore */ }
-      }
-      get().pushToast('info', '正在启动代理以确保 Trae Work 走本地代理…');
-      await get().startProxy();
-      port = get().proxy.running ? get().proxy.port : undefined;
-    }
-    try {
-      if (port) {
-        await api.env.openApp(port);
-        get().pushToast('success', `已打开 Trae Work（代理已注入 127.0.0.1:${port}）`);
-      } else {
-        // 代理启动失败：仍打开客户端，但明确告知不会捕获账号
-        await api.env.openApp(undefined);
-        get().pushToast('warn', '代理启动失败，已直接打开 Trae Work（账号不会被自动捕获）');
-      }
-    } catch (err) {
-      get().pushToast('error', `打开 Trae Work 失败：${String(err)}`);
-    }
-  },
-  openTraeCn: async () => {
-    // 与 openTraeWithProxy 同款逻辑：先确保代理在运行并注入，Trae 的流量才走本地 MITM 代理
+    // 确保代理在请求路径上：未运行则先启动，否则打开 Trae 也不会走代理、无法捕获账号
     let port: number | undefined = get().proxy.running ? get().proxy.port : undefined;
     if (!port) {
       // 可能残留端口为 0 的无效代理，先停掉再以有效端口重启
@@ -866,12 +851,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     try {
       if (port) {
-        await api.env.openCnApp(port);
+        await api.env.openApp(port);
         get().pushToast('success', `已打开 Trae（代理已注入 127.0.0.1:${port}）`);
       } else {
-        // 代理启动失败：仍打开客户端，但明确告知不走代理
-        await api.env.openCnApp(undefined);
-        get().pushToast('warn', '代理启动失败，已直接打开 Trae（流量不会经过本地代理）');
+        // 代理启动失败：仍打开客户端，但明确告知不会捕获账号
+        await api.env.openApp(undefined);
+        get().pushToast('warn', '代理启动失败，已直接打开 Trae（账号不会被自动捕获）');
       }
     } catch (err) {
       get().pushToast('error', `打开 Trae 失败：${String(err)}`);
@@ -964,8 +949,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ switchingTo: userId, switchProgress: [] });
       // withMinDelay：切换是高风险操作，保证 busy 态至少可见 1s（避免瞬间完成导致闪烁/误触连点）
       await withMinDelay(api.switchAccount(userId, targetApp));
-      // 应用名后缀：TraeWork 静默；其余应用标注目标（Trae/WorkBuddy/Doubao/CodeBuddy/Qoder）
-      get().pushToast('info', `正在切换登录态${targetApp && targetApp !== 'TraeWork' ? `（${targetApp}）` : ''}，请稍候…`);
+      // 应用名后缀：Trae 静默；其余应用标注目标（Doubao/WorkBuddy/CodeBuddy/Qoder）
+      get().pushToast('info', `正在切换登录态${targetApp && targetApp !== 'Trae' ? `（${targetApp}）` : ''}，请稍候…`);
     } catch (err) {
       set({ switchingTo: null });
       get().pushToast('error', `切换失败：${String(err)}`);
@@ -1017,7 +1002,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ deviceResetActive: true, deviceResetProgress: [] });
     try {
       await api.resetDeviceIds(targetApp);
-      get().pushToast('info', `正在执行 6 层设备标识重置（${targetApp === 'Trae' ? 'Trae' : 'Trae Work'}）…`);
+      get().pushToast('info', '正在执行 6 层设备标识重置（Trae）…');
     } catch (err) {
       set({ deviceResetActive: false });
       get().pushToast('error', `设备标识重置失败：${String(err)}`);
@@ -1099,15 +1084,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   refreshProfiles: async () => {
     try {
-      const profiles = await api.profiles.list(get().profileApp);
+      const profiles = await api.profiles.list('Trae');
       set({ profiles });
     } catch {
       /* ignore */
     }
-  },
-  setProfileApp: async (app) => {
-    set({ profileApp: app, profiles: [] });
-    await get().refreshProfiles();
   },
   refreshLocalEntitlement: async () => {
     try {
@@ -1120,7 +1101,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profileBackup: async (userId) => {
     set({ profileActive: true, profileProgress: [] });
     try {
-      await api.profiles.backup(userId, get().profileApp);
+      await api.profiles.backup(userId, 'Trae');
       get().pushToast('info', '正在备份登录态快照…');
     } catch (err) {
       set({ profileActive: false });
@@ -1130,7 +1111,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profileRestore: async (userId) => {
     set({ profileActive: true, profileProgress: [] });
     try {
-      await api.profiles.restore(userId, get().profileApp);
+      await api.profiles.restore(userId, 'Trae');
       get().pushToast('info', '正在恢复登录态快照…');
     } catch (err) {
       set({ profileActive: false });
@@ -1139,7 +1120,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   profileDelete: async (userId) => {
     try {
-      await api.profiles.delete(userId, get().profileApp);
+      await api.profiles.delete(userId, 'Trae');
       await get().refreshProfiles();
       get().pushToast('info', '快照已删除');
     } catch (err) {

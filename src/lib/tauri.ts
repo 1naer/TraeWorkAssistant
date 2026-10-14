@@ -30,7 +30,8 @@ import type {
   EnvStatus,
   GroupView,
   JwtParseResult,
-  LocalEntitlement,
+  AppEntitlement,
+  TraeWorkMigrationReport,
   ImportReport,
   ImportPreview,
   LogLine,
@@ -158,13 +159,12 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
 export const api = {
   env: {
-    check: () => invoke<EnvStatus>('env_check'),
-    checkCn: () => invoke<EnvStatus>('env_check_trae_cn'),
-    // F-01：跨应用安装位置自动识别（trae_work | trae | doubao | workbuddy）
+    // TraeWork 合并后唯一客户端检测（原 env_check 已删，统一走 Trae CN 通道）
+    check: () => invoke<EnvStatus>('env_check_trae_cn'),
+    // F-01：跨应用安装位置自动识别（trae | doubao | workbuddy）
     locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
-    openApp: (proxyPort?: number) => invoke('open_trae_app', { proxyPort }),
-    openCnApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
+    openApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
     /** Buddy 双应用：打开 WorkBuddy 桌面客户端（分离启动，不注入代理） */
     openWorkbuddyApp: () => invoke('open_workbuddy_app'),
     /** Buddy 双应用：打开 CodeBuddy 桌面客户端（分离启动，不注入代理） */
@@ -218,7 +218,7 @@ export const api = {
     getJwt: (userId: string) => invoke<string>('account_get_jwt', { userId }),
     // 会员/套餐信息
     refreshPayStatus: () => invoke<number>('refresh_pay_status'),
-    // 积分消耗历史（Trae Work query_user_usage_group_by_session；fresh=true 增量拉取，false 纯缓存）
+    // 积分消耗历史（Trae query_user_usage_group_by_session；fresh=true 增量拉取，false 纯缓存）
     usageHistory: (fresh?: boolean) =>
       invoke<UsageHistoryResult>('usage_history_fetch', { fresh: fresh ?? null }),
     // 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包；credit_packs 只含未过期可用包）
@@ -242,7 +242,7 @@ export const api = {
       }),
   },
   traeApps: {
-    localEntitlement: () => invoke<LocalEntitlement>('apps_entitlement_read'),
+    localEntitlement: () => invoke<AppEntitlement>('apps_entitlement_read'),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),
@@ -297,6 +297,11 @@ export const api = {
     logsClear: (logType: string) => invoke<number>('logs_clear', { logType }),
     /** 待取启动通知（一次性；后端启动期消息如分组统一迁移结果，拉取后即清） */
     startupNoticeTake: () => invoke<string | null>('startup_notice_take'),
+    /** TraeWork 合并迁移升级引导：有迁移报告且未关闭过 → 返回报告；否则 null */
+    traeworkMigrationGuide: () =>
+      invoke<TraeWorkMigrationReport | null>('traework_migration_guide'),
+    /** 关闭升级引导（后端落「已读」标记，之后启动不再展示） */
+    traeworkMigrationGuideDismiss: () => invoke('traework_migration_guide_dismiss'),
     settingsGet: () => invoke<Settings>('settings_get'),
     settingsSet: (patch: Partial<Settings>) => invoke('settings_set', { patch }),
     notifyTest: () => invoke<string>('notify_test'),
@@ -327,7 +332,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
+    targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
   ) =>
     invoke('switch_account', {
@@ -336,9 +341,9 @@ export const api = {
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
-  resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
+  resetDeviceIds: (targetApp?: 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
     // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
@@ -346,14 +351,14 @@ export const api = {
     // QoderWork：2026-10-02 Qoder Work 独立客户端档案（data/profiles_qoder_work；electron-root 布局）
     // fresh=true 绕过体积缓存强制重算（「刷新列表」按钮用；默认命中缓存，避免每次开弹窗遍历快照目录）
     list: (
-      targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
+      targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
       fresh?: boolean,
     ) => invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null, fresh: fresh ?? null }),
-    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'Qoder' | 'QoderWork') =>
+    backup: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'Qoder' | 'QoderWork') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
+    restore: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
+    delete: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },

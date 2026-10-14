@@ -87,9 +87,7 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
 /// 按应用类别返回候选映像名（与 env.rs 的安装探测保持一致）。
 pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
     match app_kind {
-        // Trae Work（SOLO CN）及其历史版本名
-        "TraeWork" => vec!["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
-        // Trae CN IDE
+        // Trae（双应用合并后唯一客户端）
         "Trae" => vec!["Trae CN.exe"],
         // 豆包桌面版（Chromium 壳，主进程即 Doubao.exe）
         "Doubao" => vec!["Doubao.exe"],

@@ -1,4 +1,4 @@
-//! icube 布局快照（TraeWork/Trae，原 PS Backup-CurrentProfile/Restore-Profile 的
+//! icube 布局快照（Trae/Qoder，原 PS Backup-CurrentProfile/Restore-Profile 的
 //! icube 分支 1262-1398 对译）：精准白名单备份/恢复 + .bak 两代回滚 + 恢复计数
 //!（供 Switch 恢复后校验）+ 客户端日志身份探测 + 槽位 sidecar 元数据校验。
 
@@ -25,7 +25,7 @@ impl Item {
     }
 }
 
-/// TRAE 双应用（TraeWork/Trae）白名单（原 ICUBE_ITEMS；F-80 M3 档案化后由
+/// TRAE 白名单（原 ICUBE_ITEMS；F-80 M3 档案化后由
 /// AppProfile.icube_items 参数指向，backup/restore 不再依赖单一常量）
 pub(crate) const TRAE_ICUBE_ITEMS: &[Item] = &[
     Item::File("User\\globalStorage\\storage.json"), // 1. 设备标识/遥测/认证信息
@@ -72,7 +72,7 @@ pub(crate) const QODER_IDE_ITEMS: &[Item] = &[
     Item::File("SharedClientCache\\cache\\status.json"),        // 登录/激活状态
 ];
 
-/// 精准备份：仅复制登录态关键文件（参考 traework-switcher）
+/// 精准备份：仅复制登录态关键文件（参考旧版 PS 切换器）
 pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
     let src = &sess.prof.data_dir;
     if !src.exists() {
@@ -153,6 +153,18 @@ pub fn restore_icube(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) ->
         StepStatus::Ok,
         &format!("已恢复账号 {slot_label} 的登录态 ({restored} 项)"),
     );
+    // 合并版实测（2026-10-14）：快照冻结保存时刻的窗口类型，恢复旧快照后客户端
+    // 按快照打开 IDE 窗口（用户预期恒开 Agent）。Trae 档案开启修正（best-effort，
+    // 失败不影响登录态恢复）。
+    if sess.prof.force_agent_window {
+        if let Err(e) = apply_agent_window_fixup(&dest) {
+            sink.step(
+                "restore",
+                StepStatus::Warn,
+                &format!("Agent 窗口修正失败（不影响登录态恢复）: {e}"),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -192,19 +204,70 @@ fn warn_if_slot_identity_mismatch(
     }
 }
 
+/// 「客户端当前登录」探测三态（2026-10-14 合并版实测增强）：
+/// - [`LiveUidProbe::Uid`]：最新会话日志有明文 uid——当前登录的直接证据；
+/// - [`LiveUidProbe::SessionNoUid`]：最新会话的 dynamicConfig.log 存在但无 uid——
+///   客户端本次运行期间**未登录**（登录客户端启动数秒内即产生带 uid 的 config
+///   query，本机实测 093008 会话 boot+1s 出现；观测完整性由切换/保存流程的
+///   「先优雅关闭再探测」保证）。旧 Option 语义把它与「无法判定」合并 fail-open，
+///   曾把未登录现场回写进标记槽（实测 2803 槽被 2026-10-14 09:33:40 的未登录
+///   现场覆盖），三态分派后由调用方 fail-closed；
+/// - [`LiveUidProbe::NoEvidence`]：无 logs/ 会话目录或最新会话无日志文件（含 0 字节
+///   空日志：强杀/缓冲未 flush 场景无法据此判定「未登录」）——无法判定。
+///
+/// 已知局限（2026-10-14 审查登记）：`uid=` 仅在登录/鉴权请求中出现，用户在会话中
+/// **手动退出登录**不产生反向记录，日志最后 uid 仍是退出前账号，三态探测恒报
+/// `Uid(旧账号)`——此场景下保存守卫的身份校验不可达。需彻底杜绝须改用「日志尾部
+/// 无 uid 请求的持续时间」等时序启发，误拒代价更高，暂不实施；用户手册应提示
+/// 「退出登录后请勿立即保存当前登录态」。
+#[derive(Debug)]
+pub(crate) enum LiveUidProbe {
+    Uid(String),
+    SessionNoUid,
+    NoEvidence,
+}
+
+/// 最新会话目录（15 字符 `yyyymmddThhmmss`，字典序=时间序）
+pub(crate) fn newest_session_dir(app_data_dir: &Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(app_data_dir.join("logs"))
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        // 只认目录：同名格式普通文件（误拷贝/压缩包）混入会被 .max() 选中压过真会话
+        .filter(|p| p.is_dir())
+        .filter(is_session_dir)
+        .max()
+}
+
+/// 三态探测当前登录（见 [`LiveUidProbe`]）
+pub(crate) fn probe_live_uid(app_data_dir: &Path) -> LiveUidProbe {
+    let Some(session) = newest_session_dir(app_data_dir) else {
+        return LiveUidProbe::NoEvidence;
+    };
+    let log = session.join("dynamicConfig.log");
+    if !log.exists() {
+        return LiveUidProbe::NoEvidence;
+    }
+    // 0 字节空日志 ≠「确凿未登录」（强杀时日志缓冲可能整体丢失，已登录会话同样
+    // 产生空日志）→ 判 NoEvidence 维持 fail-open，避免「已登录却存不了」误拒
+    if std::fs::metadata(&log).map(|m| m.len() == 0).unwrap_or(true) {
+        return LiveUidProbe::NoEvidence;
+    }
+    match extract_last_log_uid(&log) {
+        Some(uid) => LiveUidProbe::Uid(uid),
+        None => LiveUidProbe::SessionNoUid,
+    }
+}
+
 /// 从客户端日志探测当前登录 uid（icube 布局）：
 /// `<appdata>\logs\<yyyymmddThhmmss>\dynamicConfig.log` 的请求 URL 带明文
 /// `uid=<10~20 位数字>`。会话目录名固定 15 字符且字典序=时间序，只看最新会话
 /// （当前客户端这次运行）；最新会话无 uid 记录则返回 None——绝不回捞旧会话，
 /// 旧会话的 uid 可能是切换前的账号，误报比不报更危险（调用方 fail-open）。
 pub fn detect_live_uid(app_data_dir: &Path) -> Option<String> {
-    let logs_dir = app_data_dir.join("logs");
-    let newest = std::fs::read_dir(&logs_dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(is_session_dir)
-        .max();
-    extract_last_log_uid(&newest?.join("dynamicConfig.log"))
+    match probe_live_uid(app_data_dir) {
+        LiveUidProbe::Uid(uid) => Some(uid),
+        _ => None,
+    }
 }
 
 /// 会话目录名 = 15 字符 `yyyymmddThhmmss`（byte 8 == 'T'，其余全为数字）。
@@ -213,10 +276,88 @@ fn is_session_dir(p: &std::path::PathBuf) -> bool {
         Some(name) => {
             name.len() == 15
                 && name.as_bytes()[8] == b'T'
-                && name.bytes().all(|b| b.is_ascii_digit() || b == b'T')
+                && name
+                    .bytes()
+                    .enumerate()
+                    .all(|(i, b)| if i == 8 { b == b'T' } else { b.is_ascii_digit() })
         }
         None => false,
     }
+}
+
+/// 切换后登录身份确认结果（2026-10-14 合并版实测增强）
+pub(crate) enum SwitchVerify {
+    /// 客户端实际登录 = 切换目标
+    Ok,
+    /// 客户端实际登录为其他账号（快照污染/服务端会话回退，实测 2328 槽恢复后
+    /// 静默登录为 1448）
+    Mismatch(String),
+    /// deadline 内未产生带 uid 的新会话（未登录或未联网）
+    Timeout,
+}
+
+/// 轮询最新会话日志确认「切换后客户端实际登录身份」：合并版客户端启动即创建
+/// 新会话目录与 dynamicConfig.log，其 uid 记录是「实际登录是谁」的直接证据。
+/// 只认比 `baseline`（start_app 前的最新会话）更新的会话，防止把切换前会话的
+/// 旧 uid 误读为切换后身份。
+pub(crate) fn confirm_switch_uid(
+    app_data_dir: &Path,
+    uid: &str,
+    baseline: Option<std::path::PathBuf>,
+    timeout: std::time::Duration,
+) -> SwitchVerify {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let Some(newest) = newest_session_dir(app_data_dir) else {
+            continue;
+        };
+        if baseline.as_ref().is_some_and(|b| &newest <= b) {
+            continue; // 客户端尚未完成启动产生新会话
+        }
+        if let Some(actual) = extract_last_log_uid(&newest.join("dynamicConfig.log")) {
+            return if actual == uid {
+                SwitchVerify::Ok
+            } else {
+                SwitchVerify::Mismatch(actual)
+            };
+        }
+        // 新会话暂无 uid 记录：继续等（NEED_REFRESH/ExchangeToken 流程未完成）
+    }
+    SwitchVerify::Timeout
+}
+
+/// 「Agent 窗口」启动修正（2026-10-14 合并版实测）：合并版客户端启动窗口类型取
+/// `User\globalStorage\storage.json` 的 `runtimeWindow.lastTask.windowType`
+/// （枚举 Agent/IDE/Floating/TraeWork，缺省回落 Agent——resources/app/out/main.js
+/// `_8e`）。快照冻结的是保存时刻的窗口类型，恢复旧快照会让客户端按快照打开
+/// IDE 窗口；写回 Agent 使所有路径（切换恢复/顶部打开）恒开 Agent 窗口。
+/// storage.json 缺失时 Ok（客户端首启缺省即 Agent，无需修正）。
+pub(crate) fn apply_agent_window_fixup(data_dir: &Path) -> Result<(), String> {
+    let path = data_dir.join("User").join("globalStorage").join("storage.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let mut v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("storage.json 解析失败: {e}"))?;
+    let Some(obj) = v.as_object_mut() else {
+        return Err("storage.json 非对象".into());
+    };
+    obj.insert(
+        "runtimeWindow.lastTask".into(),
+        serde_json::json!({
+            "windowType": "Agent",
+            "startedAt": chrono::Utc::now().timestamp_millis()
+        }),
+    );
+    let out = serde_json::to_string(&v).map_err(|e| format!("storage.json 序列化失败: {e}"))?;
+    // 原子替换（2026-10-14 审查修复）：storage.json 是白名单登录态关键文件且 fixup
+    // 不产生 .bak 代际，原地覆写遇崩溃/断电/磁盘满会截断毁掉登录态。同盘临时文件 +
+    // rename 原子替换；serde_json 重序列化仅键序/空白与原文不同，客户端解析语义等价
+    let tmp = path.with_extension("json.aiwork-tmp");
+    std::fs::write(&tmp, out).map_err(|e| format!("storage.json 临时写入失败: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("storage.json 原子替换失败: {e}"))?;
+    Ok(())
 }
 
 /// 单个日志文件里取最后一次出现的 `uid=<10~20 位数字>`（只读尾部 2MB，日志
@@ -270,7 +411,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
         let mut args = RunArgs {
             action: Action::Switch,
-            target_app: TargetApp::TraeWork,
+            target_app: TargetApp::Trae,
             user_id: Some("2117003799429594".into()),
             proxy_port: None,
             include_indexeddb: false,
@@ -383,6 +524,100 @@ mod tests {
         std::fs::remove_file(newest.join("dynamicConfig.log")).unwrap();
         assert_eq!(detect_live_uid(&appdata), None);
         let _ = std::fs::remove_dir_all(&appdata);
+    }
+
+    #[test]
+    fn probe_live_uid_三态分派() {
+        let appdata = std::env::temp_dir().join(format!(
+            "sw-icube-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&appdata);
+        // NoEvidence：无 logs 目录
+        assert!(matches!(
+            probe_live_uid(&appdata),
+            LiveUidProbe::NoEvidence
+        ));
+        // NoEvidence：最新会话无 dynamicConfig.log
+        let logs = appdata.join("logs");
+        std::fs::create_dir_all(logs.join("20261014T090000")).unwrap();
+        assert!(matches!(
+            probe_live_uid(&appdata),
+            LiveUidProbe::NoEvidence
+        ));
+        // Uid：会话日志带 uid
+        std::fs::write(
+            logs.join("20261014T090000").join("dynamicConfig.log"),
+            "url https://x?uid=2328112497170937&ok=1",
+        )
+        .unwrap();
+        match probe_live_uid(&appdata) {
+            LiveUidProbe::Uid(u) => assert_eq!(u, "2328112497170937"),
+            other => panic!("期望 Uid，实际 {other:?}"),
+        }
+        // SessionNoUid：会话与日志存在但无 uid（客户端未登录运行的直接证据）
+        std::fs::write(
+            logs.join("20261014T090000").join("dynamicConfig.log"),
+            "request url: https://x/config/query?mid=abc&did=1",
+        )
+        .unwrap();
+        assert!(matches!(
+            probe_live_uid(&appdata),
+            LiveUidProbe::SessionNoUid
+        ));
+        let _ = std::fs::remove_dir_all(&appdata);
+    }
+
+    #[test]
+    fn agent窗口修正覆盖last_task且容忍缺失() {
+        let dir = std::env::temp_dir().join(format!(
+            "sw-icube-agentfix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let sg = dir.join("User").join("globalStorage").join("storage.json");
+        // storage.json 缺失：Ok（客户端首启缺省即 Agent）
+        apply_agent_window_fixup(&dir).unwrap();
+        // 快照冻结 IDE 窗口 → 补丁为 Agent；其余键保留
+        std::fs::create_dir_all(sg.parent().unwrap()).unwrap();
+        std::fs::write(
+            &sg,
+            r#"{"runtimeWindow.lastTask":{"windowType":"IDE","startedAt":1},"theme":"vs-dark"}"#,
+        )
+        .unwrap();
+        apply_agent_window_fixup(&dir).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&sg).unwrap())
+            .unwrap();
+        assert_eq!(v["runtimeWindow.lastTask"]["windowType"], "Agent");
+        assert!(v["runtimeWindow.lastTask"]["startedAt"].as_i64().unwrap() > 0);
+        assert_eq!(v["theme"], "vs-dark");
+        // 非 JSON：Err（调用方 Warn 不阻断）
+        std::fs::write(&sg, "not-json").unwrap();
+        assert!(apply_agent_window_fixup(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_switch_uid零超时立即返回() {
+        let dir = std::env::temp_dir().join("sw-icube-confirm-zero");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            confirm_switch_uid(
+                &dir,
+                "2328112497170937",
+                None,
+                std::time::Duration::ZERO
+            ),
+            SwitchVerify::Timeout
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { createPortal } from 'react-dom';
 import {
-  AppWindow,
   Camera,
   Download,
   Eye,
@@ -18,7 +16,6 @@ import {
   ScanSearch,
   ShieldAlert,
   Snowflake,
-  SquareTerminal,
   Tag,
   Tags,
   Trash2,
@@ -81,8 +78,6 @@ export default function Accounts() {
   const profiles = useAppStore((s) => s.profiles);
   const profileProgress = useAppStore((s) => s.profileProgress);
   const profileActive = useAppStore((s) => s.profileActive);
-  const profileApp = useAppStore((s) => s.profileApp);
-  const setProfileApp = useAppStore((s) => s.setProfileApp);
   const profileBackup = useAppStore((s) => s.profileBackup);
   const profileRestore = useAppStore((s) => s.profileRestore);
   const profileDelete = useAppStore((s) => s.profileDelete);
@@ -100,15 +95,13 @@ export default function Accounts() {
   // 池来源徽标（需求①可选增强）：groupId → 在哪些池有成员
   const [poolBadges, setPoolBadges] = useState<Record<string, string[]>>({});
   const [editTarget, setEditTarget] = useState<AccountView | null>(null);
-  // 双应用切换/保存菜单：{ userId, kind } —— kind='switch' 切换登录态 / 'save' 保存登录态
-  const [appMenu, setAppMenu] = useState<{ userId: string; kind: 'switch' | 'save'; x: number; y: number } | null>(null);
   const [jwtTarget, setJwtTarget] = useState<AccountView | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
   // 行内「重新登录」目标账号（无/失效 refresh_token 的账号定向 OAuth）
   const [reloginTarget, setReloginTarget] = useState<AccountView | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
-  // F-08 自动发现：扫描本机两个 Trae 应用 storage.json 的登录账号
+  // F-08 自动发现：扫描本机 Trae 应用 storage.json 的登录账号
   const [scanOpen, setScanOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [discovered, setDiscovered] = useState<DiscoveredAccount[] | null>(null);
@@ -408,7 +401,7 @@ export default function Accounts() {
             <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
               <Globe size={15} /> OAuth 登录
             </button>
-            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work / Trae 已登录账号，一键加入账号池">
+            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae 已登录账号，一键加入账号池">
               <ScanSearch size={15} /> 扫描本机账号
             </button>
             <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
@@ -484,7 +477,7 @@ export default function Accounts() {
             <EmptyState
               icon={<Plus size={28} />}
               title={filter === 'all' ? '还没有账号' : '此分组下没有账号'}
-              hint="点击右上角「添加账号」粘贴 JWT，或先启动代理，在 Trae Work / Trae 中登录后自动捕获。"
+              hint="点击右上角「添加账号」粘贴 JWT，或先启动代理，在 Trae 中登录后自动捕获。"
             />
           </div>
         ) : (
@@ -517,12 +510,7 @@ export default function Accounts() {
                           nextBilling={a.membership_next_billing}
                         />
                         {/* 客户端当前登录标记：本机 storage.json/vscdb 推导的登录 uid 与账号池匹配 */}
-                        {a.user_id && a.user_id === localEntitlement?.work?.uid && (
-                          <Badge tone="green" title="当前 Trae Work 客户端登录的账号">
-                            Trae Work 登录中
-                          </Badge>
-                        )}
-                        {a.user_id && a.user_id === localEntitlement?.cn?.uid && (
+                        {a.user_id && a.user_id === localEntitlement?.uid && (
                           <Badge tone="brand" title="当前 Trae 客户端登录的账号">
                             Trae 登录中
                           </Badge>
@@ -603,30 +591,22 @@ export default function Accounts() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
-                        <div className="relative flex items-center">
-                          <button
-                            title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换此账号（选择目标应用）'}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
-                            }}
-                            disabled={busy}
-                            className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          >
-                            {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
-                          </button>
-                          <button
-                            title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态（选择目标应用）'}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
-                            }}
-                            disabled={busy}
-                            className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          >
-                            {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-                          </button>
-                        </div>
+                        <button
+                          title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换到此账号登录 Trae'}
+                          onClick={() => void switchTo(a.user_id, 'Trae')}
+                          disabled={busy}
+                          className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        >
+                          {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+                        </button>
+                        <button
+                          title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态到该账号'}
+                          onClick={() => void saveCurrentLogin(a.user_id, 'Trae')}
+                          disabled={busy}
+                          className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        >
+                          {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                        </button>
                         {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
                             否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
@@ -701,56 +681,7 @@ export default function Accounts() {
         )}
       </div>
 
-      {/* 应用选择菜单：Portal + fixed 定位，避免被表格容器 overflow 裁剪或被后续行遮盖。
-          issue #9 反馈：原来的窄下拉两项太小易点错，改为左右两块大按钮（带图标+描述），
-          hover 用 amber 高亮让目标区域醒目不易误触 */}
-      {appMenu &&
-        !busy &&
-        createPortal(
-          <div
-            className="fixed z-50 w-[420px] overflow-hidden rounded-lg border border-slate-200 bg-white text-slate-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
-            style={{
-              left: Math.max(8, appMenu.x - 420),
-              top: (() => {
-                const MENU_H = 150;
-                const below = appMenu.y + 4 + MENU_H;
-                return below > window.innerHeight ? appMenu.y - MENU_H - 8 : appMenu.y + 4;
-              })(),
-            }}
-            onMouseLeave={() => setAppMenu(null)}
-          >
-            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold text-slate-400 dark:text-zinc-500">
-              {appMenu.kind === 'switch' ? '切换此账号到…' : '保存当前登录态到…'}
-            </div>
-            <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
-              {([
-                { app: 'TraeWork', label: 'TRAE SOLO CN', desc: 'Trae Work 桌面端', Icon: AppWindow },
-                { app: 'Trae', label: 'Trae CN', desc: 'Trae CN IDE 客户端', Icon: SquareTerminal },
-              ] as const).map((opt) => (
-                <button
-                  key={opt.app}
-                  onClick={() => {
-                    const { userId, kind } = appMenu;
-                    setAppMenu(null);
-                    if (kind === 'switch') {
-                      void switchTo(userId, opt.app);
-                    } else {
-                      void saveCurrentLogin(userId, opt.app);
-                    }
-                  }}
-                  className="group flex flex-col items-start gap-1 rounded-lg border border-slate-200 bg-white px-4 py-3 text-left transition hover:border-amber-400 hover:bg-amber-50 hover:shadow-sm dark:border-zinc-700 dark:bg-zinc-800 dark:hover:border-amber-500 dark:hover:bg-amber-500/10"
-                >
-                  <span className="flex items-center gap-2 text-sm font-semibold">
-                    <opt.Icon size={16} className="text-slate-500 transition group-hover:text-amber-500 dark:text-zinc-400" />
-                    {opt.label}
-                  </span>
-                  <span className="text-[11px] text-slate-400 dark:text-zinc-500">{opt.desc}</span>
-                </button>
-              ))}
-            </div>
-          </div>,
-          document.body,
-        )}
+      {/* 应用选择菜单已退役（TraeWork 并入 Trae 单客户端）：切换/保存按钮直接执行 */}
 
       <AddAccountModal
         open={addOpen}
@@ -863,8 +794,6 @@ export default function Accounts() {
         profiles={profiles}
         profileActive={profileActive}
         profileProgress={profileProgress}
-        profileApp={profileApp}
-        onSwitchApp={(app) => void setProfileApp(app)}
         onBackup={(slot) => void profileBackup(slot)}
         onRestore={(slot) => void profileRestore(slot)}
         onDelete={async (slot) => {

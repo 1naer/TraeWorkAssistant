@@ -6,8 +6,8 @@
 //! checkin_accounts.json，作为代理方案的兜底（仅 Windows）。
 //!
 //! 入口：CLI 任务模式 `--task-run trae-capture-local`（对齐原 `python device_proxy.py
-//! --capture-local` 手动兜底用法）。扫描两个应用目录：TRAE SOLO CN（Trae Work）与
-//! Trae CN（Trae IDE），设置 TRAE_APP_DIR 时只扫指定目录。
+//! --capture-local` 手动兜底用法）。扫描 Trae 客户端（双应用合并后唯一客户端）数据
+//! 目录，设置 TRAE_APP_DIR 时只扫指定目录。
 
 use std::path::{Path, PathBuf};
 
@@ -15,8 +15,7 @@ use crate::state::AppState;
 
 use super::handler::{extract_user_id, update_account_jwt, valid_cloud_ide_jwt, ProxyCtx};
 
-/// 候选应用数据目录（对齐 Python `_trae_app_dirs`）：TRAE SOLO CN + Trae CN；
-/// 设置 TRAE_APP_DIR 时只扫指定目录（兼容旧环境变量）
+/// 候选应用数据目录（双应用合并后仅 Trae CN）；设置 TRAE_APP_DIR 时只扫指定目录
 fn trae_app_dirs() -> Vec<PathBuf> {
     if let Ok(env) = std::env::var("TRAE_APP_DIR") {
         if !env.is_empty() {
@@ -27,10 +26,7 @@ fn trae_app_dirs() -> Vec<PathBuf> {
     if base.is_empty() {
         return vec![];
     }
-    vec![
-        Path::new(&base).join("TRAE SOLO CN"),
-        Path::new(&base).join("Trae CN"),
-    ]
+    vec![Path::new(&base).join("Trae CN")]
 }
 
 /// 离线场景构造 ProxyCtx（复用 handler 的账号写回通路；不启动代理、不 emit 前端事件）

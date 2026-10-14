@@ -172,8 +172,6 @@ pub struct Settings {
     #[serde(default = "default_notify")]
     pub notify: String,
     #[serde(default)]
-    pub trae_path: Option<String>,
-    #[serde(default)]
     pub trae_cn_path: Option<String>,
     /// 豆包桌面版 exe 手动路径（环境配置页持久化；app_locate doubao 档案读取）
     #[serde(default)]

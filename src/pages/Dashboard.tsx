@@ -28,7 +28,6 @@ import type { CheckinTrendPoint } from '../types';
 export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
   const env = useAppStore((s) => s.env);
-  const envCn = useAppStore((s) => s.envCn);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const localEntitlement = useAppStore((s) => s.localEntitlement);
   const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
@@ -150,27 +149,18 @@ export default function Dashboard() {
     }
   };
 
-  // 本机套餐徽标：两个 Trae 应用当前登录账号的套餐（storage.json 明文缓存）
-  const entHint =
-    localEntitlement?.work || localEntitlement?.cn
-      ? [
-          localEntitlement?.work?.identity_str
-            ? `Work ${localEntitlement.work.identity_str}`
-            : null,
-          localEntitlement?.cn?.identity_str ? `Trae ${localEntitlement.cn.identity_str}` : null,
-        ]
-          .filter(Boolean)
-          .join(' · ')
-      : env?.installed || envCn?.installed
-        ? '本机应用未读取到套餐'
-        : undefined;
+  // 本机套餐徽标：Trae 客户端当前登录账号的套餐（storage.json 明文缓存）
+  const entHint = localEntitlement?.identity_str
+    ? localEntitlement.identity_str
+    : env?.installed
+      ? '本机应用未读取到套餐'
+      : undefined;
   useEffect(() => {
     void refreshLocalEntitlement();
   }, [refreshLocalEntitlement]);
 
   // 当前登录账号（账号池匹配名）：本机使用证据推导 uid → 反查账号池
-  const workLogin = localEntitlement?.work?.account_name ?? null;
-  const cnLogin = localEntitlement?.cn?.account_name ?? null;
+  const login = localEntitlement?.account_name ?? null;
   // 告警提醒：JWT 24h 内将过期 + 积分 7 日内将过期（含已过期）的账号数
   const nowSec = Math.floor(Date.now() / 1000);
   const creditWarned = accounts.filter(
@@ -179,7 +169,7 @@ export default function Dashboard() {
   const alertCount = warned + creditWarned;
 
   const openTrae = async () => {
-    await useAppStore.getState().openTraeWithProxy();
+    await useAppStore.getState().openTrae();
   };
 
   return (
@@ -199,26 +189,13 @@ export default function Dashboard() {
         <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
         <StatCard
           label="登录账号"
-          value={
-            workLogin ?? cnLogin ?? (env?.installed || envCn?.installed ? '未登录' : '未安装')
-          }
-          hint={
-            [
-              env?.installed || localEntitlement?.work
-                ? `Trae Work：${workLogin ?? '未登录'}`
-                : null,
-              envCn?.installed || localEntitlement?.cn ? `Trae：${cnLogin ?? '未登录'}` : null,
-            ]
-              .filter(Boolean)
-              .join(' · ') || undefined
-          }
+          value={login ?? (env?.installed ? '未登录' : '未安装')}
+          hint={env?.installed ? `Trae：${login ?? '未登录'}` : undefined}
           tone="violet"
         />
         <StatCard
           label="本机套餐"
-          value={
-            localEntitlement?.work?.identity_str ?? localEntitlement?.cn?.identity_str ?? (env?.installed || envCn?.installed ? '—' : '未安装')
-          }
+          value={localEntitlement?.identity_str ?? (env?.installed ? '—' : '未安装')}
           hint={entHint}
           tone="violet"
         />
@@ -230,13 +207,13 @@ export default function Dashboard() {
         />
       </div>
 
-      {!env?.installed && !envCn?.installed && (
+      {!env?.installed && (
         <div className="mt-5 card flex items-center justify-between gap-4 p-4">
           <div className="flex items-center gap-3">
             <ShieldAlert className="text-amber-500" />
             <div>
-              <div className="font-medium">未检测到 Trae Work / Trae 安装</div>
-              <div className="text-xs text-slate-500">代理捕获与账号切换同时支持 Trae Work 与 Trae，安装任一应用即可开始。</div>
+              <div className="font-medium">未检测到 Trae 安装</div>
+              <div className="text-xs text-slate-500">代理捕获与账号切换基于 Trae 客户端，安装后即可开始。</div>
             </div>
           </div>
           <button
@@ -247,7 +224,7 @@ export default function Dashboard() {
           </button>
         </div>
       )}
-      {!certInstalled && (env?.installed || envCn?.installed) && (
+      {!certInstalled && env?.installed && (
         <div className="mt-3 card flex items-center justify-between gap-4 p-4">
           <div className="flex items-center gap-3">
             <ShieldAlert className="text-amber-500" />

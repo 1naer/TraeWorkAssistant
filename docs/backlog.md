@@ -1,7 +1,8 @@
-# 产品优化需求清单（全应用统一待办）
+﻿# 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v3.0.2 · 2026-10-11
+> **文档版本**: v3.0.3 · 2026-10-14
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v3.0.3 变更**（2026-10-14）：新增 **F-82 Trae 双应用合并适配 ✅ 已完成**——官方将 Trae Work（TRAE SOLO）与 Trae CN IDE 合并为单一客户端，全工程按四期方案收敛单应用（后端 TargetApp 退役 TraeWork 别名 / uid 推导证据源收敛 / 存量 settings 键与快照池自动迁移 / 前端与文档同步），方案全文见 `docs/completed/Trae双应用合并适配调整方案.md`。
 > **v3.0.2 变更**（2026-10-11）：新增 **F-81 池耗尽后跨池重试**（P2，源自 2026-10-11 shared-groups-tags 调度全链路审查）：双源模型首选池在**执行期**逐账号耗尽（401/积分耗尽/SessionDead）时直接 503，即便其余池可服务——跨池回退目前仅在首调 `pool_health` 预检失败时生效，执行期耗尽不在覆盖面；条目含编排器外提方案（方案 A）与最小补丁方案（方案 B）论证。同批审查修复项（org_index invalidate 补漏、KEYS_STATE 锁外展开、load_index 单事务、Trae savePool 防护、per_model 编辑 UI 等）随当日改动直接落地，不占待办编号。
 > **v3.0.1 变更**（2026-10-06，补记）：**F-80 Qoder 平台全面支持 ✅ 已完成**——v3.7.0（2026-10-04）交付（详见 CHANGELOG 3.7.0 与本文 F-80 条目）：COSY 签名上游网关 + 积分看板三平台化（Trae/Buddy/Qoder）+ 账号三通道入池（PAT / OAuth 设备流 / IDE 扫描）+ 每日双活动签到 + qoder 四表；API 网关由三池升级为 **trae / buddy / qoder / custom 四池调度**。F-80-余 后续优化项状态见总览。
 > **v3.0 变更**（2026-09-26，待办全量复核 + F-75 收官）：① **F-75 macOS 平台支持标记 ✅ 已完成**——macos_main 分支产品化（2026-09-17~26，22 提交）：platform 服务层 + 平台门控 + dmg 构建流水线（db4efd4）、app_locate mac bundle 分派 + LaunchServices 启动（5c1f79a）、平台抽象层收敛（113350a）、R1-R3 真机收口 + 双平台二轮审查修复（4adf498）、三/四轮真机修复——vault 双源密钥 + mac JWT 本地捕获 + 切换链收口（97e4dd5）、CI 三产物矩阵 aarch64/x64/universal + 可选自签（3c89310）、package_macos.mjs dmg + 便携 zip（81a9870）、dmg 打包重试（16a9b3d）、局域网网卡黑名单补 mac 虚拟接口（3a31d17）、内置更新竞态修复（#37）+ macOS 手动安装引导（e96a218）；随 3.6.1/3.6.2 发 mac dmg，AGENT.md §11.1 双平台发版红线在案；② 其余待办经代码检索复核状态无变化（F-70 余项 tc 直读仍未接入 `apps_accounts_discover`；F-38/E-01/E-02/F-69/F-79 等确认未实施，状态属实）。
@@ -35,6 +36,7 @@
 | W-01 ❌ | Work 积分（209）接入 API 网关（多活会话编排） | Trae/网关 | — | — | 已排除（2026-09-15）：Trae 积分签到调整，前提与收益均不成立，见 §三/§四 |
 | F-70 | Trae tc 凭证直读 + ECDSA P-256 刷新情报核对 | Trae 生态 | **P2** | 1~2 天（余量） | **部分完成**（解密算法 + DeviceProof 已落地 2026-09-16；剩余账号发现直读接入） |
 | F-81 | 池耗尽后跨池重试（执行期耗尽的池间回退编排） | 网关 | **P2** | 2~3 天 | 待开发（2026-10-11 调度全链路审查产出，方案已论证见条目） |
+| F-82 ✅ | Trae 双应用合并适配（Trae Work 并入 Trae CN 单客户端，全链路收敛 + 存量迁移） | Trae 生态 | **P1** | 2~3 天（P0~P3 于 2026-10-14 当日完成） | 已完成（2026-10-14，方案见 docs/completed/Trae双应用合并适配调整方案.md） |
 | F-69 | Trae 会话导出存档（Markdown + 存档浏览器） | Trae 生态 | **P3** | 2~3 天 | 待开发 |
 | F-79 | 网关流式上游异步化（reqwest + async SSE 迁移） | 网关 | **P3** | 2~3 天 | 待开发（过渡方案 D-1/A/B/C/E 已落地 2026-09-16） |
 | E-03 | 豆包多模态端点（生图/生视频/音乐/文件中转站） | 豆包/网关 | **P3** | 3~4 天 | 待开发（依赖 E-01） |
@@ -218,6 +220,17 @@
 - **验收**：双源模型 + Buddy 池全部账号积分耗尽（模拟 401/额度尽）时，请求自动落 Trae 池成功且日志含 `cross_pool_retry`；`fallback=false` 时行为与现状完全一致（503）；MAX_ROTATE 全请求上限生效（不出现 6 轮轮换）；`ModelCooling` 等显式错误仍直接透传不跨池；`cargo test` 既有调度单测全绿 + 新增候选序/池游标单测。
 - **登记来源**：2026-10-11 shared-groups-tags（D1-D5）调度全链路审查——「池内账号耗尽不跨池回退（重试不重跑 resolve_target），双源弹性仅首调生效」审查发现 L3，用户裁定立项。
 
+### F-82 Trae 双应用合并适配（P1）✅ 已完成（2026-10-14）
+
+- **需求概述**：官方将 Trae Work（TRAE SOLO）与 Trae CN IDE 合并为单一客户端「Trae CN」，数据目录统一 `%APPDATA%\Trae CN`（icube 布局）。全工程按四期方案收敛单应用，方案全文见 `docs/completed/Trae双应用合并适配调整方案.md`。
+- **P0 后端收敛**：`TargetApp` 退役 TraeWork 别名（六变体 Trae/Doubao/WorkBuddy/CodeBuddy/Qoder/QoderWork，parse 未知值直接报错）；icube 档案指向 `%APPDATA%\Trae CN`；exe/进程白名单拒绝 `TRAE SOLO CN`；uid 推导退役 `solo.mobile.allowControl` 证据源、收敛三级链（storage.json `icube_gtm.users` → 客户端日志探测 → hybrid 合并取优）；`commands/env.rs` 删 `env_check` / `open_trae_app`（由 `env_check_trae_cn` / `open_trae_cn_app` 承接）；`models.rs` 删 `trae_path` 字段；签到 UA 白名单域保留品牌字面量；cargo test 全量通过。
+- **P1 存量迁移**：`store/migrate.rs::migrate_traework_merge`——settings 键迁移 + 旧池 `data/profiles` → `data/profiles_trae` 搬迁（去重、幂等、kv 标记防重入）；目标主槽已存在时整组入 `data/profiles_trae_work_legacy` 绝不覆盖；含单测。
+- **P2 前端收敛**：types / tauri 封装 / store / UI 组件去双应用分支（tsc 零错误）。
+- **P3 文档联动**：AGENT.md / README / user-manual / tech-framework / backlog / CHANGELOG 六文件同步。
+- **边界保留**：WorkBuddy 为腾讯独立应用不随合并退役；协议常量（`solo_work_lite` / `solo_agent`）与签到 UA 白名单字面量保留；Work 积分（product_id 209）协议术语不变。
+- **迁移预期**：迁移快照首用需在 Trae 重登一次该账号。
+- **登记来源**：用户实测本机升级（`C:\Users\tianw\AppData\Local\Programs\Trae CN`，TRAE SOLO CN 已不存在）+ 官方合并公告，2026-10-14 立项当日交付。
+
 ### F-69 Trae 会话导出存档（P3）
 
 - **需求概述**：用旧账号 JWT 调 SOLO 会话接口导出对话内容为 Markdown，按账号归档到助手数据目录，前端提供存档浏览器（按账号/日期/项目筛选）。不改变云端数据归属，零风控风险。**边界**：仅"存档"，新账号下不能继续对话——会话真迁移（场景 C）已被服务端 `user_id` 归属校验证伪，见 §四已排除项。
@@ -279,7 +292,7 @@
 
 ### F-75 macOS 平台支持（P3，分层归位）✅ 已完成（2026-09-26，macos_main 分支产品化）
 
-- **需求概述**：让助手与四应用（Trae Work / Trae CN / WorkBuddy+CodeBuddy / 豆包）的账号管理、切换、签到、网关能力在 macOS 可用。**迁移策略为「分层归位」而非整体重写**。
+- **需求概述**：让助手与三应用（Trae / WorkBuddy+CodeBuddy / 豆包）的账号管理、切换、签到、网关能力在 macOS 可用。**迁移策略为「分层归位」而非整体重写**。
 - **v2.6 复审背景**（2026-09-15，Python/PS 移除 + SQLite 迁移 + 定时任务 Rust 化完成后的全仓代码实测）：原 Windows 依赖全景中三大项已整体消失——① 切换桥（原表最大工作量项，PS 1534 行）已 Rust 化为 `switcher/` 且平台耦合收敛到 locate/proc/machine 三模块（其余 ~70% 纯文件层天然跨平台）；② Python 网络层与豆包脚本已全量 Rust 化，**原 M2「路径中立化」阶段整体取消**；③ 存储层已迁 SQLite（rusqlite bundled 跨平台）、Job Object 随 `python.rs` 删除消失、进度事件已进程内回调（无 stdout 桥）。**预估由 6~8 周下调至 3~4 周**。
 - **已天然跨平台（复审确认，无需处理）**：
   - **业务核心**：签到/积分/配额/续期/导出（`tasks/`，ureq 纯网络零 Windows 依赖）；SQLite 存储层（`store/`，bundled 编译）；API 网关（`api_server/`，hyper + rustls + rcgen 全跨平台栈）；CLI 任务模式 `--task-run`；`chatdata` 三件套与 WorkBuddy CLI 桥（`~/.workbuddy`/`~/.codebuddy` 惯例路径天然跨平台）。
@@ -311,7 +324,7 @@
   - **M3 打包分发（3~5 天）**：dmg + 公证 + updater 配置。
 - **参考开源项目**：`tauri-apps/tauri`（v2 多平台打包与 updater 官方范式）；`hwchen/keyring-rs`（三平台 secret store 统一抽象）；本项目既有 Rust 资产（`switcher/` 平台分派设计、`tasks/scheduler.rs` 跨平台调度、sysinfo 进程管理）。
 - **边界与风险**：①各目标应用 macOS 版布局是最大不确定性，M-1 侦察不通过的应用域先不支持（档案表按应用×平台灰度）；②Apple 签名公证需要 Developer ID 账号；③MITM 抓包在 macOS 需 Keychain 信任授权交互；④豆包 cookie 解密 mac 形态（Keychain Safe Storage）与 Windows DPAPI+AES-GCM 完全不同，属重写而非移植；⑤`machine.rs` 注册表层 mac 无等价物（MachineGuid），设备重置覆盖面在 mac 上降级（如实提示）。
-- **验收**：macOS 上完成 Trae Work 双账号切换 + WorkBuddy 切换 + 自动签到（内置调度器）+ 网关代理全链路；Windows 行为零变化（回归：现有 Rust 测试全绿 + 前端 tsc）。
+- **验收**：macOS 上完成 Trae 双账号切换 + WorkBuddy 切换 + 自动签到（内置调度器）+ 网关代理全链路；Windows 行为零变化（回归：现有 Rust 测试全绿 + 前端 tsc）。
 - **落地落点（2026-09-17~26，macos_main 分支 22 提交，产品化闭环 ✅）**：
   - **主体（db4efd4，09-17）**：platform 服务层 + 平台门控 + dmg 构建流水线；cert（`security add-trusted-cert`）/ proxy（networksetup/scutil）/ process（sysinfo）/ oauth / env / updater / checkin / device_proxy（bypass + ca + 绑定）等原 13 个 Windows 依赖点全量 mac 分支落地；
   - **定位与启动（5c1f79a）**：`app_locate` mac bundle 分派——`/Applications/<App>.app` 探测链 + LaunchServices 启动；**平台抽象层收敛（113350a）** + 整体黑盒复审修复（9504e3a）；

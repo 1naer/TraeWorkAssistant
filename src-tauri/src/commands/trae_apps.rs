@@ -1,18 +1,17 @@
-//! F-08 双应用账号自动发现 + Trae 会员/套餐信息展示
+//! F-08 账号自动发现 + Trae 会员/套餐信息展示
 //!
-//! 数据来源（本机实测，2026-09-07）：
-//! - `%APPDATA%\TRAE SOLO CN\User\globalStorage\storage.json`（Trae Work）
-//! - `%APPDATA%\Trae CN\User\globalStorage\storage.json`（Trae CN IDE）
+//! 数据来源（双应用合并后唯一客户端，本机实测 2026-10-14）：
+//! - `%APPDATA%\Trae CN\User\globalStorage\storage.json`
 //!
 //! **两套 uid 体系（重要）**：
 //! - `iCubeAuthInfo://icube-dc:<uid>` 键名中的 uid 是**账户中心（dc）id 空间**，
 //!   与账号池 / JWT `data.id` 的 **Cloud-IDE id 空间不是同一体系**（实测同一登录账号
 //!   dc=199439841787403 vs Cloud-IDE=2328112497170937），直接用会导致重复入池。
 //! - 因此当前登录账号的 Cloud-IDE uid 由本机使用痕迹推导：
-//!   1. Trae CN：storage.json `icube_gtm.users` 键名（仅记录当前/近期使用用户）；
-//!   2. Trae Work：state.vscdb（SQLite ItemTable）`solo.mobile.allowControl` 的
-//!      per-uid `updatedTime` 最新者，辅以 `<uid>:*` / `:user:<uid>` 键名证据计数；
-//!   3. 两应用证据合并取（最新时间, 证据数）最大者。
+//!   1. storage.json `icube_gtm.users` 键名（仅记录当前/近期使用用户，权重最高）；
+//!   2. state.vscdb（SQLite ItemTable）`<uid>:*` / `:user:<uid>` 等键名证据计数
+//!      （原 Trae Work 专属 `solo.mobile.allowControl` 证据源随双应用合并退役）；
+//!   3. 证据与桥标记按 hybrid 规则合并取优（见 current_cloud_uid_hybrid）。
 //! - 推导失败时回退展示 dc uid，但标记 `uid_confident=false` 并禁止入池，
 //!   避免再产生跨体系的重复账号。
 //!
@@ -30,14 +29,10 @@ use crate::state::AppState;
 const STORAGE_SUFFIX: &str = r"User\globalStorage\storage.json";
 const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
 
-/// 单个应用的数据目录候选（按优先级）
+/// 单个应用的数据目录候选（按优先级；双应用合并后仅 Trae → `%APPDATA%\Trae CN`）
 fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     match app_kind {
-        "TraeWork" => vec![
-            std::path::PathBuf::from(&appdata).join("TRAE SOLO CN"),
-            std::path::PathBuf::from(&appdata).join("TRAE SOLO"),
-        ],
         "Trae" => vec![std::path::PathBuf::from(&appdata).join("Trae CN")],
         _ => vec![],
     }
@@ -45,7 +40,6 @@ fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
 
 fn app_label(app_kind: &str) -> &str {
     match app_kind {
-        "TraeWork" => "Trae Work",
         "Trae" => "Trae",
         _ => app_kind,
     }
@@ -121,10 +115,10 @@ fn month_to_ts_ms(month: &str) -> i64 {
 
 /// 从 state.vscdb（SQLite ItemTable）提取 per-uid 使用证据。
 /// 覆盖的键模式（本机实测）：
-/// - `solo.mobile.allowControl`：JSON `{uid: {updatedTime}}`，含精确毫秒时间戳（最强证据）
 /// - `<uid>:...` 键名前缀（如 `<uid>:AI.agent.model...`）
 /// - `*:user:<uid>[:YYYY-MM]`（如 `commercial-banner-popup:...:user:<uid>:2026-09`）
 /// - `solo-lite-mode-state-map-<uid>`
+/// （原 Trae Work 专属证据源 `solo.mobile.allowControl` 已随双应用合并退役，不再读取）
 fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
     let mut out: HashMap<String, UidEvidence> = HashMap::new();
     let Some(db_path) = app_data_dirs(app_kind)
@@ -155,28 +149,8 @@ fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
         Err(_) => return out,
     };
     for row in rows.flatten() {
-        let (key, value) = row;
-        // 1) solo.mobile.allowControl：JSON {uid: {updatedTime}} —— 精确时间戳
-        if key == "solo.mobile.allowControl" {
-            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&value) {
-                if let Some(obj) = map.as_object() {
-                    for (uid, info) in obj {
-                        if !is_uid_token(uid) {
-                            continue;
-                        }
-                        let ts = info
-                            .get("updatedTime")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        let e = out.entry(uid.clone()).or_default();
-                        e.latest_ts_ms = e.latest_ts_ms.max(ts);
-                        e.count += 2;
-                    }
-                }
-            }
-            continue;
-        }
-        // 2) `solo-lite-mode-state-map-<uid>`
+        let (key, _value) = row;
+        // 1) `solo-lite-mode-state-map-<uid>`
         if let Some(rest) = key.strip_prefix("solo-lite-mode-state-map-") {
             if is_uid_token(rest.trim()) {
                 let e = out.entry(rest.trim().to_string()).or_default();
@@ -184,7 +158,7 @@ fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
             }
             continue;
         }
-        // 3) 键名冒号分段扫描：`<uid>:...` 前缀 与 `:user:<uid>[:YYYY-MM]`
+        // 2) 键名冒号分段扫描：`<uid>:...` 前缀 与 `:user:<uid>[:YYYY-MM]`
         let tokens: Vec<&str> = key.split(':').collect();
         for (i, t) in tokens.iter().enumerate() {
             let tt = t.trim();
@@ -257,7 +231,7 @@ fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<(Strin
 /// 旧版无 sidecar → ts=0（视为很旧，证据优先）。
 fn marker_with_ts(app_kind: &str, data_dir: &std::path::Path) -> Option<(String, i64)> {
     let profiles_dir = crate::switcher::profile::profile_for(
-        crate::switcher::TargetApp::parse(app_kind),
+        crate::switcher::TargetApp::parse(app_kind).ok()?,
         data_dir,
     )
     .profiles_dir;
@@ -338,9 +312,9 @@ pub struct DiscoveredAccount {
     pub dc_uid: Option<String>,
     /// Cloud-IDE uid 是否经本机使用证据确认（false 时 user_id 实为 dc uid，入池会重复）
     pub uid_confident: bool,
-    /// 应用类别：TraeWork | Trae
+    /// 应用类别：恒 "Trae"（双应用合并后唯一客户端）
     pub app: String,
-    /// 展示名：Trae Work / Trae
+    /// 展示名：恒 "Trae"
     pub app_label: String,
     /// 是否已在账号池
     pub in_pool: bool,
@@ -397,7 +371,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
     let known = pool_uid_set(&accounts);
 
     let mut out = Vec::new();
-    for kind in ["TraeWork", "Trae"] {
+    for kind in ["Trae"] {
         // 记录实际命中的 storage 路径用于展示
         let mut path_display = String::new();
         for dir in app_data_dirs(kind) {
@@ -466,7 +440,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
 /// 它是设备/数据中心级标识而非账号 id，不具备账号区分度。按用户要求预留记录，
 /// 供未来与外部数据源对账合并；不参与去重/合并/展示。
 ///
-/// 来源优先级：live 应用 storage.json（当前登录最准）→ profiles[_trae]/<uid> 快照。
+/// 来源优先级：live 应用 storage.json（当前登录最准）→ profiles_trae/<uid> 快照。
 pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<String> {
     let uid = user_id.trim();
     if uid.is_empty() {
@@ -483,22 +457,18 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
     {
         return None;
     }
-    // 候选来源：live 两应用 → 该账号两体系快照
+    // 候选来源：live 应用 → 该账号快照（唯一池 profiles_trae，双池已合并退役）
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    for kind in ["TraeWork", "Trae"] {
-        for dir in app_data_dirs(kind) {
-            candidates.push(dir.join(STORAGE_SUFFIX));
-        }
+    for dir in app_data_dirs("Trae") {
+        candidates.push(dir.join(STORAGE_SUFFIX));
     }
-    for prof in ["profiles", "profiles_trae"] {
-        candidates.push(
-            data_dir
-                .join("data")
-                .join(prof)
-                .join(uid)
-                .join(STORAGE_SUFFIX),
-        );
-    }
+    candidates.push(
+        data_dir
+            .join("data")
+            .join("profiles_trae")
+            .join(uid)
+            .join(STORAGE_SUFFIX),
+    );
     let mut found = None;
     for p in candidates {
         if !p.is_file() {
@@ -612,7 +582,7 @@ pub fn apps_account_add(
 
 #[derive(Serialize, Clone, Default)]
 pub struct AppEntitlement {
-    /// 应用类别：TraeWork | Trae
+    /// 应用类别：恒 "Trae"（双应用合并后唯一客户端）
     pub app: String,
     /// 展示名
     pub app_label: String,
@@ -626,12 +596,6 @@ pub struct AppEntitlement {
     pub identity: Option<i64>,
     /// 服务端最后同步时间（毫秒）
     pub last_sync_time: Option<i64>,
-}
-
-#[derive(Serialize, Clone)]
-pub struct LocalEntitlement {
-    pub work: Option<AppEntitlement>,
-    pub cn: Option<AppEntitlement>,
 }
 
 fn parse_entitlement(kind: &str, storage: &serde_json::Value) -> Option<AppEntitlement> {
@@ -690,14 +654,17 @@ fn app_login(
     })
 }
 
-/// 读取本机两个 Trae 应用当前登录账号（uid + 账号池展示名）与套餐信息。
-/// async 派发：Trae Work 登录推导需全表读取 state.vscdb（可达数十 MB），同步会冻住 UI。
+/// 读取本机 Trae 客户端（双应用合并后唯一客户端）当前登录账号（uid + 账号池展示名）
+/// 与套餐信息。原 `LocalEntitlement { work, cn }` 双登录位结构已随合并去壳单值化：
+/// 未安装/未登录时返回 app="Trae" 的空壳（uid/套餐字段均为 null）。
+/// async 派发：登录推导需全表读取 state.vscdb（可达数十 MB），同步会冻住 UI。
 #[tauri::command(async)]
-pub fn apps_entitlement_read(state: State<AppState>) -> Result<LocalEntitlement, String> {
+pub fn apps_entitlement_read(state: State<AppState>) -> AppEntitlement {
     let accounts = crate::vault::load_accounts(&state);
-    Ok(LocalEntitlement {
-        work: app_login("TraeWork", &accounts, &state.data_dir),
-        cn: app_login("Trae", &accounts, &state.data_dir),
+    app_login("Trae", &accounts, &state.data_dir).unwrap_or_else(|| AppEntitlement {
+        app: "Trae".into(),
+        app_label: "Trae".into(),
+        ..Default::default()
     })
 }
 
@@ -825,7 +792,7 @@ mod tests {
         .unwrap();
         // 桥标记指向另一账号（hybrid 会选它）：sidecar 远未来 → 证据恒输
         let prof_dir = crate::switcher::profile::profile_for(
-            crate::switcher::TargetApp::TraeWork,
+            crate::switcher::TargetApp::Trae,
             &base,
         )
         .profiles_dir;
@@ -838,12 +805,12 @@ mod tests {
         .unwrap();
         // 有日志 → 日志 uid 优先（issue #55：手动重登新账号后不再被标记带偏）
         assert_eq!(
-            live_cloud_uid_with(Some(app_dir.clone()), "TraeWork", &base).as_deref(),
+            live_cloud_uid_with(Some(app_dir.clone()), "Trae", &base).as_deref(),
             Some("3401253136383392")
         );
         // 日志不可用 → 回退 hybrid（标记）
         assert_eq!(
-            live_cloud_uid_with(None, "TraeWork", &base).as_deref(),
+            live_cloud_uid_with(None, "Trae", &base).as_deref(),
             Some("2011463847263801")
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -894,7 +861,7 @@ mod tests {
     }
 
     /// marker_with_ts：标记 uid + sidecar 切换时刻（缺失 sidecar → ts=0；
-    /// BOM 剥离与 profiles 目录路由按档案表）
+    /// BOM 剥离与 profiles 目录路由按档案表；未知 kind → None）
     #[test]
     fn marker_with_ts_读取标记与切换时刻() {
         let data = std::env::temp_dir().join(format!(
@@ -906,19 +873,16 @@ mod tests {
                 .subsec_nanos()
         ));
         let _ = std::fs::remove_dir_all(&data);
-        // TraeWork → data/data/profiles（档案表路由）
-        let dir = crate::switcher::profile::profile_for(
-            crate::switcher::TargetApp::TraeWork,
-            &data,
-        )
-        .profiles_dir;
+        // Trae → data/data/profiles_trae（档案表路由）
+        let dir = crate::switcher::profile::profile_for(crate::switcher::TargetApp::Trae, &data)
+            .profiles_dir;
         std::fs::create_dir_all(&dir).unwrap();
         // 无标记 → None
-        assert_eq!(marker_with_ts("TraeWork", &data), None);
+        assert_eq!(marker_with_ts("Trae", &data), None);
         // 带侧标记（PS 时代 BOM）无 sidecar → uid 有、ts=0
         std::fs::write(dir.join("current_account.txt"), "\u{feff}4487568582777872").unwrap();
         assert_eq!(
-            marker_with_ts("TraeWork", &data),
+            marker_with_ts("Trae", &data),
             Some(("4487568582777872".into(), 0))
         );
         // sidecar 写入切换时刻
@@ -928,22 +892,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            marker_with_ts("TraeWork", &data),
-            Some(("4487568582777872".into(), 1_789_500_000_000))
-        );
-        // Trae → data/data/profiles_trae（互不串台）
-        let dir2 = crate::switcher::profile::profile_for(crate::switcher::TargetApp::Trae, &data)
-            .profiles_dir;
-        std::fs::create_dir_all(&dir2).unwrap();
-        std::fs::write(dir2.join("current_account.txt"), "2328112497170937").unwrap();
-        assert_eq!(
             marker_with_ts("Trae", &data),
-            Some(("2328112497170937".into(), 0))
-        );
-        assert_eq!(
-            marker_with_ts("TraeWork", &data),
             Some(("4487568582777872".into(), 1_789_500_000_000))
         );
+        // 未知 kind（已退役的 TraeWork 等）→ parse Err → None
+        assert_eq!(marker_with_ts("TraeWork", &data), None);
         let _ = std::fs::remove_dir_all(&data);
     }
 }

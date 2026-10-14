@@ -64,7 +64,6 @@ impl Action {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetApp {
-    TraeWork,
     Trae,
     Doubao,
     WorkBuddy,
@@ -78,17 +77,19 @@ pub enum TargetApp {
 }
 
 impl TargetApp {
-    /// PS ValidateSet 对译：未知值回退 TraeWork（调用方为自家前端恒传合法值，
-    /// 回退比硬失败更稳；PS ValidateSet 直接拒绝，此为 8.2 #10 有意差异）
-    pub fn parse(s: &str) -> TargetApp {
+    /// PS ValidateSet 对译：未知值返回 Err（调用方为自家前端恒传合法值）。
+    /// 2026-10-14 Trae Work 与 Trae CN 合并为单一客户端后退役 TraeWork 变体，
+    /// 原「未知值回退 TraeWork」兜底随之移除，不留兼容别名（存量持久化字符串
+    /// 由 store 迁移一次性改写）
+    pub fn parse(s: &str) -> Result<TargetApp, String> {
         match s {
-            "Trae" => TargetApp::Trae,
-            "Doubao" => TargetApp::Doubao,
-            "WorkBuddy" => TargetApp::WorkBuddy,
-            "CodeBuddy" => TargetApp::CodeBuddy,
-            "Qoder" => TargetApp::Qoder,
-            "QoderWork" => TargetApp::QoderWork,
-            _ => TargetApp::TraeWork,
+            "Trae" => Ok(TargetApp::Trae),
+            "Doubao" => Ok(TargetApp::Doubao),
+            "WorkBuddy" => Ok(TargetApp::WorkBuddy),
+            "CodeBuddy" => Ok(TargetApp::CodeBuddy),
+            "Qoder" => Ok(TargetApp::Qoder),
+            "QoderWork" => Ok(TargetApp::QoderWork),
+            other => Err(format!("未知应用类型: {other}")),
         }
     }
 }
@@ -332,6 +333,30 @@ pub fn path_eq(a: &Path, b: &Path) -> bool {
 
 // ── current_account.txt 读写 ────────────────────────────────────────────────
 
+/// 当前登录态回写标记槽的决策（纯函数，供 switch_flow 与单测；2026-10-14 审查
+/// 修复抽出）。`probed_uid` 为 stop 后权威重探的 uid（hybrid 值或空），
+/// `not_logged_in` = 三态探测判 SessionNoUid。
+#[derive(Debug, PartialEq, Eq)]
+enum CurrentWriteback {
+    /// 探测 uid 与标记账号一致 → 回写该账号槽
+    Backup(String),
+    /// 客户端本次运行未登录 → 绝不回写（防未登录现场毁槽；优先级最高，
+    /// 即便过期 hybrid 值恰好等于标记账号也不回写）
+    SkipNotLoggedIn,
+    /// 探测 uid 与标记不一致或无探测值 → 跳过（防误覆盖）
+    SkipMismatch,
+}
+
+fn classify_current_writeback(probed_uid: &str, not_logged_in: bool, cur: &str) -> CurrentWriteback {
+    if not_logged_in {
+        return CurrentWriteback::SkipNotLoggedIn;
+    }
+    if !probed_uid.is_empty() && probed_uid == cur {
+        return CurrentWriteback::Backup(cur.to_string());
+    }
+    CurrentWriteback::SkipMismatch
+}
+
 /// PS Get-CurrentAccount 对译。PS 5.1 Set-Content -Encoding UTF8 写入带 BOM
 ///（doubao.rs / workbuddy accounts 既有读取同为三段式剥 BOM）。Rust trim() 不剥
 /// U+FEFF（非 White_Space 字符），存量文件不显式剥离会读出 "\u{FEFF}uid" →
@@ -386,7 +411,7 @@ fn fatal_line(msg: &str) -> String {
 // ── 布局分派（PS Backup-CurrentProfile / Restore-Profile 分派头）────────────
 
 /// L2 身份硬校验（2026-09-29 实测事故：1335 登录态被「保存当前登录态→4487」
-/// 写进 4487 槽）。仅 icube 布局（TraeWork/Trae）有可靠日志数据源。
+/// 写进 4487 槽）。仅 Trae（icube 布局）有可靠日志数据源。
 ///
 /// 必须在 stop_app 之后（日志已完整落盘）、backup_current 之前（后者内部
 /// rotate_bak 会覆盖槽位，拦截必须发生在任何写操作前）调用。探测与目标不符 →
@@ -396,7 +421,7 @@ fn fatal_line(msg: &str) -> String {
 /// 覆盖污染 B 的槽位（icube 布局 1335/4487 同型事故）。
 /// live 探测按布局分派（2026-10-02 审查重构）：
 /// - icube：命令层预探测优先（Qoder 保存链 vscdb secret://userInfo 解密传入，唯一
-///   可靠源）；空则日志探测回退——仅 TraeWork/Trae（Qoder 池 id 为 qd-<hex> 形态，
+///   可靠源）；空则日志探测回退——仅 Trae（Qoder 池 id 为 qd-<hex> 形态，
 ///   与日志数字 uid 永不相等，回退会把「格式不同」误判为「登录了别的账号」恒拒保存）
 /// - electron_root（QoderWork）：预探测（命令层 live_work_account_id 解密 auth.v1.dat
 ///   user.id；2026-10-04 实测修正——Cookies 库无 qoderuid cookie，原探测恒空守卫失效）
@@ -407,20 +432,43 @@ fn save_identity_guard(
     uid: &str,
     sink: &dyn ProgressSink,
 ) -> Result<(), String> {
-    let live = match sess.prof.layout {
+    let probe = match sess.prof.layout {
         Layout::Icube => {
             if !sess.expected_current_uid.is_empty() {
-                Some(sess.expected_current_uid.clone())
-            } else if matches!(sess.target, TargetApp::TraeWork | TargetApp::Trae) {
-                icube::detect_live_uid(&sess.prof.data_dir)
+                Some(icube::LiveUidProbe::Uid(sess.expected_current_uid.clone()))
+            } else if sess.target == TargetApp::Trae {
+                Some(icube::probe_live_uid(&sess.prof.data_dir))
             } else {
                 None
             }
         }
-        Layout::ElectronRoot => {
-            (!sess.expected_current_uid.is_empty()).then(|| sess.expected_current_uid.clone())
-        }
+        Layout::ElectronRoot => (!sess.expected_current_uid.is_empty())
+            .then(|| icube::LiveUidProbe::Uid(sess.expected_current_uid.clone())),
         _ => return Ok(()),
+    };
+    // Trae 未登录三态（2026-10-14 合并版实测）：最新会话日志存在但无任何带 uid 的
+    // 请求 = 客户端本次运行期间未登录——fail-closed 拒绝保存。原 fail-open 会把
+    // 未登录现场写进目标槽位（槽位毁灭：之后「切换」到该账号恒恢复出未登录态）。
+    if matches!(probe, Some(icube::LiveUidProbe::SessionNoUid)) {
+        let msg = format!(
+            "客户端当前未登录（最新会话日志无登录请求记录），已拒绝保存，\
+             避免把未登录现场写入账号 {uid} 的快照；请先在客户端登录账号 {uid} 后再「保存当前登录态」。"
+        );
+        // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
+        // 失败仅 Warn，不影响拒绝结果
+        if let Err(e) = proc::start_app(sess, sink) {
+            sink.step(
+                "guard",
+                StepStatus::Warn,
+                &format!("客户端重启失败，请手动打开: {e}"),
+            );
+        }
+        sink.step("fatal", StepStatus::Error, &format!("失败: {msg}"));
+        return Err(fatal_line(&format!("[fatal] {msg}")));
+    }
+    let live = match probe {
+        Some(icube::LiveUidProbe::Uid(live)) => Some(live),
+        _ => None,
     };
     match live {
         Some(live) if live != uid => {
@@ -524,7 +572,7 @@ fn restore_profile(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) -> R
     // 恢复项计数（Switch 恢复后校验用）：每次恢复先重置为 -1；icube/electron_root
     // 结尾写实际值。校验处用 -le 0 拦截：等价于 0 项拷贝=快照空/损坏；-1 作为防御一并拦下。
     sess.last_restored_count = -1;
-    // F-68：icube 布局（TraeWork/Trae）恢复前抽出 state.vscdb 的两个全局键
+    // F-68：icube 布局（Trae/Qoder）恢复前抽出 state.vscdb 的两个全局键
     //（项目列表 / 最近打开），恢复后按条目合并回写——账号分区键零改动。
     // 仅在恢复成功时合并；失败已由布局实现侧处理，合并失败按 warn 处理不阻断。
     let keep_keys = if sess.prof.layout == Layout::Icube {
@@ -868,32 +916,69 @@ fn switch_flow(
     // 保存当前登录态到 "last" 槽位（安全备份）
     backup_current(sess, "last", sink)?;
 
+    // 权威重探（2026-10-14 合并版实测增强）：stop 后最新会话日志已完整，Trae 对
+    // live uid 重探三态分派——
+    // - Uid：权威证据，覆盖 pre-stop 探测值；
+    // - SessionNoUid：客户端本次运行期间未登录（会话日志无任何带 uid 的请求），
+    //   禁止回写标记槽——实测 093318 会话（恢复 2803 后客户端 21 秒内未登录退出）
+    //   曾因 fail-open 把未登录现场刷进 2803 槽，造成「切回来恒未登录」的槽位毁灭；
+    // - NoEvidence：维持 pre-stop 探测值（原 fail-open 语义，全新安装等场景）。
+    let mut expected_uid = expected_uid.to_string();
+    let mut not_logged_in = false;
+    if sess.target == TargetApp::Trae {
+        match icube::probe_live_uid(&sess.prof.data_dir) {
+            icube::LiveUidProbe::Uid(u) => expected_uid = u,
+            // 清空 pre-stop hybrid 值：它可能恰为标记账号（上次切换失败残留），
+            // 不清空会让下方第一分支命中、未登录现场照样刷进标记槽（实测 2803 槽
+            // 污染复刻路径）。SessionNoUid = 权威证据「本次运行未登录」，
+            // pre-stop 的任何推断值一律作废
+            icube::LiveUidProbe::SessionNoUid => {
+                not_logged_in = true;
+                expected_uid.clear();
+            }
+            icube::LiveUidProbe::NoEvidence => {}
+        }
+    }
+
     // 防误覆盖守卫：仅当桌面端检测到的当前登录（expected_uid）与标记文件一致时才
     // 回写账号槽。不一致/未检测到 = 客户端很可能已手动重登或处于未登录态，此时把
     // "当前态"刷进标记槽会把错误内容覆盖掉该账号的快照（实测 B 被覆盖根因），
     // 故跳过并警告——last 槽始终有完整备份可回退。
     if let Some(cur) = get_current_account(sess) {
         if cur != uid {
-            if !expected_uid.is_empty() && expected_uid == cur {
-                backup_current(sess, &cur, sink)?;
-                sink.step(
-                    "backup",
-                    StepStatus::Ok,
-                    &format!("当前账号 {cur} 的登录态已备份"),
-                );
-            } else {
-                sink.step(
-                    "backup",
-                    StepStatus::Warn,
-                    &format!(
-                        "检测到的当前登录（{}）与标记账号 {cur} 不一致，已跳过回写该账号槽位（当前态仍备份到 last），防止误覆盖",
-                        if expected_uid.is_empty() {
-                            "未识别或未检测到登录会话"
-                        } else {
-                            expected_uid
-                        }
-                    ),
-                );
+            match classify_current_writeback(&expected_uid, not_logged_in, &cur) {
+                CurrentWriteback::Backup(slot) => {
+                    backup_current(sess, &slot, sink)?;
+                    sink.step(
+                        "backup",
+                        StepStatus::Ok,
+                        &format!("当前账号 {slot} 的登录态已备份"),
+                    );
+                }
+                CurrentWriteback::SkipNotLoggedIn => {
+                    sink.step(
+                        "backup",
+                        StepStatus::Warn,
+                        &format!(
+                            "客户端本次运行期间未登录（最新会话日志无登录请求记录），已跳过回写该账号槽位，\
+                             防止把未登录现场写入账号 {cur} 的快照（当前态仍备份到 last）"
+                        ),
+                    );
+                }
+                CurrentWriteback::SkipMismatch => {
+                    sink.step(
+                        "backup",
+                        StepStatus::Warn,
+                        &format!(
+                            "检测到的当前登录（{}）与标记账号 {cur} 不一致，已跳过回写该账号槽位（当前态仍备份到 last），防止误覆盖",
+                            if expected_uid.is_empty() {
+                                "未识别或未检测到登录会话"
+                            } else {
+                                &expected_uid
+                            }
+                        ),
+                    );
+                }
             }
         }
     }
@@ -978,7 +1063,55 @@ fn switch_flow(
 
     apply_fingerprint_override(sess, sink);
     set_current_account(sess, uid);
+    // baseline：start 前的最新会话，供切换后身份确认只认「比它更新的会话」
+    let baseline = icube::newest_session_dir(&sess.prof.data_dir);
     proc::start_app(sess, sink)?;
+
+    // Trae 登录身份确认（2026-10-14 合并版实测增强）：合并版客户端启动即产生新
+    // 会话与 dynamicConfig.log，其 uid 是「实际登录是谁」的直接证据。实测：恢复
+    // 被污染的槽位会静默登录为其他账号（2328 槽恢复后实际登录 1448）、恢复失效
+    // 会话则停在未登录界面——如实在 done 文案中告知，不再静默报「切换成功」。
+    if sess.target == TargetApp::Trae {
+        match icube::confirm_switch_uid(
+            &sess.prof.data_dir,
+            uid,
+            baseline,
+            std::time::Duration::from_secs(20),
+        ) {
+            icube::SwitchVerify::Mismatch(actual) => {
+                // 桥标记纠偏（2026-10-14 审查修复）：1030 行刚把标记写成 uid，但日志
+                // 权威证据表明实际登录为 actual——维持 uid 会让 hybrid 回退把「标记
+                // 说 uid」误报为当前登录（保存守卫文案失真、扫描误报已入池）。
+                // set_current_account 会同步刷新 switchedAt，hybrid 读侧据此采信
+                set_current_account(sess, &actual);
+                sink.step(
+                    "switch",
+                    StepStatus::Warn,
+                    &format!("检测到客户端实际登录为 {actual}，桥标记已同步纠正为 {actual}"),
+                );
+                return done(
+                    sink,
+                    &format!(
+                        "已切换至账号 {uid}（警告：客户端实际登录为 {actual}，该快照可能已被其他账号污染；\
+                         请在客户端手动登录账号 {uid} 后点「保存当前登录态」覆盖修复）"
+                    ),
+                );
+            }
+            icube::SwitchVerify::Timeout => {
+                // 标记维持 uid：超时可能是 NEED_REFRESH 慢登录（稍后仍会登入 uid），
+                // 也可能确实未登录（此时标记过期，但保存侧 L2 三态探测 fail-closed
+                // 已兜底，不会据此误写入槽位），无更优单值可写
+                return done(
+                    sink,
+                    &format!(
+                        "已切换至账号 {uid}（警告：20 秒内未确认登录身份，该快照的登录会话可能已失效；\
+                         若客户端未登录，请手动登录后点「保存当前登录态」重建快照）"
+                    ),
+                );
+            }
+            icube::SwitchVerify::Ok => {}
+        }
+    }
 
     // authfile 布局：verify 超时 ≠ 切换失败（快照已恢复、客户端已启动），但必须在
     // done 里如实告知「登录身份未确认」，否则前端报「切换成功」掩盖未登录事实
@@ -1177,7 +1310,7 @@ mod tests {
     fn glob_大小写不敏感与ps_like语义一致() {
         assert!(glob_match_ci("*Doubao*", "doubao.lnk"));
         assert!(glob_match_ci("*TRAE*", "Trae Setup.lnk"));
-        assert!(glob_match_ci("Trae*", "TRAE SOLO CN"));
+        assert!(glob_match_ci("Trae*", "TRAE CN"));
         assert!(glob_match_ci("*豆包*", "豆包.lnk"));
         assert!(!glob_match_ci("*Doubao*", "wechat.lnk"));
         assert!(glob_match_ci("exact", "exact"));
@@ -1199,12 +1332,12 @@ mod tests {
     #[test]
     fn get_current_account_剥存量bom() {
         let dir = std::env::temp_dir().join(format!("sw-mod-test-{}", std::process::id()));
-        let prof_dir = dir.join("data").join("profiles");
+        let prof_dir = dir.join("data").join("profiles_trae");
         std::fs::create_dir_all(&prof_dir).unwrap();
         std::fs::write(prof_dir.join("current_account.txt"), "\u{feff}4487568582777872").unwrap();
         let mut args = RunArgs {
             action: Action::KeepAlive,
-            target_app: TargetApp::TraeWork,
+            target_app: TargetApp::Trae,
             user_id: None,
             proxy_port: None,
             include_indexeddb: false,
@@ -1212,7 +1345,7 @@ mod tests {
             machine_id_override: None,
             data_dir: dir.clone(),
         };
-        args.target_app = TargetApp::TraeWork;
+        args.target_app = TargetApp::Trae;
         let sess = Session::new(&args);
         assert_eq!(get_current_account(&sess).as_deref(), Some("4487568582777872"));
         // 无 BOM 正常读取
@@ -1233,7 +1366,7 @@ mod tests {
         let r = run_action(
             RunArgs {
                 action: Action::Switch,
-                target_app: TargetApp::TraeWork,
+                target_app: TargetApp::Trae,
                 user_id: None,
                 proxy_port: None,
                 include_indexeddb: false,
@@ -1257,7 +1390,7 @@ mod tests {
         let r = run_action(
             RunArgs {
                 action: Action::Switch,
-                target_app: TargetApp::TraeWork,
+                target_app: TargetApp::Trae,
                 user_id: Some("../evil".into()),
                 proxy_port: None,
                 include_indexeddb: false,
@@ -1281,12 +1414,44 @@ mod tests {
 
     #[test]
     fn step_line_四字段齐全() {
-        let line = step_line("stop", StepStatus::Running, "正在关闭 Trae Work");
+        let line = step_line("stop", StepStatus::Running, "正在关闭 Trae");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["stage"], "stop");
         assert_eq!(v["status"], "running");
-        assert_eq!(v["message"], "正在关闭 Trae Work");
+        assert_eq!(v["message"], "正在关闭 Trae");
         assert!(v["time"].as_str().unwrap().contains(':'));
+    }
+
+    #[test]
+    fn parse_未知值返回err且不设traework别名() {
+        assert!(matches!(TargetApp::parse("Trae"), Ok(TargetApp::Trae)));
+        assert!(matches!(TargetApp::parse("QoderWork"), Ok(TargetApp::QoderWork)));
+        // 合并退役：不允许 "TraeWork" 兼容别名，未知值一律 Err
+        assert!(TargetApp::parse("TraeWork").is_err());
+        assert!(TargetApp::parse("trae").is_err());
+        assert!(TargetApp::parse("").is_err());
+    }
+
+    #[test]
+    fn 回写决策_未登录优先级最高且过期hybrid值不参与() {
+        use CurrentWriteback::{Backup, SkipMismatch, SkipNotLoggedIn};
+        // 未登录：即使过期 hybrid 值恰好等于标记账号（2803 槽污染复刻路径），也绝不回写
+        assert_eq!(
+            classify_current_writeback("2803", true, "2803"),
+            SkipNotLoggedIn
+        );
+        // 探测 uid 与标记一致 → 回写
+        assert_eq!(
+            classify_current_writeback("2328", false, "2328"),
+            Backup("2328".into())
+        );
+        // 探测值与标记不一致 → 跳过
+        assert_eq!(
+            classify_current_writeback("1448", false, "2328"),
+            SkipMismatch
+        );
+        // 无探测值（NoEvidence fail-open 维持）→ 跳过
+        assert_eq!(classify_current_writeback("", false, "2328"), SkipMismatch);
     }
 
     // ── bootstrap_snapshot_from_token_store（issue #78 方案 A）─────────────────

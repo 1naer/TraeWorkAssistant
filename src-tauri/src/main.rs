@@ -141,11 +141,9 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
-            commands::env::env_check,
             commands::env::app_locate,
             commands::env::open_doubao_app,
             commands::env::open_trae_website,
-            commands::env::open_trae_app,
             commands::env::env_check_trae_cn,
             commands::env::open_trae_cn_app,
             commands::env::open_workbuddy_app,
@@ -200,6 +198,8 @@ fn main() {
             commands::misc::logs_query,
             commands::misc::logs_clear,
             commands::misc::startup_notice_take,
+            commands::misc::traework_migration_guide,
+            commands::misc::traework_migration_guide_dismiss,
             commands::misc::settings_get,
             commands::misc::settings_set,
             commands::misc::notify_test,
@@ -398,6 +398,13 @@ fn main() {
             // 注意：必须先于 vault 迁移执行——JSON 中的明文凭据先入库，
             // 再由随后的 vault::migrate_on_startup 收敛进 Stronghold 并从库中占位化抹除。
             if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir) {
+                fs_utils::app_log(&state.data_dir, &summary);
+            }
+
+            // TraeWork 双应用合并存量迁移（docs/completed/Trae双应用合并适配调整方案.md §5.8）：
+            // settings trae_path 退役 + 旧快照池 profiles 整组搬迁（幂等；
+            // Trae 运行中自动跳过下次重试），必须先于 settings 消费执行
+            if let Some(summary) = store::migrate::migrate_traework_merge(&state.data_dir) {
                 fs_utils::app_log(&state.data_dir, &summary);
             }
 
