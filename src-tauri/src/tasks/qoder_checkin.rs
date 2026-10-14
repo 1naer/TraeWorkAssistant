@@ -594,14 +594,23 @@ enum BlindStep {
     Failed(u16),
 }
 
-fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool) -> BlindStep {
+fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind: Option<&str>) -> BlindStep {
     if status == 401 {
         return BlindStep::Auth;
     }
     if (200..=201).contains(&status) {
         return match claimed {
-            Some("CLAIMED") if !replayed => BlindStep::FreshClaim,
-            Some("CLAIMED") => BlindStep::Replay,
+            Some("CLAIMED") => {
+                // 奖励类型防线（审查 P2）：领取响应 benefit.kind 显式非 CREDITS
+                //（如 BOGO）时不判 FreshClaim/Replay——盲发目标是每日积分活动，
+                // 非积分领取伪装成 success / 非积分回放伪装成 already 都会掩盖
+                // 「积分未领」的真话；kind 缺失不降级（宁不判负不误杀真实
+                // success，与 benefit_is_credits 缺失从严的对称取舍）
+                if kind.is_some_and(|k| !k.eq_ignore_ascii_case("CREDITS")) {
+                    return BlindStep::Failed(status);
+                }
+                if replayed { BlindStep::Replay } else { BlindStep::FreshClaim }
+            }
             // 200 但非 CLAIMED 形态（未知响应结构）不宽容——盲发语义已探针锁定
             _ => BlindStep::Failed(status),
         };
@@ -647,8 +656,10 @@ enum FallbackOutcome {
     Auth(Option<f64>),
     /// 存在失败条目（4xx/5xx/网络/未知形态）——如实报 fail，触发调度器
     /// 指数退避重试 + UI 显示真话（即使同时有成功条目：claim 幂等，重试轮次
-    /// 以列表已领判定/回放确认，不产生重复领取副作用）
-    Failed(String),
+    /// 以列表已领判定/回放确认，不产生重复领取副作用）。已累计 reward 随行
+    /// 不丢弃（真实入账不因整体 fail 而回滚，对齐 Auth 变体语义；无成功场景
+    /// 下必为 None——统一透传防未来演进丢账，审查 P3）
+    Failed(String, Option<f64>),
 }
 
 /// 盲发兜底聚合判定（纯函数，可单测）。优先级：
@@ -672,7 +683,7 @@ fn aggregate_fallback(
         if any_fresh {
             msg = format!("{}；{}", messages.join("；"), msg);
         }
-        return FallbackOutcome::Failed(msg);
+        return FallbackOutcome::Failed(msg, reward);
     }
     if any_fresh {
         return FallbackOutcome::Success(messages.join("；"), reward);
@@ -681,9 +692,9 @@ fn aggregate_fallback(
         return FallbackOutcome::AlreadyReplayed;
     }
     if !stale_parts.is_empty() {
-        return FallbackOutcome::Failed(stale_parts.join("；"));
+        return FallbackOutcome::Failed(stale_parts.join("；"), reward);
     }
-    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into())
+    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into(), reward)
 }
 
 /// 盲发单轮聚合中间态（纯数据，可单测）：一圈候选的归类结果，
@@ -782,7 +793,14 @@ fn blind_round(
             .and_then(|b| fs_utils::dig(b, &["replayed", "data.replayed"]))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        match classify_blind_step(status, claimed.as_deref(), replayed) {
+        // 领取响应的奖励类型（benefit.kind，与 FreshClaim 分支 amount 同路径）：
+        // 供 classify_blind_step 校验非 CREDITS 领取不误报 success/already
+        let kind = body
+            .as_ref()
+            .and_then(|b| b.get("benefit"))
+            .and_then(|x| x.get("kind"))
+            .and_then(Value::as_str);
+        match classify_blind_step(status, claimed.as_deref(), replayed, kind) {
             BlindStep::Auth => {
                 round.auth = true;
                 return round;
@@ -967,7 +985,7 @@ fn process_account(
                         FallbackOutcome::Auth(r) => {
                             ("auth".into(), "登录态失效（401）".into(), r)
                         }
-                        FallbackOutcome::Failed(m) => ("fail".into(), m, None),
+                        FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
                     }
                 }
             } else {
@@ -1065,7 +1083,7 @@ fn process_account(
                                     FallbackOutcome::Auth(r) => {
                                         ("auth".into(), "登录态失效（401）".into(), r)
                                     }
-                                    FallbackOutcome::Failed(m) => ("fail".into(), m, None),
+                                    FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
                                 }
                             }
                         } else {
@@ -1424,27 +1442,61 @@ mod tests {
     }
 
     /// 盲发单步归类：非明确成功/回放形态一律 Failed（宁 fail 不假 already）；
-    /// 401 单列走 auth 自愈
+    /// 401 单列走 auth 自愈；显式非 CREDITS 领取不误报 success/already
     #[test]
     fn blind_step_classification() {
         use BlindStep::*;
-        // 200+CLAIMED+!replayed → 真实新领取
-        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), false), FreshClaim));
-        assert!(matches!(classify_blind_step(201, Some("CLAIMED"), false), FreshClaim));
+        // 200+CLAIMED+!replayed → 真实新领取（kind 缺失不降级：宁不判负不误杀真实 success）
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), false, None), FreshClaim));
+        assert!(matches!(classify_blind_step(201, Some("CLAIMED"), false, None), FreshClaim));
         // 幂等回放
-        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), true), Replay));
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), true, None), Replay));
         // 200 但非 CLAIMED 形态（未知响应结构）→ Failed（不再宽容吞掉）
-        assert!(matches!(classify_blind_step(200, None, false), Failed(200)));
+        assert!(matches!(classify_blind_step(200, None, false, None), Failed(200)));
         assert!(matches!(
-            classify_blind_step(200, Some("PENDING"), false),
+            classify_blind_step(200, Some("PENDING"), false, None),
             Failed(200)
         ));
         // 4xx/5xx/网络 status=0 → Failed
-        assert!(matches!(classify_blind_step(400, None, false), Failed(400)));
-        assert!(matches!(classify_blind_step(500, None, false), Failed(500)));
-        assert!(matches!(classify_blind_step(0, None, false), Failed(0)));
+        assert!(matches!(classify_blind_step(400, None, false, None), Failed(400)));
+        assert!(matches!(classify_blind_step(500, None, false, None), Failed(500)));
+        assert!(matches!(classify_blind_step(0, None, false, None), Failed(0)));
         // 401 → Auth
-        assert!(matches!(classify_blind_step(401, None, false), Auth));
+        assert!(matches!(classify_blind_step(401, None, false, None), Auth));
+
+        // ── 奖励类型防线（审查 P2）：benefit.kind 非 CREDITS 的领取不误报 ──
+        // ① CREDITS 正向（含大小写宽容）→ FreshClaim / Replay 不受影响
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), false, Some("CREDITS")),
+            FreshClaim
+        ));
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), false, Some("credits")),
+            FreshClaim
+        ));
+        // ② 显式非 CREDITS（如 BOGO）的领取 → 降级 Failed（不误报 success）
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), false, Some("BOGO")),
+            Failed(200)
+        ));
+        // ③ 显式非 CREDITS 的回放 → 降级 Failed（不误报 already）
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), true, Some("BOGO")),
+            Failed(200)
+        ));
+        // ④ CREDITS 回放 → Replay 保持
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), true, Some("CREDITS")),
+            Replay
+        ));
+        // ⑤ kind 缺失 → 不降级（宁不判负不误杀真实 success）
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), false, None), FreshClaim));
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), true, None), Replay));
+        // ⑥ 401 Auth 优先，不受 kind 遮蔽
+        assert!(matches!(
+            classify_blind_step(401, Some("CLAIMED"), false, Some("BOGO")),
+            Auth
+        ));
     }
 
     /// 盲发失败消息构造：BLOCKED/风控依赖不可用给可操作提示（不倾倒原始
@@ -1658,7 +1710,7 @@ mod tests {
         let merged = stale_only().merge(stale_only());
         assert!(matches!(
             merged.aggregate(),
-            FallbackOutcome::Failed(m) if m.matches("stale").count() == 2
+            FallbackOutcome::Failed(m, None) if m.matches("stale").count() == 2
         ));
     }
 
@@ -1677,24 +1729,25 @@ mod tests {
             aggregate_fallback(false, true, &[], &[], &["stale".to_string()], None),
             FallbackOutcome::AlreadyReplayed
         ));
-        // 仅 stale → 如实 Failed（触发重试，重试轮次重学 id）
+        // 仅 stale → 如实 Failed（触发重试，重试轮次重学 id）；reward 无成功来源 → None
         assert!(matches!(
             aggregate_fallback(false, false, &[], &[], &["stale".to_string()], None),
-            FallbackOutcome::Failed(m) if m.contains("stale")
+            FallbackOutcome::Failed(m, None) if m.contains("stale")
         ));
-        // 真实失败掩码一切（含新鲜成功：宁 fail 不假 success）
+        // 真实失败掩码一切（含新鲜成功：宁 fail 不假 success）——但已领到的
+        // reward 随行不丢弃（真实入账不因整体 fail 而回滚，对齐 Auth 语义）
         assert!(matches!(
             aggregate_fallback(true, false, &fresh, &["real fail".to_string()], &["stale".to_string()], Some(100.0)),
-            FallbackOutcome::Failed(m) if m.contains("real fail") && m.contains("盲发直领")
+            FallbackOutcome::Failed(m, Some(100.0)) if m.contains("real fail") && m.contains("盲发直领")
         ));
         assert!(matches!(
             aggregate_fallback(false, true, &[], &["real fail".to_string()], &[], None),
-            FallbackOutcome::Failed(m) if m.contains("real fail")
+            FallbackOutcome::Failed(m, None) if m.contains("real fail")
         ));
-        // 全空（表空/全被白名单拦下）→ Failed 兜底
+        // 全空（表空/全被白名单拦下）→ Failed 兜底；空表 reward 必为 None（透传等价）
         assert!(matches!(
             aggregate_fallback(false, false, &[], &[], &[], None),
-            FallbackOutcome::Failed(m) if m.contains("表为空")
+            FallbackOutcome::Failed(m, None) if m.contains("表为空")
         ));
     }
 

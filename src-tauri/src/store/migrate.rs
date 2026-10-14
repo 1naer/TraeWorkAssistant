@@ -983,17 +983,25 @@ fn slot_base_name(name: &str) -> String {
     s
 }
 
-/// 移动且绝不覆盖：目标已存在（重试残留等）时加时间戳后缀
+/// 移动且绝不覆盖：目标已存在（重试残留等）时加时间戳后缀；时间戳撞名（同秒
+/// 迁移两个同名文件）时递增序号后缀（.2/.3/…）直至找到空位——Windows rename
+/// 会静默覆盖已存在目标，仅秒级时间戳时同秒第二个文件会吞掉第一个（审查 P2）
 fn rename_no_clobber(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if dst.exists() {
-        let stamped = format!(
-            "{}_{}",
-            dst.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            chrono::Local::now().format("%Y%m%d%H%M%S")
-        );
-        return std::fs::rename(src, dst.with_file_name(stamped));
+    if !dst.exists() {
+        return std::fs::rename(src, dst);
     }
-    std::fs::rename(src, dst)
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stamped = format!("{}_{}", name, chrono::Local::now().format("%Y%m%d%H%M%S"));
+    let mut cand = dst.with_file_name(&stamped);
+    let mut seq = 2u32;
+    while cand.exists() {
+        cand = dst.with_file_name(format!("{stamped}.{seq}"));
+        seq += 1;
+    }
+    std::fs::rename(src, cand)
 }
 
 /// 槽身份标注（best-effort）：已有池根 sidecar `<base>.meta.json` 时以原子替换写入

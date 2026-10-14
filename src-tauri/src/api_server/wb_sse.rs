@@ -1042,7 +1042,9 @@ pub fn completion_to_text(v: &Value, model: &str) -> Value {
     resp
 }
 
-fn u64_pair(u: &Value) -> (u64, u64) {
+/// usage tokens 宽口径提取（记账统一口径，审查 P2）：别名（input/output_tokens）
+/// 与字符串数字形态不再静默得 0。供流式/非流式/toolexec/custom_route 各记账点共用
+pub(crate) fn u64_pair(u: &Value) -> (u64, u64) {
     let get = |keys: &[&str]| -> u64 {
         keys.iter()
             .find_map(|k| u.get(*k).and_then(token_number))

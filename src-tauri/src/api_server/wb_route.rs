@@ -32,7 +32,7 @@ use super::pool::PickedAccount;
 use super::retry::{retry_plan, RetryAction};
 use super::wb_payload;
 use super::wb_sse;
-use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, token_number};
+use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, u64_pair};
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
@@ -698,15 +698,8 @@ fn run_wb_stream(
                         wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
-                        let (pt, ct) = usage
-                            .as_ref()
-                            .map(|u| {
-                                (
-                                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                )
-                            })
-                            .unwrap_or((0, 0));
+                        // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                        let (pt, ct) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
                         // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计。
                         // 每请求终态单行（审查问题6）：换号重试（空完成未流出 /
                         // 错误未流出，对应下方两处 break）为中间态不落账，避免
@@ -1095,10 +1088,8 @@ pub async fn wb_aggregate_chat(
                                     break;
                                 }
                                 r["model"] = json!(model);
-                                let (pt, ct) = r.get("usage").map(|u| (
-                                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                )).unwrap_or((0, 0));
+                                // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                                let (pt, ct) = r.get("usage").map(u64_pair).unwrap_or((0, 0));
                                 // F-76① TTFT 入账
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.wb_pool.note_success(win_uid);
@@ -1357,6 +1348,10 @@ pub async fn wb_tool_exec_chat(
         let mut last_err: Option<String> = None;
         // F-76① TTFT：各轮首字耗时（最终轮即最终回复的首字延迟）
         let mut last_ttfb_ms: Option<u64> = None;
+        // 请求级 usage 累加（跨账号跨轮次，含失败账号与中间轮的真实消耗）——
+        // 失败终局记账带上（审查 P1：原硬编码 0,0 把已消耗的 tokens 全部丢弃）；
+        // 成功终局仍以 completion 写回值为准（只含最终成功账号，维持不变）
+        let mut req_acc_usage = (0u64, 0u64);
         let resp_id = format!("resp_{}", now_ts());
 
         'accounts: loop {
@@ -1472,12 +1467,11 @@ pub async fn wb_tool_exec_chat(
                             break Err("空完成（影子风控/上游异常）".to_string());
                         }
                         if let Some(u) = completion.get("usage") {
-                            acc_usage = (
-                                acc_usage.0
-                                    + u.get("prompt_tokens").and_then(token_number).unwrap_or(0),
-                                acc_usage.1
-                                    + u.get("completion_tokens").and_then(token_number).unwrap_or(0),
-                            );
+                            // 宽口径提取（别名 + 字符串数字形态，审查 P2）；
+                            // 同步累加请求级口径（审查 P1：失败终局带上真实消耗）
+                            let (pt, ct) = u64_pair(u);
+                            acc_usage = (acc_usage.0 + pt, acc_usage.1 + ct);
+                            req_acc_usage = (req_acc_usage.0 + pt, req_acc_usage.1 + ct);
                             acc_cached += cached_tokens_of(u);
                             acc_cache_write += cache_write_tokens_of(u);
                         }
@@ -1642,10 +1636,9 @@ pub async fn wb_tool_exec_chat(
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         match final_completion {
             Some(mut completion) => {
-                let (pt, ct) = completion.get("usage").map(|u| (
-                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                )).unwrap_or((0, 0));
+                // 宽口径提取（别名 + 字符串数字形态，审查 P2）；
+                // completion 写回值为最终账号跨轮累加（acc_usage），维持不变
+                let (pt, ct) = completion.get("usage").map(u64_pair).unwrap_or((0, 0));
                 let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
                 // F-76① TTFT 入账：最终轮首字耗时
                 state.record_usage_ttfb(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
@@ -1660,7 +1653,9 @@ pub async fn wb_tool_exec_chat(
                 Ok((completion, ws_items, resp_id))
             }
             None => {
-                state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
+                // 失败终局带上请求级真实消耗（审查 P1：跨账号跨轮次已消耗的
+                // tokens 原硬编码 0,0 全部丢弃，含失败账号与中间轮回喂）
+                state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, req_acc_usage.0, req_acc_usage.1);
                 state.logger.log_request(
                     "buddy", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, &key_name, "", last_err.as_deref(),
