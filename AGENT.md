@@ -104,7 +104,7 @@ ai-work-assistant/
 | 代理 | `proxy_start(port)` / `proxy_stop()` / `proxy_status()` | ProxyStatus：`running/port/captured/started_at` |
 | 账号 | `accounts_list` → `AccountView[]` | 聚合 JWT / 分组 / 设备 / 积分 / 今日 |
 | 账号 | `account_add_manual(name, jwt, groupId?)` | 解析 JWT → userId 入库 |
-| 账号 | `account_delete(userId, deleteProfile)` | 同时清分组；`deleteProfile=true` 删 profiles/<uid> |
+| 账号 | `account_delete(userId, deleteProfile)` | 同时清分组与 `device_map` 设备指纹条目（移植 docker_main PR #101，持 `DEVICE_MAP_LOCK`）；`deleteProfile=true` 删 profiles/<uid> |
 | 账号 | `account_update(...)` / `accounts_export_raw()` / `accounts_import(...)` | 编辑账号 / 原始 JSON 导出 / 导入 |
 | 账号 | `account_get_jwt(userId)` | 按需获取完整 JWT——列表接口 `AccountView.jwt` 已掩码下发（前4+****+后4），完整值仅供「查看/复制 JWT」弹窗按需拉取 |
 | 积分 | `fetch_remaining_credits` / `fetch_credit_detail` / `refresh_remaining_credits` | 剩余积分查询 / 明细 / 刷新 |

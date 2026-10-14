@@ -189,11 +189,11 @@ const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
 /// 是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
 const PERMANENT_AUTH_TAG: &str = "permanent_auth";
 
-/// 拉取活动列表（**全量，不过滤**）。返回 Ok(全量 campaign 列表)；
-/// Err(kind, message)：auth（401，调用方刷新重试）| fail。
-/// 全量返回的原因：列表内 CLAIMED grant 是「每日奖励已领取」的判定数据源
-///（daily_credits_claimed_in_list），CLAIMABLE 过滤交给调用方（filter_claimable）。
-fn list_campaigns(
+/// 拉取活动列表原始数据（**全量，不过滤，允许空列表**）。
+/// 返回 Ok(campaign 列表，可为空)；Err(kind, message)：auth（401）| fail。
+/// 与 [`list_campaigns`] 的区别：不把空列表判为 fail——盲发兜底当轮重学
+///（issue #105）需要「列表为空 → 学不到 → 放弃重学」而非「列表为空 → 整账号失败」。
+fn fetch_campaigns(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &QoderUrls,
@@ -212,13 +212,25 @@ fn list_campaigns(
     let Some(b) = body.filter(|b| b.is_object()) else {
         return Err(("fail".into(), "campaigns 响应非 JSON".into()));
     };
-    // 信封穿透（fs_utils::dig 含 data 包裹下钻）；⚠ campaigns 为空 ≠ 已签：
-    // 可能活动未开始 / Cosy-ClientType 缺失（本层恒带）/ 接口结构变更——
-    // 与「无可领项」显式区分，kind=fail 触发 UI 提示（§5.2）
-    let campaigns = fs_utils::dig(&b, &["campaigns"])
+    // 信封穿透（fs_utils::dig 含 data 包裹下钻）
+    Ok(fs_utils::dig(&b, &["campaigns"])
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+/// 拉取活动列表（**全量，不过滤**）。返回 Ok(全量 campaign 列表)；
+/// Err(kind, message)：auth（401，调用方刷新重试）| fail。
+/// 全量返回的原因：列表内 CLAIMED grant 是「每日奖励已领取」的判定数据源
+///（daily_credits_claimed_in_list），CLAIMABLE 过滤交给调用方（filter_claimable）。
+fn list_campaigns(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &QoderUrls,
+) -> Result<Vec<Value>, (String, String)> {
+    let campaigns = fetch_campaigns(agent, headers, urls)?;
+    // ⚠ campaigns 为空 ≠ 已签：可能活动未开始 / Cosy-ClientType 缺失（本层
+    // 恒带）/ 接口结构变更——与「无可领项」显式区分，kind=fail 触发 UI 提示（§5.2）
     if campaigns.is_empty() {
         return Err((
             "fail".into(),
@@ -448,6 +460,24 @@ const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
     ("01a0f1cd-945c-7217-b373-f62e70da792d", "每日领 100 Credits"),
 ];
 
+/// 从活动条目提取 (campaignId, 展示名)（id 过路径白名单 [A-Za-z0-9_-]，非法
+/// 丢弃；展示名取 name/title/campaignName/campaign_name 候选键，缺失回退 id 前 8 位）。
+/// 各学习档位共用的提取口径。
+fn learned_entry_from(c: &Value) -> Option<(String, String)> {
+    let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
+    if cid.is_empty()
+        || !cid.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    let cname = s_of(fs_utils::dig(
+        c,
+        &["name", "title", "campaignName", "campaign_name"],
+    ));
+    let cname = if cname.is_empty() { cid.chars().take(8).collect() } else { cname };
+    Some((cid, cname))
+}
+
 /// 从活动列表学习当日「每日 100 Credits」活动 id（issue #66 健壮性①：每日轮换
 /// 的 campaignId 硬编码必然过期，逐日人工抓包更新不可持续）。
 ///
@@ -458,8 +488,6 @@ const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
 /// 口径（对齐 daily_credits_claimed_in_list 但**不要求 claimStatus**——
 /// CLAIMED/CLAIMABLE/未领均为有效候选，保证零 CLAIMABLE 时仍能学到 id）：
 /// actionType == CLAIM_BENEFIT && benefit.kind == CREDITS && startAt <= now <= endAt。
-/// id 过路径白名单 [A-Za-z0-9_-]（非法丢弃）；展示名取 name/title/campaignName/
-/// campaign_name 候选键，缺失回退 id 前 8 位。
 fn learn_daily_campaign_ids(campaigns: &[Value], now_secs: i64) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for c in campaigns {
@@ -478,20 +506,58 @@ fn learn_daily_campaign_ids(campaigns: &[Value], now_secs: i64) -> Vec<(String, 
         if !(action && credits && in_window) {
             continue;
         }
-        let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
-        if cid.is_empty()
-            || !cid.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        {
-            continue;
+        if let Some(entry) = learned_entry_from(c) {
+            merge_learned(&mut out, vec![entry]);
         }
-        let cname = s_of(fs_utils::dig(
-            c,
-            &["name", "title", "campaignName", "campaign_name"],
-        ));
-        let cname = if cname.is_empty() { cid.chars().take(8).collect() } else { cname };
-        merge_learned(&mut out, vec![(cid, cname)]);
     }
     out
+}
+
+/// 宽松档学习（issue #105：服务端字段口径变更/窗口缺失时严格档学不到 id，
+/// 盲发兜底只剩过期硬编码表 → 全天 409 死循环）。仅作严格档产空时的兜底，
+/// 学习错 id 的代价是一次 409（已归 stale_parts：不掩码成功、剔除候选、
+/// 触发重试），风险可控。分档（取**首个非空档**，宁缺勿滥）：
+/// - 档 A：actionType == CLAIM_BENEFIT && benefit.kind == CREDITS（去窗口要求——
+///   服务端省略/改用其他窗口字段形态时仍可学）
+/// - 档 B：benefit.kind == CREDITS（去 actionType 要求——覆盖 actionType 枚举变更）
+/// - 档 C：actionType == CLAIM_BENEFIT && 展示名含「每日」（覆盖 benefit.kind
+///   也变更的极端形态；「每日」限定避免撞上无关活动）
+fn learn_daily_campaign_ids_lenient(campaigns: &[Value]) -> Vec<(String, String)> {
+    let is_credits = |c: &Value| {
+        c.get("benefit")
+            .and_then(|x| x.get("kind"))
+            .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
+            .unwrap_or(false)
+    };
+    let is_claim_benefit =
+        |c: &Value| s_of(c.get("actionType")).to_ascii_uppercase() == "CLAIM_BENEFIT";
+    let mut learn = |pred: &dyn Fn(&Value) -> bool| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for c in campaigns {
+            if pred(c) {
+                if let Some(entry) = learned_entry_from(c) {
+                    merge_learned(&mut out, vec![entry]);
+                }
+            }
+        }
+        out
+    };
+    let tier_a = learn(&|c| is_claim_benefit(c) && is_credits(c));
+    if !tier_a.is_empty() {
+        return tier_a;
+    }
+    let tier_b = learn(&is_credits);
+    if !tier_b.is_empty() {
+        return tier_b;
+    }
+    learn(&|c| {
+        is_claim_benefit(c)
+            && s_of(fs_utils::dig(
+                c,
+                &["name", "title", "campaignName", "campaign_name"],
+            ))
+            .contains("每日")
+    })
 }
 
 /// 学习结果按 id 去重合并（纯函数，可单测）：同 id 保留先到条目（learned 优先）。
@@ -560,9 +626,10 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
     }
     // 409 CAMPAIGN_NOT_ACTIVE（issue #66 健壮性②）：明确归因为「候选 id 错」
     // 而非账号/网络错——盲发到已过期的每日活动 id 的特征形态，给准确提示
-    //（旧实现落通用「（HTTP 409）{head}」不可读，也与账号级失败无法区分）
+    //（旧实现落通用「（HTTP 409）{head}」不可读，也与账号级失败无法区分）。
+    // issue #105 修复后该形态会在当轮触发重学+重试，此处文案同步对齐
     if code == 409 && raw.contains("CAMPAIGN_NOT_ACTIVE") {
-        return "每日活动 id 已过期（409 CAMPAIGN_NOT_ACTIVE，活动每日轮换）——将从活动列表自动重学".into();
+        return "每日活动 id 已过期（409 CAMPAIGN_NOT_ACTIVE，活动每日轮换）——已触发当轮重学重试".into();
     }
     let head: String = raw.chars().take(120).collect();
     format!("（HTTP {code}）{head}")
@@ -618,30 +685,81 @@ fn aggregate_fallback(
     FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into())
 }
 
-/// 列表零 CLAIMABLE 时的每日活动盲发直领。候选序（issue #66 健壮性①）：
-/// **learned 优先**（learn_daily_campaign_ids 从当日列表重学的 id，最新鲜），
-/// 硬编码 KNOWN_DAILY_CAMPAIGNS 去重补后兜底。逐条盲发 claim，单步经
-/// classify_blind_step 归类后经 aggregate_fallback 聚合；任一 401 → 中断遍历
-/// 返回 `Auth`（已累计 reward 不丢弃）。409 过期 id 会从 `learned` 原地剔除
-///（&mut），同轮后续账号不再重复盲发。
-fn known_daily_fallback(
+/// 盲发单轮聚合中间态（纯数据，可单测）：一圈候选的归类结果，
+/// 供 stale-only 判定与跨轮合并（known_daily_fallback 当轮重学重试）。
+struct BlindRound {
+    messages: Vec<String>,
+    fail_parts: Vec<String>,
+    stale_parts: Vec<String>,
+    reward: Option<f64>,
+    any_fresh: bool,
+    any_replay: bool,
+    /// 任一候选 401（blind_round 中断遍历的标记；调用方上报 Auth，
+    /// 已累计 reward 随行——对齐 claim_one auth 语义）
+    auth: bool,
+}
+
+impl BlindRound {
+    /// 全部候选均 409 过期且无任何成功/回放/真实失败（issue #105 死循环特征：
+    /// 学习产空 + 硬编码表过期，重试轮次原样复现）——当轮重学重试的触发条件。
+    /// auth 中断轮不触发（401 需凭证刷新自愈，同头重试注定失败）
+    fn stale_only(&self) -> bool {
+        !self.auth
+            && !self.any_fresh
+            && !self.any_replay
+            && self.fail_parts.is_empty()
+            && !self.stale_parts.is_empty()
+    }
+
+    /// 经 aggregate_fallback 定级为 FallbackOutcome
+    fn aggregate(self) -> FallbackOutcome {
+        aggregate_fallback(
+            self.any_fresh,
+            self.any_replay,
+            &self.messages,
+            &self.fail_parts,
+            &self.stale_parts,
+            self.reward,
+        )
+    }
+
+    /// 跨轮合并（重试轮并入首轮）：各分桶拼接、reward 累加、fresh/replay 或合并，
+    /// 再由 aggregate_fallback 统一定级（stale 不掩码新鲜成功/回放的语义不变）
+    fn merge(mut self, other: BlindRound) -> BlindRound {
+        self.messages.extend(other.messages);
+        self.fail_parts.extend(other.fail_parts);
+        self.stale_parts.extend(other.stale_parts);
+        self.reward = match (self.reward, other.reward) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => b.or(a),
+        };
+        self.any_fresh |= other.any_fresh;
+        self.any_replay |= other.any_replay;
+        self.auth |= other.auth;
+        self
+    }
+}
+
+/// 盲发一圈候选（known_daily_fallback 的执行单元）。逐条盲发 claim，单步经
+/// classify_blind_step 归类；任一 401 → 置 auth 标记中断遍历（调用方据此上报
+/// `Auth`，已累计 reward 随行不丢弃，对齐 claim_one auth 语义）。409 过期 id
+/// 会从 `learned` 原地剔除（&mut），同轮后续账号不再重复盲发。
+fn blind_round(
     agent: &ureq::Agent,
     headers: &[(String, String)],
+    candidates: &[(String, String)],
     learned: &mut Vec<(String, String)>,
-) -> FallbackOutcome {
-    let mut candidates: Vec<(String, String)> = learned.clone();
-    for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
-        if !candidates.iter().any(|(e, _)| e == cid) {
-            candidates.push((cid.to_string(), cname.to_string()));
-        }
-    }
-    let mut messages: Vec<String> = Vec::new();
-    let mut fail_parts: Vec<String> = Vec::new();
-    let mut stale_parts: Vec<String> = Vec::new();
-    let mut reward: Option<f64> = None;
-    let mut any_fresh = false;
-    let mut any_replay = false;
-    for (cid, cname) in &candidates {
+) -> BlindRound {
+    let mut round = BlindRound {
+        messages: Vec::new(),
+        fail_parts: Vec::new(),
+        stale_parts: Vec::new(),
+        reward: None,
+        any_fresh: false,
+        any_replay: false,
+        auth: false,
+    };
+    for (cid, cname) in candidates {
         // 路径安全防线：候选含非法字符时拒绝该条（与 claim_one 同白名单）
         if cid.is_empty()
             || !cid.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -665,7 +783,8 @@ fn known_daily_fallback(
             .unwrap_or(false);
         match classify_blind_step(status, claimed.as_deref(), replayed) {
             BlindStep::Auth => {
-                return FallbackOutcome::Auth(reward);
+                round.auth = true;
+                return round;
             }
             BlindStep::FreshClaim => {
                 let amt = body
@@ -673,14 +792,14 @@ fn known_daily_fallback(
                     .and_then(|b| b.get("benefit"))
                     .and_then(|x| x.get("amount"))
                     .and_then(|v| num_or_none(Some(v)));
-                any_fresh = true;
-                messages.push(format!("{cname}（盲发直领）"));
+                round.any_fresh = true;
+                round.messages.push(format!("{cname}（盲发直领）"));
                 if let Some(a) = amt {
-                    reward = Some(reward.unwrap_or(0.0) + a);
+                    round.reward = Some(round.reward.unwrap_or(0.0) + a);
                 }
             }
             BlindStep::Replay => {
-                any_replay = true;
+                round.any_replay = true;
             }
             BlindStep::Failed(code) => {
                 let reason = describe_blind_failure(code, claimed.as_deref(), &raw);
@@ -690,15 +809,67 @@ fn known_daily_fallback(
                 // 首个账号学到的 id 已过期时，后续账号不再重复盲发同一 409）
                 if code == 409 && raw.contains("CAMPAIGN_NOT_ACTIVE") {
                     learned.retain(|(e, _)| e != cid);
-                    stale_parts.push(format!("{cname} 盲发失败：{reason}"));
+                    round.stale_parts.push(format!("{cname} 盲发失败：{reason}"));
                 } else {
-                    fail_parts.push(format!("{cname} 盲发失败：{reason}"));
+                    round.fail_parts.push(format!("{cname} 盲发失败：{reason}"));
                 }
                 // 继续尝试下一条：单条失败不中断（聚合时按 aggregate_fallback 定级）
             }
         }
     }
-    aggregate_fallback(any_fresh, any_replay, &messages, &fail_parts, &stale_parts, reward)
+    round
+}
+
+/// 列表零 CLAIMABLE 时的每日活动盲发直领。候选序（issue #66 健壮性①）：
+/// **learned 优先**（learn_daily_campaign_ids 从当日列表重学的 id，最新鲜），
+/// 硬编码 KNOWN_DAILY_CAMPAIGNS 去重补后兜底。逐条盲发 claim，单步经
+/// classify_blind_step 归类后经 aggregate_fallback 聚合；任一 401 → 中断遍历
+/// 返回 `Auth`（已累计 reward 不丢弃）。
+///
+/// 当轮重学闭环（issue #105）：全部候选 409 过期且无成功/回放/真实失败
+///（stale_only）时，**当轮**重取活动列表并经宽松档（learn_daily_campaign_ids_lenient）
+/// 重学，学得新 id 立即补一轮盲发——原实现只承诺「将从活动列表自动重学」却把
+/// 自愈寄望于调度器下一轮，学习产空 + 硬编码过期时即全天 409 死循环。
+/// 重试轮与首轮经 BlindRound::merge 合并后统一定级（409 归 stale 的掩码语义不变）。
+fn known_daily_fallback(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &QoderUrls,
+    learned: &mut Vec<(String, String)>,
+) -> FallbackOutcome {
+    let mut candidates: Vec<(String, String)> = learned.clone();
+    for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
+        if !candidates.iter().any(|(e, _)| e == cid) {
+            candidates.push((cid.to_string(), cname.to_string()));
+        }
+    }
+    let tried: Vec<String> = candidates.iter().map(|(cid, _)| cid.clone()).collect();
+    let first = blind_round(agent, headers, &candidates, learned);
+    // 401 中断：上报 Auth 走账号级凭证刷新自愈（已累计 reward 随行，不重学不重试）
+    if first.auth {
+        return FallbackOutcome::Auth(first.reward);
+    }
+    if !first.stale_only() {
+        return first.aggregate();
+    }
+    // 当轮重学：重取列表（fetch_campaigns 允许空表——空表 = 学不到 = 放弃重试），
+    // 宽松档学习，仅取**未试过**的 id（409 剔除只动 learned，tried 防重学撞旧 id）
+    let mut retry: Vec<(String, String)> = Vec::new();
+    if let Ok(campaigns) = fetch_campaigns(agent, headers, urls) {
+        merge_learned(&mut retry, learn_daily_campaign_ids_lenient(&campaigns));
+    }
+    retry.retain(|(cid, _)| !tried.iter().any(|t| t == cid));
+    if retry.is_empty() {
+        return first.aggregate();
+    }
+    // 重学结果入共享池（跨账号复用；若重试轮再 409 会被 blind_round 剔除）
+    merge_learned(learned, retry.clone());
+    let second = blind_round(agent, headers, &retry, learned);
+    let merged = first.merge(second);
+    if merged.auth {
+        return FallbackOutcome::Auth(merged.reward);
+    }
+    merged.aggregate()
 }
 
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
@@ -787,7 +958,7 @@ fn process_account(
                 if daily_credits_claimed_in_list(&campaigns, now) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
-                    match known_daily_fallback(agent, &headers, learned) {
+                    match known_daily_fallback(agent, &headers, &urls, learned) {
                         FallbackOutcome::Success(m, r) => ("success".into(), m, r),
                         FallbackOutcome::AlreadyReplayed => {
                             ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
@@ -883,7 +1054,7 @@ fn process_account(
                             if daily_credits_claimed_in_list(&campaigns, now) {
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
-                                match known_daily_fallback(agent, &headers, learned) {
+                                match known_daily_fallback(agent, &headers, &urls, learned) {
                                     FallbackOutcome::Success(m, r) => ("success".into(), m, r),
                                     FallbackOutcome::AlreadyReplayed => (
                                         "already".into(),
@@ -1380,6 +1551,114 @@ mod tests {
         assert_eq!(learned.len(), 2);
         assert_eq!(learned[0], ("id-a".to_string(), "先到".to_string()));
         assert_eq!(learned[1], ("id-b".to_string(), "新".to_string()));
+    }
+
+    /// 宽松档学习（issue #105）：严格档产空时按档 A（去窗口）→ 档 B（去
+    /// actionType）→ 档 C（名称含「每日」）取首个非空档；非法 id 各档均丢弃；
+    /// 严格档命中时不走宽松档
+    #[test]
+    fn learn_daily_campaign_ids_lenient_tiers() {
+        // 档 A：actionType+kind 命中但窗口字段缺失（严格档学不到的场景）
+        let no_window = json!({
+            "campaignId": "aaaa1111-bbbb-7ccc-dddd-eeeeffff0001",
+            "claimStatus": "CLAIMABLE", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "CREDITS", "amount": 100},
+        });
+        let out = learn_daily_campaign_ids_lenient(&[no_window.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "aaaa1111-bbbb-7ccc-dddd-eeeeffff0001");
+        // 同条目严格档学不到（无窗口 = 从严丢弃）
+        assert!(learn_daily_campaign_ids(&[no_window.clone()], 1_791_380_000).is_empty());
+        // 严格档命中（带窗口）→ 宽松档入口不影响主路径（宽松档仅在重学路径调用）
+        let with_window = json!({
+            "campaignId": "aaaa1111-bbbb-7ccc-dddd-eeeeffff0002",
+            "actionType": "CLAIM_BENEFIT", "benefit": {"kind": "CREDITS"},
+            "startAt": 1_791_338_400i64, "endAt": 1_791_424_740i64,
+        });
+        let out = learn_daily_campaign_ids_lenient(&[with_window]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "aaaa1111-bbbb-7ccc-dddd-eeeeffff0002");
+        // 档 B：actionType 枚举变更（kind 仍 CREDITS）→ 档 A 空，档 B 命中
+        let renamed_action = json!({
+            "campaignId": "b1", "actionType": "DAILY_REWARD",
+            "benefit": {"kind": "CREDITS"},
+        });
+        let out = learn_daily_campaign_ids_lenient(&[renamed_action]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "b1");
+        // 档 C：kind 也变更，但 actionType+名称含「每日」→ 命中
+        let renamed_kind = json!({
+            "campaignId": "c1", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "DAILY_POINT"}, "name": "每日领 100 Credits",
+        });
+        let out = learn_daily_campaign_ids_lenient(&[renamed_kind]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "c1");
+        // 档 C 不收无关活动（名称不含「每日」）
+        let unrelated = json!({
+            "campaignId": "u1", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "DAILY_POINT"}, "name": "新人礼包",
+        });
+        assert!(learn_daily_campaign_ids_lenient(&[unrelated]).is_empty());
+        // 非法 id 各档均丢弃
+        let evil = json!({"campaignId": "../evil?", "actionType": "CLAIM_BENEFIT",
+                          "benefit": {"kind": "CREDITS"}});
+        assert!(learn_daily_campaign_ids_lenient(&[evil]).is_empty());
+        // 全空列表 → 空产出（当轮重学放弃重试的路径）
+        assert!(learn_daily_campaign_ids_lenient(&[]).is_empty());
+    }
+
+    /// BlindRound 语义（issue #105）：stale_only 触发条件与跨轮合并后定级
+    #[test]
+    fn blind_round_stale_only_and_merge() {
+        let stale_only = || BlindRound {
+            messages: vec![],
+            fail_parts: vec![],
+            stale_parts: vec!["stale".to_string()],
+            reward: None,
+            any_fresh: false,
+            any_replay: false,
+            auth: false,
+        };
+        assert!(stale_only().stale_only());
+        // 任一新鲜成功/回放/真实失败/auth 中断 → 不触发当轮重学
+        let mut r = stale_only();
+        r.any_fresh = true;
+        assert!(!r.stale_only());
+        let mut r = stale_only();
+        r.any_replay = true;
+        assert!(!r.stale_only());
+        let mut r = stale_only();
+        r.fail_parts.push("real fail".to_string());
+        assert!(!r.stale_only());
+        let mut r = stale_only();
+        r.auth = true;
+        assert!(!r.stale_only());
+        // stale_parts 为空（如首轮即 401 中断的空轮）→ 不触发
+        let mut r = stale_only();
+        r.stale_parts.clear();
+        assert!(!r.stale_only());
+        // 跨轮合并：stale 轮 + 新鲜成功轮 → fresh 胜出（aggregate 归 Success），
+        // reward 累加，auth 标记保留
+        let mut fresh = BlindRound {
+            messages: vec!["每日领 100 Credits（盲发直领）".to_string()],
+            fail_parts: vec![],
+            stale_parts: vec![],
+            reward: Some(100.0),
+            any_fresh: true,
+            any_replay: false,
+            auth: false,
+        };
+        fresh.auth = true;
+        let merged = stale_only().merge(fresh);
+        assert!(merged.auth);
+        assert!(matches!(merged.aggregate(), FallbackOutcome::Success(_, Some(100.0))));
+        // stale 轮 + 再 stale 轮 → Failed（两轮 stale 文案拼接，触发调度器重试）
+        let merged = stale_only().merge(stale_only());
+        assert!(matches!(
+            merged.aggregate(),
+            FallbackOutcome::Failed(m) if m.matches("stale").count() == 2
+        ));
     }
 
     /// 盲发聚合判定（issue #66 健壮性②）：stale（409 id 过期）不掩码新鲜成功/

@@ -2014,6 +2014,9 @@ mod tests {
                 access_token: "tk".into(),
                 machine_id: String::new(),
                 needs_relogin: false,
+                credits: None,
+                credits_expire_at: None,
+                credits_fetched_at: None,
             }],
             &["q1".to_string()],
         );

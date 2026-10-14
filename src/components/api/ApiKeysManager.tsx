@@ -75,8 +75,8 @@ export default function ApiKeysManager({
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [buddyPoolStatus, setBuddyPoolStatus] = useState<PoolStatus[]>([]);
   const [qoderPoolStatus, setQoderPoolStatus] = useState<PoolStatus[]>([]);
-  // 今日按 Key 的 token 用量（「今日已用」列展示）
-  const [usage, setUsage] = useState<UsageDayView[]>([]);
+  // 今日按 Key 的 token 用量（「今日已用」列展示；四桶分账记账，跨桶合并后按 Key 聚合）
+  const [usage, setUsage] = useState<UsageDayView[][]>([]);
   // Qoder 上游开关（对齐方案 §5.3 警告徽标数据源，已交付归档）：
   // Key 绑定 Qoder 池但未启用时显式告警；null = 未知（不告警）
   const [qoderEnabled, setQoderEnabled] = useState<boolean | null>(null);
@@ -377,13 +377,14 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 保留空列表 */
       });
-    // 今日 token 用量（读落盘数据，仅取当日条目）
-    api.apiServer
-      .usageStats(14)
-      .then(setUsage)
-      .catch(() => {
-        /* 保留空列表 */
-      });
+    // 今日 token 用量（读落盘数据，仅取当日条目）：四桶并拉——key_tokens 按池分账
+    // （Trae/Buddy/Qoder/Custom 各自的 DayStats），只读 Trae 桶会漏记非 Trae 流量的 Key 用量
+    Promise.all([
+      api.apiServer.usageStats(14).catch(() => [] as UsageDayView[]),
+      api.apiServer.wbUsageStats(14).catch(() => [] as UsageDayView[]),
+      api.apiServer.customUsageStats(14).catch(() => [] as UsageDayView[]),
+      api.apiServer.qoderUsageStats(14).catch(() => [] as UsageDayView[]),
+    ]).then(([trae, wb, custom, qoder]) => setUsage([trae, wb, custom, qoder]));
     // Qoder 上游开关（Key 绑定 Qoder 池的警告徽标数据源）
     api.apiServer
       .poolList()
@@ -399,12 +400,20 @@ export default function ApiKeysManager({
   }, [editKey, deleteForKey, authConfirmOpen, onSubModalChange]);
 
   // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
+  // 四桶合并：同一 Key 的请求可能落 Trae/Buddy/Qoder/Custom 任一桶，按 Key 名跨桶求和
   const todayKey = new Date().toLocaleDateString('sv-SE');
   const todayKeyTokens = useMemo(() => {
     const m = new Map<string, { prompt: number; completion: number }>();
-    usage.find((d) => d.date === todayKey)?.key_tokens.forEach((t) =>
-      m.set(t.name, { prompt: t.prompt_tokens, completion: t.completion_tokens }),
-    );
+    for (const bucket of usage) {
+      bucket
+        .find((d) => d.date === todayKey)
+        ?.key_tokens.forEach((t) => {
+          const ex = m.get(t.name) ?? { prompt: 0, completion: 0 };
+          ex.prompt += t.prompt_tokens;
+          ex.completion += t.completion_tokens;
+          m.set(t.name, ex);
+        });
+    }
     return m;
   }, [usage, todayKey]);
 
@@ -726,7 +735,7 @@ export default function ApiKeysManager({
         <div className="space-y-4 text-sm">
           <div>
             <div className="mb-1.5 text-xs font-medium text-slate-500">
-              资源池<span className="ml-1 font-normal text-slate-400">（issue #25：绑定后该 Key 的请求优先走所选池）</span>
+              资源池<span className="ml-1 font-normal text-slate-400">（绑定后该 Key 的请求优先走所选池）</span>
             </div>
             <div className="flex gap-2">
               {[

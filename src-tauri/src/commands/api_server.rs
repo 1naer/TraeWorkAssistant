@@ -819,6 +819,14 @@ fn apply_pool_snapshot(
                 .map(|p| p.machine_id.clone())
                 .unwrap_or_default(),
             needs_relogin: a.needs_relogin,
+            // issue #102 智能调度 + issue #91 reserve 过滤：余额/到期/快照时间
+            // 随 qoder_credits 回写链路入池（旧数据无字段 → None → fail-open）
+            credits: a.credits_balance,
+            credits_expire_at: a.credits_expire_at,
+            credits_fetched_at: a
+                .credits_fetched_at
+                .as_deref()
+                .and_then(fs_utils::parse_ts_loose),
         })
         .collect();
     let qoder_ids: Vec<String> = qoder_sync.iter().map(|a| a.uid.clone()).collect();

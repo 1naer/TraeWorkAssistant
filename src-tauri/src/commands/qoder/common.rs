@@ -51,6 +51,12 @@ pub struct QoderAccount {
     pub credits_balance: Option<f64>,
     #[serde(default)]
     pub credits_fetched_at: Option<String>,
+    /// 最早积分包到期时间缓存（Unix 秒；积分查询回写，issue #102 调度口径）：
+    /// 剩余>0 且激活的包取 min，无逐包明细时随订阅周期到期日（口径对齐
+    /// WorkBuddyAccount.credits_expire_at issue #28）；None = 无到期信息，
+    /// 键值随每次回写覆盖（不留 stale）
+    #[serde(default)]
+    pub credits_expire_at: Option<i64>,
     /// 每账号稳定设备指纹（§5.10 多账号并发；入池时生成一次永不轮换，
     /// 存量账号经 ensure_pool_profiles 惰性回填）
     #[serde(default)]

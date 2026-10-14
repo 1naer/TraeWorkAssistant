@@ -464,9 +464,10 @@ impl ApiPool {
     }
 
     /// 从 Qoder 账号同步池（p3-3）：Qoder 专用池实例（`ApiSharedState.qoder_pool`），
-    /// 全量重建语义同 sync_from_wb。Qoder 按倍率计费无积分余额概念，
-    /// credits 恒 None（selectable 不做积分过滤）；machine_id 透传账号记录值
-    ///（可能为空——请求时由 identity 回调解析 effective 凭证补齐）
+    /// 全量重建语义同 sync_from_wb。积分/到期快照随 QoderSyncAccount 装配
+    ///（issue #102 智能调度三键生效 + issue #91 reserve 保留额过滤）；
+    /// machine_id 透传账号记录值（可能为空——请求时由 identity 回调解析
+    /// effective 凭证补齐）
     pub fn sync_from_qoder(&self, accounts: &[QoderSyncAccount], enabled: &[String]) {
         let mut entries = safe_lock(&self.entries);
         entries.clear();
@@ -481,9 +482,9 @@ impl ApiPool {
                     uid: a.uid.clone(),
                     name: a.name.clone(),
                     jwt: a.access_token.clone(),
-                    credits: None,
-                    credits_expire_at: None,
-                    credits_fetched_at: None,
+                    credits: a.credits,
+                    credits_expire_at: a.credits_expire_at,
+                    credits_fetched_at: a.credits_fetched_at,
                     disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
@@ -1059,6 +1060,14 @@ pub struct QoderSyncAccount {
     pub access_token: String,
     pub machine_id: String,
     pub needs_relogin: bool,
+    /// 余额快照（issue #102 三池对齐）：qoder_credits 任务回写 QoderAccount.credits_balance；
+    /// None = 无快照/旧数据，reserve 过滤 fail-open
+    pub credits: Option<f64>,
+    /// 最早积分包到期（Unix 秒，issue #102）：smart 排序键①「先到期先消耗」与
+    /// selectable 到期过滤的数据源；None = 无到期信息
+    pub credits_expire_at: Option<i64>,
+    /// 余额快照采集时间（Unix 秒）：reserve 过滤新鲜度门槛（issue #91 口径）
+    pub credits_fetched_at: Option<i64>,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
@@ -1921,6 +1930,9 @@ mod tests {
                     access_token: "tk".into(),
                     machine_id: "mid".into(),
                     needs_relogin: false,
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
                 },
                 crate::api_server::pool::QoderSyncAccount {
                     uid: "qd-dead".into(),
@@ -1928,6 +1940,9 @@ mod tests {
                     access_token: "tk".into(),
                     machine_id: String::new(),
                     needs_relogin: true,
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
                 },
                 // 空令牌账号不入池（无法签名）
                 crate::api_server::pool::QoderSyncAccount {
@@ -1936,6 +1951,9 @@ mod tests {
                     access_token: String::new(),
                     machine_id: String::new(),
                     needs_relogin: false,
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
                 },
             ],
             &["qd-1".to_string(), "qd-dead".to_string(), "qd-empty".to_string()],
@@ -1955,11 +1973,39 @@ mod tests {
                 access_token: "tk".into(),
                 machine_id: String::new(),
                 needs_relogin: true,
+                credits: None,
+                credits_expire_at: None,
+                credits_fetched_at: None,
             }],
             &["qd-dead".to_string()],
         );
         assert_eq!(pool.count(), 1);
         assert!(pool.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn qoder_sync_carries_credits_snapshot() {
+        // issue #102：Qoder 余额/到期/快照时间透传入池——smart 排序三键
+        //（最早到期 → 倍率 → 积分和）与 reserve 保留额过滤的数据源
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[crate::api_server::pool::QoderSyncAccount {
+                uid: "qd-c".into(),
+                name: "n".into(),
+                access_token: "tk".into(),
+                machine_id: String::new(),
+                needs_relogin: false,
+                credits: Some(42.0),
+                credits_expire_at: Some(1_999_999_999),
+                credits_fetched_at: Some(1_700_000_000),
+            }],
+            &["qd-c".to_string()],
+        );
+        let entries = safe_lock(&pool.entries);
+        let e = entries.get("qd-c").unwrap();
+        assert_eq!(e.credits, Some(42.0));
+        assert_eq!(e.credits_expire_at, Some(1_999_999_999));
+        assert_eq!(e.credits_fetched_at, Some(1_700_000_000));
     }
 
     #[test]
