@@ -362,6 +362,7 @@ fn main() {
             commands::workbuddy::buddy_ai_account_toggle,
             commands::workbuddy::buddy_ai_credits_history,
             commands::workbuddy::buddy_ai_accounts_export,
+            commands::workbuddy::buddy_ai_request_usage,
             commands::workbuddy::buddy_ai_credits_fetch,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,

@@ -46,6 +46,7 @@ pub(crate) fn buddy_pool_write_credits(
     acct_id: &str,
     balance: f64,
     expire_secs: Option<i64>,
+    packages: Option<Value>,
 ) -> Result<(), String> {
     let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_buddy_pool(state);
@@ -56,6 +57,9 @@ pub(crate) fn buddy_pool_write_credits(
     a.credits_fetched_at = Some(chrono::Utc::now().to_rfc3339());
     if expire_secs.is_some() {
         a.credits_expire_at = expire_secs; // 秒级时间戳（WorkBuddyAccount 口径）
+    }
+    if packages.is_some() {
+        a.credits_packages = packages; // 分包明细（P9）
     }
     save_buddy_pool(state, &pool)?;
     // P8：打卡/取数回写后刷新当日积分快照（趋势曲线数据源；锁内调用不重复加锁）
@@ -274,6 +278,7 @@ pub fn buddy_ai_accounts_list(state: State<'_, AppState>) -> Result<Vec<Value>, 
                 "needs_relogin": a.needs_relogin,
                 "relogin_reason": a.relogin_reason,
                 "disabled": a.disabled,
+                "credits_packages": a.credits_packages,
                 "credits_balance": a.credits_balance,
                 "credits_expire_at": a.credits_expire_at,
                 "credits_fetched_at": a.credits_fetched_at,
@@ -521,7 +526,7 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
             a.uid.clone()
         };
         let base = crate::tasks::wb_common::region_activity_base(&intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"]))));
-        let snap = crate::tasks::buddy_ai_checkin::fetch_total_dosage(&agent, base, &token, &uid);
+        let snap = crate::tasks::buddy_ai_checkin::fetch_dosage_info(&agent, base, &token, &uid);
         out.push((a.id.clone(), snap));
     }
     // 短临界区回写快照三键
@@ -531,12 +536,14 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
         let now = chrono::Utc::now().to_rfc3339();
         for (id, snap) in &out {
             if let Some(a) = pool.accounts.iter_mut().find(|a| &a.id == id) {
-                if let Some((total, expire)) = snap {
-                    a.credits_balance = Some(*total);
+                if let Some(info) = snap {
+                    a.credits_balance = Some(info.total);
                     a.credits_fetched_at = Some(now.clone());
-                    if expire.is_some() {
-                        a.credits_expire_at = *expire; // 秒级时间戳
+                    if info.expire_secs.is_some() {
+                        a.credits_expire_at = info.expire_secs; // 秒级时间戳
                     }
+                    // P9 分包明细（get-user-resource Accounts[] 深度解析）
+                    a.credits_packages = serde_json::to_value(&info.packages).ok();
                 }
             }
         }
@@ -566,9 +573,10 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
             let m: std::collections::HashMap<String, (f64, Option<i64>)> = out
                 .iter()
                 .filter_map(|(id, snap)| {
-                    let (total, expire) = snap.as_ref()?;
-                    let expire = (*expire).or_else(|| current.get(id).copied().flatten());
-                    Some((id.clone(), (*total, expire)))
+                    let info = snap.as_ref()?;
+                    let expire =
+                        info.expire_secs.or_else(|| current.get(id).copied().flatten());
+                    Some((id.clone(), (info.total, expire)))
                 })
                 .collect();
             if !m.is_empty() {
@@ -818,6 +826,109 @@ pub fn buddy_ai_account_toggle(
         .ok_or_else(|| format!("账号不存在: {user_id}"))?;
     acct.disabled = disabled;
     save_buddy_pool(&state, &pool)
+}
+
+/// buddy-ai 官网请求流水查询（P9 抓包解锁：/v2/billing/meter/get-user-request-usage
+/// 分页接口，credit/model/client/requestTime/input/agentPurpose 请求级明细）。
+/// 积分看板「请求明细」表 + 模型级真实积分数据源；鉴权同 get-user-resource（Bearer）。
+/// /v2 前缀不可用时回退裸路径（官网网页走裸路径，双兼容）
+#[tauri::command(async)]
+pub fn buddy_ai_request_usage(
+    state: State<'_, AppState>,
+    user_id: String,
+    days: Option<i64>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<Value, String> {
+    let acct = {
+        let pool = load_buddy_pool(&state);
+        pool.accounts
+            .iter()
+            .find(|a| a.id == user_id)
+            .cloned()
+            .ok_or_else(|| format!("账号不在 buddy-ai 池中: {user_id}"))?
+    };
+    let tokens = load_buddy_tokens(&state);
+    let rec = tokens
+        .get("tokens")
+        .and_then(|t| t.get(&acct.id))
+        .cloned()
+        .unwrap_or_default();
+    let token = as_str(fs_utils::dig(&rec, &["access_token"]))
+        .filter(|t| !t.is_empty())
+        .ok_or("该账号无 access_token（不可查询官网流水）")?;
+    let uid = if acct.uid.is_empty() {
+        as_str(fs_utils::dig(&rec, &["uid"])).unwrap_or_default().to_string()
+    } else {
+        acct.uid.clone()
+    };
+    let base = crate::tasks::wb_common::region_activity_base(&intl_domain_or(as_str(fs_utils::dig(
+        &rec,
+        &["domain"],
+    ))));
+    let days = days.unwrap_or(7).clamp(1, 31);
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(20).clamp(1, 100);
+    let start = (chrono::Local::now() - chrono::Duration::days(days - 1))
+        .format("%Y-%m-%d 00:00:00")
+        .to_string();
+    let end = chrono::Local::now().format("%Y-%m-%d 23:59:59").to_string();
+    let body = json!({
+        "startTime": start,
+        "endTime": end,
+        "pageNum": page,
+        "pageSize": page_size,
+    });
+    let agent = crate::tasks::http_agent(30);
+    let send = |url: String| -> Result<Value, String> {
+        let resp = agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("X-User-Id", &uid)
+            .set("X-Client-Platform", "web")
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .map_err(|e| format!("请求流水查询失败: {e}"))?;
+        resp.into_json()
+            .map_err(|e| format!("请求流水响应解析失败: {e}"))
+    };
+    let v = match send(format!("{base}/v2/billing/meter/get-user-request-usage")) {
+        Ok(v) => v,
+        Err(e) if e.contains("404") || e.contains("Not Found") => {
+            send(format!("{base}/billing/meter/get-user-request-usage"))?
+        }
+        Err(e) => return Err(e),
+    };
+    if v.get("code").and_then(Value::as_i64) != Some(0) {
+        return Err(format!(
+            "官网返回异常: {}",
+            v.get("msg").and_then(Value::as_str).unwrap_or("未知错误")
+        ));
+    }
+    // 信封：{code, data: {total, data: [rows]}}（小写 data，与 get-user-resource 大写嵌套不同）
+    let data = v.get("data").cloned().unwrap_or_default();
+    let total = data.get("total").and_then(Value::as_i64).unwrap_or(0);
+    // 行脱敏：input 全文不外发，仅保留 inputTrunc（明细展示口径）
+    let rows: Vec<Value> = data
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|r| {
+                    json!({
+                        "requestId": r.get("requestId").cloned().unwrap_or_default(),
+                        "credit": r.get("credit").cloned().unwrap_or(json!(0)),
+                        "model": r.get("model").cloned().unwrap_or_default(),
+                        "client": r.get("client").cloned().unwrap_or_default(),
+                        "requestTime": r.get("requestTime").cloned().unwrap_or_default(),
+                        "inputTrunc": r.get("inputTrunc").cloned().unwrap_or_default(),
+                        "agentPurpose": r.get("agentPurpose").cloned().unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({ "total": total, "page": page, "pageSize": page_size, "rows": rows }))
 }
 
 /// buddy-ai 积分历史查询（P8：趋势曲线数据源；近 N 天快照升序，默认 90 天）

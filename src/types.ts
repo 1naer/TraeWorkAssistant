@@ -1133,6 +1133,14 @@ export interface BuddyAiAccountView {
   relogin_reason: string;
   /** 启停（P3）：true = 已停用——不参与打卡花名册与网关取号 */
   disabled: boolean;
+  /** 积分包明细（P9：get-user-resource Accounts[] 分包解析；null = 未取数） */
+  credits_packages: Array<{
+    name: string;
+    code: string;
+    remain: number;
+    size: number;
+    expire_secs: number | null;
+  }> | null;
   credits_balance: number | null;
   /** 积分包最近到期时刻（秒级 unix 时间戳；注意与 credits_fetched_at 的 rfc3339 串不同） */
   credits_expire_at: number | null;

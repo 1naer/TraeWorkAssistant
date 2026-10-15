@@ -53,12 +53,50 @@ fn digv<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
 
 /// 拉取单账号积分快照：POST {base}/v2/billing/meter/get-user-resource。
 /// 返回 (TotalDosage, 最早未来 ExpiredTime 秒)；解析失败恒 None（调用方容错）。
-pub fn fetch_total_dosage(
+/// 积分包明细（P9 抓包校准：intl 包条目含 PackageName/CapacityRemain(Precise)/
+/// CapacitySize/CycleEndTime；Status 0=有效 3=宽限期）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DosagePackage {
+    pub name: String,
+    pub code: String,
+    pub remain: f64,
+    pub size: f64,
+    /// 包到期（秒级；CycleEndTime 按 +08:00 墙钟解析）
+    pub expire_secs: Option<i64>,
+}
+
+/// get-user-resource 深度解析结果（P9 抓包校准）：total + 最早到期 + 分包明细。
+/// 到期来源修正：intl 包 `ExpiredTime` 恒为空串，真实到期是 `CycleEndTime`
+/// 字符串日期时间（"2026-10-29 08:47:12"）——原实现只收集数值型 ExpiredTime，
+/// credits_expire_at 永远 None（看板到期列恒空）
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct DosageInfo {
+    pub total: f64,
+    pub expire_secs: Option<i64>,
+    pub packages: Vec<DosagePackage>,
+}
+
+/// 官网日期时间字符串解析（"YYYY-MM-DD HH:MM:SS"，+08:00 墙钟 → epoch 秒）
+pub fn parse_cn_datetime(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let dt = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
+    Some(offset.from_local_datetime(&dt).single()?.timestamp())
+}
+
+/// 包条目字段取值：Precise 字符串优先（精度丢失小），回退整数字段
+fn pkg_f64(obj: &Value, precise_key: &str, plain_key: &str) -> f64 {
+    dig_f64(obj, precise_key)
+        .or_else(|| dig_f64(obj, plain_key))
+        .unwrap_or(0.0)
+}
+
+pub fn fetch_dosage_info(
     agent: &ureq::Agent,
     base: &str,
     token: &str,
     uid: &str,
-) -> Option<(f64, Option<i64>)> {
+) -> Option<DosageInfo> {
     let url = format!("{base}/v2/billing/meter/get-user-resource");
     let resp = agent
         .post(&url)
@@ -75,24 +113,57 @@ pub fn fetch_total_dosage(
     let data = digv(&v, &["data"]);
     let core = data
         .and_then(|d| crate::fs_utils::path(d, &["Response", "Data"]))
-        .or(data);
-    let dosage = core
-        .and_then(|c| dig_f64(c, "TotalDosage"))
-        .or_else(|| dig_f64(&v, "TotalDosage"))?;
-    // 最早未来到期（秒级时间戳或毫秒，容错归一到秒）
-    let expire = core
-        .map(|c| dig_all(c, "ExpiredTime"))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|t| {
-            let t = t.as_f64()?;
-            // >1e12 视为毫秒
-            let secs = if t > 1e12 { t / 1000.0 } else { t };
-            let now = chrono::Utc::now().timestamp() as f64;
-            (secs > now).then_some(secs as i64)
-        })
-        .min();
-    Some((dosage, expire))
+        .or(data)?;
+    let now = chrono::Utc::now().timestamp();
+    // 分包明细（Status 0=有效/3=宽限；其余状态不计）
+    let mut packages = Vec::new();
+    let mut expire_candidates: Vec<i64> = Vec::new();
+    if let Some(arr) = core.get("Accounts").and_then(Value::as_array) {
+        for a in arr {
+            let status = a.get("Status").and_then(Value::as_i64).unwrap_or(0);
+            if status != 0 && status != 3 {
+                continue;
+            }
+            let cycle_end = a
+                .get("CycleEndTime")
+                .and_then(Value::as_str)
+                .and_then(parse_cn_datetime);
+            if let Some(e) = cycle_end {
+                if e > now {
+                    expire_candidates.push(e);
+                }
+            }
+            // 旧字段兼容：数值型 ExpiredTime（秒/毫秒归一）
+            if let Some(t) = a.get("ExpiredTime").and_then(Value::as_f64) {
+                let secs = if t > 1e12 { t / 1000.0 } else { t };
+                if secs > now as f64 {
+                    expire_candidates.push(secs as i64);
+                }
+            }
+            packages.push(DosagePackage {
+                name: a
+                    .get("PackageName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                code: a
+                    .get("PackageCode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                remain: pkg_f64(a, "CapacityRemainPrecise", "CapacityRemain"),
+                size: pkg_f64(a, "CycleCapacitySizePrecise", "CycleCapacitySize"),
+                expire_secs: cycle_end,
+            });
+        }
+    }
+    let total = dig_f64(core, "TotalDosage").unwrap_or_else(|| packages.iter().map(|p| p.remain).sum());
+    let expire_secs = expire_candidates.iter().copied().min();
+    Some(DosageInfo {
+        total,
+        expire_secs,
+        packages,
+    })
 }
 
 /// dig 单键 f64（数值或数字字符串兜底）
@@ -218,7 +289,7 @@ fn process_account(
     }
 
     // ⑥ 前置：打卡前积分快照（失败不阻塞打卡——到账校验是加分项不是门槛）
-    let before = fetch_total_dosage(agent, base, token, uid);
+    let before = fetch_dosage_info(agent, base, token, uid);
 
     // ① 建会话
     let body = json!({
@@ -367,9 +438,9 @@ fn process_account(
     }
 
     // ⑥ 到账校验 + 幂等戳落盘 + 池快照回写（成功才落盘，§4.5：不成功不记打卡）
-    let after = fetch_total_dosage(agent, base, token, uid);
-    let gain = match (before, after) {
-        (Some((b, _)), Some((a, _))) if a > b => Some(a - b),
+    let after = fetch_dosage_info(agent, base, token, uid);
+    let gain = match (&before, &after) {
+        (Some(b), Some(a)) if a.total > b.total => Some(a.total - b.total),
         _ => None,
     };
     // 幂等戳：token rec 增量更新（敏感字段经 secure upsert 保持占位口径——
@@ -380,14 +451,22 @@ fn process_account(
         return fail(format!("打卡幂等戳落盘失败（记为未完成防假打卡）：{e}"));
     }
     // 池快照回写（after 口径；before/after 不可用时跳过不阻塞成功语义）
-    if let Some((total, expire)) = after {
-        if let Err(err) = crate::commands::workbuddy::buddy_pool_write_credits(state, acct_id, total, expire) {
+    if let Some(info) = &after {
+        let packages = serde_json::to_value(&info.packages).unwrap_or(Value::Null);
+        if let Err(err) = crate::commands::workbuddy::buddy_pool_write_credits(
+            state,
+            acct_id,
+            info.total,
+            info.expire_secs,
+            Some(packages),
+        ) {
             crate::fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 打卡积分回写失败 {acct_id}: {err}"));
         }
     }
     let msg = match gain {
         Some(g) => format!("活跃打卡完成，积分 +{g:.0}（{:.0} → {:.0}）",
-            before.map(|(b, _)| b).unwrap_or(0.0), after.map(|(a, _)| a).unwrap_or(0.0)),
+            before.as_ref().map(|b| b.total).unwrap_or(0.0),
+            after.as_ref().map(|a| a.total).unwrap_or(0.0)),
         None => "活跃打卡完成（会话 completed，奖励自动入账）".to_string(),
     };
     let mut ev = result_ev(acct_id, nickname, "success", &msg);
@@ -586,6 +665,27 @@ mod tests {
             .map(|t| if t > 1e12 { t / 1000.0 } else { t })
             .min_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(expire, Some(1_790_000_000.0));
+    }
+
+    /// P9 抓包校准：CycleEndTime 字符串（+08:00 墙钟）解析；锚点取自实测抓包——
+    /// CycleEndTime "2026-10-29 08:47:12" ↔ DeductionEndTime 1793234832000ms 双向印证
+    #[test]
+    fn parse_cn_datetime_capture_anchored() {
+        let secs = parse_cn_datetime("2026-10-29 08:47:12").expect("解析成功");
+        assert_eq!(secs, 1_793_234_832);
+        assert_eq!(parse_cn_datetime(""), None);
+        assert_eq!(parse_cn_datetime("9999-99-99 99:99:99"), None);
+    }
+
+    /// P9：分包字段 Precise 字符串优先、整数字段兜底
+    #[test]
+    fn pkg_f64_precise_priority() {
+        let a = json!({"CapacityRemainPrecise": "248.05", "CapacityRemain": 248});
+        assert_eq!(pkg_f64(&a, "CapacityRemainPrecise", "CapacityRemain"), 248.05);
+        let b = json!({"CapacityRemain": 100});
+        assert_eq!(pkg_f64(&b, "CapacityRemainPrecise", "CapacityRemain"), 100.0);
+        let c = json!({});
+        assert_eq!(pkg_f64(&c, "CapacityRemainPrecise", "CapacityRemain"), 0.0);
     }
 
     /// with_backoff：4xx 不重试直返、Ok 直返

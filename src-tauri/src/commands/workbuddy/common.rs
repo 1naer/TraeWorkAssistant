@@ -2,6 +2,7 @@
 //! 字段提取、进程检测、续期互斥锁、会话 uid 防护、CLI 设置回滚等被多域复用的辅助。
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tauri::{AppHandle, State};
@@ -95,6 +96,10 @@ pub struct WorkBuddyAccount {
     /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
     #[serde(default)]
     pub credits_expire_at: Option<i64>,
+    /// 积分包明细（P9 抓包校准：get-user-resource Accounts[] 分包解析——
+    /// [{name, code, remain, size, expire_secs}]；None = 未取数或上游无明细）
+    #[serde(default)]
+    pub credits_packages: Option<Value>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]

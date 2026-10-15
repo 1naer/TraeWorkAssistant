@@ -41,6 +41,25 @@ export default function BuddyAiCredits() {
   const [history, setHistory] = useState<CreditSnap[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  // 请求明细（P9：官网 get-user-request-usage 分页）
+  const [usageAcct, setUsageAcct] = useState('');
+  const [usageDays, setUsageDays] = useState(7);
+  const [usagePage, setUsagePage] = useState(1);
+  const [usageData, setUsageData] = useState<{
+    total: number;
+    page: number;
+    pageSize: number;
+    rows: Array<{
+      requestId: string;
+      credit: number;
+      model: string;
+      client: string;
+      requestTime: string;
+      inputTrunc: string;
+      agentPurpose: string;
+    }>;
+  } | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -121,6 +140,35 @@ export default function BuddyAiCredits() {
       .slice(0, 8);
   }, [usage]);
   const rankMax = modelRank[0]?.requests ?? 0;
+  // 积分包明细聚合（P9：各账号 credits_packages 拍平）
+  const pkgList = useMemo(
+    () =>
+      list.flatMap((a) =>
+        (a.credits_packages ?? []).map((p) => ({
+          acct: a.nickname || a.id,
+          ...p,
+        })),
+      ),
+    [list],
+  );
+  // 请求明细拉取（P9：官网分页接口）
+  const loadUsage = useCallback(
+    async (acctId: string, days: number, page: number) => {
+      if (!acctId) return;
+      setUsageLoading(true);
+      try {
+        const r = await api.buddyai.requestUsage(acctId, days, page, 20);
+        setUsageData(r);
+      } catch (err) {
+        pushToast('error', `请求流水查询失败：${String(err).slice(0, 160)}`);
+        setUsageData(null);
+      } finally {
+        setUsageLoading(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
   // Token 统计切面（P8 补齐：buddy_ai_days 桶网关记账；输入/输出分列）
   const todayTokens = useMemo(() => {
     const d = usage.find((u) => u.date === today);
@@ -205,6 +253,42 @@ export default function BuddyAiCredits() {
               </LineChart>
             </ResponsiveContainer>
           </div>
+        )}
+      </div>
+
+      {/* 积分包明细（P9 抓包解锁：get-user-resource Accounts[] 分包解析） */}
+      <div className="card mt-4 overflow-x-auto p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-medium">积分包明细</span>
+          <span className="text-[11px] text-slate-400">按包拆分剩余/总额/到期（同步积分后刷新）</span>
+        </div>
+        {pkgList.length === 0 ? (
+          <p className="py-4 text-center text-xs text-slate-400">暂无分包数据，先「同步积分」取数。</p>
+        ) : (
+          <table className="w-full min-w-[640px] text-sm">
+            <thead>
+              <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
+                <th className="py-2 pr-3 font-medium">账号</th>
+                <th className="py-2 pr-3 font-medium">包名</th>
+                <th className="py-2 pr-3 font-medium">剩余</th>
+                <th className="py-2 pr-3 font-medium">总额</th>
+                <th className="py-2 pr-3 font-medium">到期时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pkgList.map((p, i) => (
+                <tr key={`${p.acct}-${p.code}-${i}`} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
+                  <td className="py-2 pr-3 text-xs">{p.acct}</td>
+                  <td className="py-2 pr-3 text-xs">{p.name || p.code || '—'}</td>
+                  <td className="py-2 pr-3 text-xs tabular-nums text-emerald-600 dark:text-emerald-400">{p.remain.toFixed(2)}</td>
+                  <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">{p.size.toFixed(0)}</td>
+                  <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">
+                    {p.expire_secs ? new Date(p.expire_secs * 1000).toLocaleString() : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
 
@@ -325,9 +409,123 @@ export default function BuddyAiCredits() {
             ))}
             <p className="text-[11px] leading-4 text-slate-400">
               口径说明：Intl 上游未下发按模型积分明细，排行以网关请求数计（对齐 Token 统计网关源口径）；
-              模型级积分待上游公开接口后接入。
+              请求级真实积分见下方「请求明细」（官网流水）。
             </p>
           </div>
+        )}
+      </div>
+
+      {/* 请求明细（P9 抓包解锁：官网 get-user-request-usage 请求级流水） */}
+      <div className="card mt-4 p-4">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium">请求明细</span>
+          <select
+            className="rounded-md border border-slate-200 bg-transparent px-2 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+            value={usageAcct}
+            onChange={(e) => {
+              setUsageAcct(e.target.value);
+              setUsagePage(1);
+              setUsageData(null);
+            }}
+          >
+            <option value="">选择账号…</option>
+            {list.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.nickname || a.id}
+              </option>
+            ))}
+          </select>
+          <select
+            className="rounded-md border border-slate-200 bg-transparent px-2 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+            value={usageDays}
+            onChange={(e) => {
+              setUsageDays(Number(e.target.value));
+              setUsagePage(1);
+            }}
+          >
+            <option value={7}>近 7 天</option>
+            <option value={14}>近 14 天</option>
+            <option value={31}>近 31 天</option>
+          </select>
+          <button
+            className="btn-outline text-xs"
+            disabled={!usageAcct || usageLoading}
+            onClick={() => void loadUsage(usageAcct, usageDays, usagePage)}
+          >
+            {usageLoading ? '查询中…' : '查询'}
+          </button>
+          <span className="text-[11px] text-slate-400">
+            {usageData ? `共 ${usageData.total} 条 · 第 ${usagePage} 页` : '官网请求级流水（含打卡请求，可作官网侧旁证）'}
+          </span>
+        </div>
+        {!usageData ? (
+          <p className="py-4 text-center text-xs text-slate-400">选择账号与时间范围后点「查询」。</p>
+        ) : usageData.rows.length === 0 ? (
+          <p className="py-4 text-center text-xs text-slate-400">该窗口内无请求记录。</p>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
+                    <th className="py-2 pr-3 font-medium">时间</th>
+                    <th className="py-2 pr-3 font-medium">模型</th>
+                    <th className="py-2 pr-3 font-medium">客户端</th>
+                    <th className="py-2 pr-3 font-medium">消耗积分</th>
+                    <th className="py-2 pr-3 font-medium">用途</th>
+                    <th className="py-2 pr-3 font-medium">输入内容</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {usageData.rows.map((r) => (
+                    <tr key={r.requestId} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
+                      <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">{r.requestTime}</td>
+                      <td className="py-2 pr-3 font-mono text-xs">{r.model}</td>
+                      <td className="py-2 pr-3 text-xs text-slate-500">{r.client}</td>
+                      <td className="py-2 pr-3 text-xs tabular-nums">
+                        {r.credit > 0 ? (
+                          <span className="text-amber-600 dark:text-amber-400">{r.credit.toFixed(2)}</span>
+                        ) : (
+                          <span className="text-slate-400">0</span>
+                        )}
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-slate-500">{r.agentPurpose}</td>
+                      <td className="py-2 pr-3 max-w-[220px] truncate text-xs text-slate-500" title={r.inputTrunc}>
+                        {r.inputTrunc || '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex items-center justify-end gap-2 text-xs">
+              <button
+                className="btn-outline px-2 py-1"
+                disabled={usagePage <= 1 || usageLoading}
+                onClick={() => {
+                  const p = usagePage - 1;
+                  setUsagePage(p);
+                  void loadUsage(usageAcct, usageDays, p);
+                }}
+              >
+                上一页
+              </button>
+              <span className="tabular-nums text-slate-500">
+                {usagePage} / {Math.max(Math.ceil(usageData.total / usageData.pageSize), 1)}
+              </span>
+              <button
+                className="btn-outline px-2 py-1"
+                disabled={usagePage >= Math.ceil(usageData.total / usageData.pageSize) || usageLoading}
+                onClick={() => {
+                  const p = usagePage + 1;
+                  setUsagePage(p);
+                  void loadUsage(usageAcct, usageDays, p);
+                }}
+              >
+                下一页
+              </button>
+            </div>
+          </>
         )}
       </div>
     </div>
