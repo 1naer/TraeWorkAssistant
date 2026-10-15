@@ -1479,6 +1479,13 @@ pub fn api_wb_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server:
     crate::api_server::wb_catalog::load(&state.data_dir)
 }
 
+/// Buddy 国际版（buddy-ai）模型目录（§4.4 首版静态配置，无动态拉取/落盘；
+/// 倍率占位 1.0 待官网核对回填，仅供 BuddyAI 页目录展示）
+#[tauri::command]
+pub fn api_buddy_ai_catalog_list() -> Vec<crate::api_server::wb_catalog::WbModel> {
+    crate::api_server::wb_catalog::builtin_buddy_ai()
+}
+
 /// 查询最近 N 天的 API 用量统计（Trae 模型请求桶，按日聚合，直接读盘，服务未运行也可查）
 #[tauri::command]
 pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {

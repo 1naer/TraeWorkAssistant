@@ -77,6 +77,49 @@ impl WbModel {
     }
 }
 
+/// Buddy 国际版（buddy-ai）内置静态目录（§4.4：首版静态配置，不做动态拉取）。
+///
+/// 来源：R-5 探测 + workbuddy2api-hub 附录 A——Intl 17 个模型清单（`GET /v3/config`
+/// `agents[cli].models`，UA 带 CLI 段才下发全量）。倍率为**占位值 1.0**（官网实际
+/// 倍率待人工核对后回填，人工维护原则同 Qoder 倍率修正）；能力字段（上下文/模态/
+/// effort）上游未探测确认前保守留空，仅用于目录展示与「国际档可用模型」语义，
+/// 不参与 credits 成本估算（buddy-ai 池路由走独立记账桶，阶段 3b 打卡轮再对齐）。
+pub fn builtin_buddy_ai() -> Vec<WbModel> {
+    // (id, 展示名)
+    const INTL_MODELS: [(&str, &str); 17] = [
+        ("hy4-preview-f", "Hunyuan 4 Preview (Fast)"),
+        ("hy3", "Hunyuan 3"),
+        ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+        ("gpt-6-astra", "GPT-6 Astra"),
+        ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+        ("gpt-5.5", "GPT-5.5"),
+        ("gpt-5.4", "GPT-5.4"),
+        ("grok-4.7", "Grok 4.7"),
+        ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+        ("glm-5.3-flash", "GLM 5.3 Flash"),
+        ("glm-5.3", "GLM 5.3"),
+        ("glm-5.2", "GLM 5.2"),
+        ("kimi-k3", "Kimi K3"),
+        ("kimi-k2.6", "Kimi K2.6"),
+        ("kimi-k2.8-preview", "Kimi K2.8 Preview"),
+    ];
+    INTL_MODELS
+        .iter()
+        .map(|(id, display)| WbModel {
+            id: id.to_string(),
+            display: display.to_string(),
+            context_length: 0,
+            max_tokens: 0,
+            supports_image: false,
+            supported_efforts: Vec::new(),
+            effort_override: None,
+            rate: 1.0, // 占位：官网实际值待人工核对回填（§4.4 静态配置原则）
+        })
+        .collect()
+}
+
 /// 内置静态兜底目录（15 模型，§5.6；倍率为 2026-09 WorkBuddy 客户端截图快照，
 /// 多界面并列时取最低：hy4-preview / hy3 限时免费 0.00x，deepseek-v4-flash 0.03x，
 /// glm-5.3 / glm-5.2 0.78x，deepseek-v4-pro 0.51x，kimi-k3 / kimi-k3-1 1.62x，

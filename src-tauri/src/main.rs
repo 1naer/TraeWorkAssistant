@@ -238,6 +238,8 @@ fn main() {
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,
             commands::api_server::api_wb_catalog_list,
+            // Buddy 国际版（buddy-ai）模型目录（阶段 3：静态配置）
+            commands::api_server::api_buddy_ai_catalog_list,
             commands::wb_config::wb_route_config_get,
             commands::wb_config::wb_route_config_set,
             commands::wb_config::wb_template_map_get,

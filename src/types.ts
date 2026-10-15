@@ -1106,6 +1106,29 @@ export interface UpdateDownloaded {
 }
 
 // ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
+/** Buddy 国际版（buddy-ai）账号视图（buddy_ai_accounts_list，阶段 3 分区 UI） */
+export interface BuddyAiAccountView {
+  /** 账号 id（池键，wb-<hash> 派生口径同国内） */
+  id: string;
+  /** 真实账号 uuid（JWT sub，可能为空——手工导入无 uid 时为 ''） */
+  uid: string;
+  nickname: string;
+  note: string;
+  group_id: string;
+  access_token_expires_at: number | null;
+  refresh_token_expires_at: number | null;
+  auth_saved_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  credits_balance: number | null;
+  credits_expire_at: string | null;
+  credits_fetched_at: string | null;
+  /** 凭证是否存在（vault 回填后有明文 access_token 才算可用） */
+  has_credential: boolean;
+  /** token rec domain（恒含 .workbuddy.ai） */
+  domain: string;
+}
+
 export interface WorkBuddyAccountView {
   id: string;
   uid: string;

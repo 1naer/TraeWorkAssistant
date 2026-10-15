@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AccountView,
   ApiServiceStatus,
+  BuddyAiAccountView,
   ApiPoolFile,
   ApiKeyEntry,
   CcSwitchStatus,
@@ -420,6 +421,24 @@ export const api = {
         { userId },
       ),
   },
+  // ---- Buddy 国际版（buddy-ai 独立池；Rust commands/workbuddy/buddy_ai.rs）----
+  buddyai: {
+    /** buddy-ai OAuth 扫码登录（workbuddy.ai + platform=workbuddy-ai）；
+     *  事件 buddy-ai-oauth-progress / buddy-ai-oauth-done（与 wb-oauth 同构、独立前缀） */
+    oauthLogin: () => invoke<void>('buddy_ai_oauth_login'),
+    accountsList: () => invoke<BuddyAiAccountView[]>('buddy_ai_accounts_list'),
+    /** 手工导入国际账号凭证（区域必选校验：domain 须含 .workbuddy.ai） */
+    accountImportCreds: (name?: string, accessToken?: string, refreshToken?: string, domain?: string) =>
+      invoke<{ id: string; domain: string }>('buddy_ai_account_import_creds', {
+        name: name ?? null,
+        accessToken: accessToken ?? null,
+        refreshToken: refreshToken ?? null,
+        domain: domain ?? null,
+      }),
+    accountRemove: (userId: string) => invoke('buddy_ai_account_remove', { userId }),
+    /** 凭证续期（R-2a 实测端点，rt 轮换回写；失败按暂态不标 needs_relogin） */
+    refreshToken: (userId: string) => invoke<string>('buddy_ai_refresh_token', { userId }),
+  },
   // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
   workbuddy: {
     envCheck: () => invoke<WorkBuddyEnvCheck>('workbuddy_env_check'),
@@ -810,6 +829,8 @@ export const api = {
     wbCatalogSync: () => invoke<number>('api_wb_catalog_sync'),
     // WB 目录模型列表（Buddy「资源调度」页展示）
     wbCatalogList: () => invoke<WbModelInfo[]>('api_wb_catalog_list'),
+    /** Buddy 国际版（buddy-ai）模型目录（§4.4 首版静态配置） */
+    buddyAiCatalogList: () => invoke<WbModelInfo[]>('api_buddy_ai_catalog_list'),
     // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
     // side：trae（Trae 模型网关）/ wb（WB 上游网关），两套条目互不覆盖
     ccSwitchStatus: () => invoke<CcSwitchStatus>('ccswitch_status'),
