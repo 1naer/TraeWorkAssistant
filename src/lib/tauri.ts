@@ -790,6 +790,8 @@ export const api = {
         buddyAiEnabled?: boolean;
         /** buddy-ai 显式会话粘性开关；null/未传 = 保留原值 */
         buddyAiStickyEnabled?: boolean;
+        /** buddy-ai 池粘性 TTL 秒（P6 顺延补齐）；null/未传 = 保留原值 */
+        buddyAiPoolStickyTtlSecs?: number;
       },
       wbStrategy?: string,
     ) =>
@@ -827,6 +829,7 @@ export const api = {
         qoderTagIds: wbFlags?.qoderTagIds ?? null,
         buddyAiEnabled: wbFlags?.buddyAiEnabled ?? null,
         buddyAiStickyEnabled: wbFlags?.buddyAiStickyEnabled ?? null,
+        buddyAiPoolStickyTtlSecs: wbFlags?.buddyAiPoolStickyTtlSecs ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),

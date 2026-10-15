@@ -121,6 +121,26 @@ export default function BuddyAiCredits() {
       .slice(0, 8);
   }, [usage]);
   const rankMax = modelRank[0]?.requests ?? 0;
+  // Token 统计切面（P8 补齐：buddy_ai_days 桶网关记账；输入/输出分列）
+  const todayTokens = useMemo(() => {
+    const d = usage.find((u) => u.date === today);
+    return d ? d.prompt_tokens + d.completion_tokens : 0;
+  }, [usage, today]);
+  const sumTokens = useMemo(
+    () => usage.reduce((s, u) => s + u.prompt_tokens + u.completion_tokens, 0),
+    [usage],
+  );
+  const sumRequests = useMemo(() => usage.reduce((s, u) => s + u.total_requests, 0), [usage]);
+  const sumErrors = useMemo(() => usage.reduce((s, u) => s + u.errors, 0), [usage]);
+  const tokenTrend = useMemo(
+    () =>
+      usage.map((u) => ({
+        date: u.date.slice(5),
+        输入: u.prompt_tokens,
+        输出: u.completion_tokens,
+      })),
+    [usage],
+  );
 
   const fmtExpire = (ts: number | null) =>
     ts == null ? '—' : new Date(ts * 1000).toLocaleString();
@@ -182,6 +202,41 @@ export default function BuddyAiCredits() {
                 <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
                 <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
                 <Line type="monotone" dataKey="可用总积分" stroke="#10b981" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
+
+      {/* Token 统计（P8 补齐：buddy_ai_days 桶网关记账切面） */}
+      <div className="card mt-4 p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-medium">Token 统计</span>
+          <span className="text-[11px] text-slate-400">近 30 天 · 网关记账（buddy-ai 档）</span>
+        </div>
+        <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+          <StatCard label="今日 Tokens" value={todayTokens.toLocaleString()} hint="输入 + 输出合计" tone="brand" />
+          <StatCard label="30 天累计 Tokens" value={sumTokens.toLocaleString()} hint="输入 + 输出合计" tone="green" />
+          <StatCard label="请求数" value={sumRequests.toLocaleString()} hint={`${sumErrors} 次失败`} tone="slate" />
+          <StatCard
+            label="平均每请求"
+            value={sumRequests > 0 ? Math.round(sumTokens / sumRequests).toLocaleString() : '—'}
+            hint="tokens / 请求"
+            tone="amber"
+          />
+        </div>
+        {tokenTrend.length === 0 ? (
+          <p className="py-4 text-center text-xs text-slate-400">近 30 天无网关请求记录。</p>
+        ) : (
+          <div className="h-48">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={tokenTrend} margin={{ top: 4, right: 8, bottom: 0, left: -8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#8884" vertical={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" tickLine={false} axisLine={false} />
+                <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={(v: number) => `${Math.round(v / 1000)}k`} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                <Line type="monotone" dataKey="输入" stroke="#0ea5e9" strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="输出" stroke="#10b981" strokeWidth={2} dot={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>

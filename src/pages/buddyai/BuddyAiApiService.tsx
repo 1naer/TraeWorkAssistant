@@ -20,7 +20,12 @@ export default function BuddyAiApiService() {
   const [pool, setPool] = useState<ApiPoolFile | null>(null);
   const [accounts, setAccounts] = useState<BuddyAiAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
-  const [flags, setFlags] = useState({ buddyAiEnabled: false, buddyAiStickyEnabled: false });
+  const [flags, setFlags] = useState<{
+    buddyAiEnabled: boolean;
+    buddyAiStickyEnabled: boolean;
+    buddyAiPoolStickyTtlSecs?: number;
+  }>({ buddyAiEnabled: false, buddyAiStickyEnabled: false });
+  const [poolTtl, setPoolTtl] = useState(0);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [rowOp, setRowOp] = useState<string | null>(null);
@@ -42,6 +47,7 @@ export default function BuddyAiApiService() {
           buddyAiEnabled: pf.buddy_ai_enabled ?? false,
           buddyAiStickyEnabled: pf.buddy_ai_sticky_enabled ?? false,
         });
+        setPoolTtl(pf.buddy_ai_pool_sticky_ttl_secs ?? 0);
       }
     } finally {
       setLoading(false);
@@ -52,7 +58,11 @@ export default function BuddyAiApiService() {
     void refresh();
   }, [refresh]);
 
-  const saveFlags = async (next: { buddyAiEnabled: boolean; buddyAiStickyEnabled: boolean }) => {
+  const saveFlags = async (next: {
+    buddyAiEnabled: boolean;
+    buddyAiStickyEnabled: boolean;
+    buddyAiPoolStickyTtlSecs?: number;
+  }) => {
     if (!pool) {
       pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
       return;
@@ -251,6 +261,24 @@ export default function BuddyAiApiService() {
                   <span className="ml-1 text-xs text-slate-400">显式 conversationId 在国际池内绑定账号；默认关</span>
                 </span>
               </label>
+              <div className="flex items-center gap-2 pl-6 text-xs text-slate-500">
+                池粘性 TTL
+                <input
+                  type="number"
+                  min={60}
+                  max={86400}
+                  className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                  value={poolTtl}
+                  onChange={(e) => setPoolTtl(Number(e.target.value))}
+                  onBlur={() => {
+                    const clamped = Math.min(Math.max(Math.round(poolTtl || 0), 60), 86400);
+                    setPoolTtl(clamped);
+                    void saveFlags({ ...flags, buddyAiPoolStickyTtlSecs: clamped });
+                  }}
+                />
+                秒
+                <span className="text-[11px] text-slate-400">（粘性绑定有效期，60s–24h）</span>
+              </div>
             </div>
           )}
           <div className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
