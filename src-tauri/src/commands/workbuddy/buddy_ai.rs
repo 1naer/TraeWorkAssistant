@@ -296,6 +296,19 @@ pub fn buddy_ai_refresh_token(state: State<'_, AppState>, user_id: String) -> Re
             .cloned()
             .ok_or_else(|| format!("账号不在 buddy-ai 池中: {user_id}"))?
     };
+    // 审查修复（M2）：续期全程持每账号刷新锁 + 跨进程锁——rt 每次轮换，
+    // 并发续期时后落库者会把先落库者的新 rt 覆盖为已被服务端作废的旧值（凭证永久失效）。
+    // 与 wb 侧 refresh_access_token 锁序同构；与网关 401 国际档续期互斥共用同一把锁
+    let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&acct.id);
+    let _refresh_guard = refresh_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(_cross) =
+        crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(&state.data_dir, "buddy-ai", &acct.id, 5000).0
+    else {
+        return Err("他方进程正在刷新该账号，稍后重试".into());
+    };
+    // 锁内读凭证（他人刚刷新落库的新值直接可见）
     let tokens = load_buddy_tokens(&state);
     let rec = tokens
         .get("tokens")
@@ -347,19 +360,25 @@ pub fn buddy_ai_refresh_token(state: State<'_, AppState>, user_id: String) -> Re
     let exp_ms = expires_in.map(|s| now_ms + s * 1000);
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
 
-    // rt 轮换回写（R-2a：每次刷新轮换；响应缺失时保留旧值防丢）
-    let creds = json!({
-        "access_token": new_access,
-        "refresh_token": if new_refresh.as_deref().unwrap_or("").is_empty() {
-            as_str(fs_utils::dig(&rec, &["refresh_token"]))
-        } else {
-            new_refresh
-        },
-        "expires_at_ms": exp_ms,
-        "refresh_expires_at_ms": rexp_ms,
-        "domain": intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"]))),
-    });
-    crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &acct.id, &creds)?;
+    // rt 轮换回写（R-2a：每次刷新轮换；响应缺失时保留旧值防丢）。
+    // 审查修复（M1）：合并式写回（在旧 rec 上更新四键）——upsert 是整行 REPLACE，
+    // 从零构造会抹掉打卡幂等戳 last_daily_chat 与 uid 兜底，刷新一次当日打卡即被重跑
+    let mut merged = if rec.is_object() { rec.clone() } else { serde_json::json!({}) };
+    if let Some(rm) = merged.as_object_mut() {
+        rm.insert("access_token".into(), json!(new_access));
+        rm.insert(
+            "refresh_token".into(),
+            json!(if new_refresh.as_deref().unwrap_or("").is_empty() {
+                as_str(fs_utils::dig(&rec, &["refresh_token"])).unwrap_or_default()
+            } else {
+                new_refresh.clone().unwrap_or_default()
+            }),
+        );
+        rm.insert("expires_at_ms".into(), json!(exp_ms));
+        rm.insert("refresh_expires_at_ms".into(), json!(rexp_ms));
+        rm.insert("domain".into(), json!(intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"])))));
+    }
+    crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &acct.id, &merged)?;
     // 短临界区回写池过期时间
     {
         let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -382,30 +401,39 @@ const MIGRATION_BACKUP_KEY: &str = "buddy_ai_migration_backup";
 // ── 每日活跃打卡（阶段 3b，§4.5 补篇）：NDJSON 进度管线 + 积分同步命令 ──────
 
 /// 打卡整轮轮次互斥（独立于 WB_ROUND_LOCK——不与国内签到互斥，两池零交织）。
-/// AtomicBool CAS 而非 MutexGuard：guard 不能跨 thread::spawn 移动（!Send），
-/// 忙标志由各执行线程 finally 复位
+/// AtomicBool CAS + RAII guard：guard 不能跨 thread::spawn 移动（!Send），
+/// 但 RAII 结构体（无借用）可以——Drop 自动复位，任意路径（含 panic 展开）
+/// 都不会把 BUSY 永久挂起（审查修复：原实现调度器/启动补跑路径抢占后不释放，
+/// 当天后续所有打卡轮次被 skipped_busy 永久跳过）
 static BUDDY_AI_ROUND_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 抢打卡轮次（调度器 run_task / 启动钩子 / UI 命令三路复用；CAS 幂等语义）
-pub(crate) fn try_acquire_buddy_ai_round() -> Result<(), String> {
+/// 打卡轮次 RAII 守卫：持有期间 BUSY=true，Drop（含 panic 展开）复位
+pub(crate) struct BuddyAiRoundGuard;
+
+impl Drop for BuddyAiRoundGuard {
+    fn drop(&mut self) {
+        BUDDY_AI_ROUND_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 抢打卡轮次（调度器 run_task / 启动钩子 / UI 命令三路复用；CAS 幂等语义）。
+/// 守卫必须移动进执行线程，生命周期覆盖整轮
+pub(crate) fn try_acquire_buddy_ai_round() -> Result<BuddyAiRoundGuard, String> {
     use std::sync::atomic::Ordering;
     BUDDY_AI_ROUND_BUSY
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .map(|_| ())
+        .map(|_| BuddyAiRoundGuard)
         .map_err(|_| "已有 buddy-ai 打卡任务在执行中".to_string())
-}
-
-/// 释放打卡轮次（执行线程收尾调用；调度器 skipped_busy 路径不涉及）
-fn release_buddy_ai_round() {
-    BUDDY_AI_ROUND_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// buddy-ai 每日活跃打卡启动（手动触发，UI 进度经 buddy-ai-checkin-progress NDJSON 推送）
 #[tauri::command(async)]
 pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
-    // 轮次互斥：CAS 抢占（运行中重复点击显式拒绝）
-    try_acquire_buddy_ai_round()?;
+    // 轮次互斥：CAS 抢占（运行中重复点击显式拒绝）；守卫移动进执行线程，
+    // 生命周期覆盖整轮（临时守卫若不 move 会在语句末 Drop 白抢一次锁）
+    let _round = try_acquire_buddy_ai_round()?;
     std::thread::spawn(move || {
+        let _round = _round; // 显式移动进闭包，Drop 自动复位 BUSY（含 panic 展开）
         let st = AppState::new();
         let payload = match st {
             Ok(st) => {
@@ -435,7 +463,6 @@ pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
         };
         let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(&json!({"type":"exit"})).unwrap_or_default());
         let _ = payload;
-        release_buddy_ai_round();
     });
     Ok(())
 }
@@ -585,6 +612,9 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
     if db.kv_get_raw(MIGRATION_MARKER).is_some() {
         return Ok((0, 0));
     }
+    // 审查修复（H2）：wb 池读-改-写全程持 wb_pool_lock——迁移窗口内并发的 wb 池
+    // 命令（导入/删除/积分回写）同为读-改-写，无锁会互相覆盖丢更新
+    let _wb_guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     // secure 回填读（仅内存）：迁移要把敏感值从 wb vault 命名空间搬到 buddy-ai 命名空间
     let wb_store = crate::tasks::wb_common::token_store_load_secure(&state.data_dir);
     let wb_tokens = wb_store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
@@ -611,19 +641,46 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
         return Ok((0, stay_ids.len()));
     }
 
-    // 备份先行（审计口径：备份的是 DB 形态——敏感字段占位，不含明文）
+    // 备份先行（审计口径：备份的是 DB 占位形态，不含明文凭证）。
+    // 审查修复（C1）：moved_tokens 来自 secure 回填读（内存明文）——备份前必须把
+    // 敏感键置空，否则明文 access/refresh token 经 kv_set_raw 落 SQLite，DB 文件
+    // 泄漏即凭证泄漏（回滚场景由用户重新登录/导入恢复凭证，不影响账号结构回滚）
+    const BACKUP_SENSITIVE_KEYS: [&str; 4] = [
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "refreshToken",
+    ];
+    let mut backup_tokens = moved_tokens.clone();
+    for rec in backup_tokens.values_mut() {
+        if let Some(rm) = rec.as_object_mut() {
+            for k in BACKUP_SENSITIVE_KEYS {
+                if rm.contains_key(k) {
+                    rm.insert(k.to_string(), json!(""));
+                }
+            }
+        }
+    }
     let backup = json!({
         "migrated_at": chrono::Utc::now().to_rfc3339(),
         "accounts": moved_accounts,
-        "tokens": moved_tokens,
+        "tokens": backup_tokens,
     });
     db.kv_set_raw(MIGRATION_BACKUP_KEY, &serde_json::to_string(&backup).map_err(|e| e.to_string())?)?;
 
-    // buddy-ai 侧先写（幂等 upsert；失败即整体失败，wb 侧未动）
+    // buddy-ai 侧先写（幂等 upsert；失败即整体失败，wb 侧未动）。
+    // 审查修复（H2/H3）：buddy 侧写入持 buddy_ai_pool_lock（锁序 wb→buddy 单向）；
+    // 池行按 id upsert——部分失败重试时纯 push 会产生重复账号行（凭证写成功、
+    // wb 侧回写失败 → 标记未置位 → 下次启动重扫重迁）
     {
+        let _buddy_guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut buddy_pool = load_buddy_pool(state);
         for a in &moved_accounts {
-            buddy_pool.accounts.push(a.clone());
+            if let Some(existing) = buddy_pool.accounts.iter_mut().find(|x| x.id == a.id) {
+                *existing = a.clone();
+            } else {
+                buddy_pool.accounts.push(a.clone());
+            }
         }
         save_buddy_pool(state, &buddy_pool)?;
         for (id, rec) in &moved_tokens {
@@ -631,9 +688,8 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
         }
     }
     // wb 侧后写（池整存 + 混居 token 行删除；vault 旧条目留存不删——加密数据无害，
-    // 避免迁移中断后 wb 侧凭证丢失不可回滚）
+    // 避免迁移中断后 wb 侧凭证丢失不可回滚）。wb_pool_lock 已在函数顶部持有
     {
-        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         save_pool(state, &wb_pool)?;
         for id in moved_tokens.keys() {
             crate::store::docs::token_store_remove(&db, "wb_tokens", id)?;

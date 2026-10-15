@@ -108,7 +108,16 @@ fn resolve_wb_target(
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    if wb_catalog::find(&catalog, &r.model).is_none() {
+    // 审查修复：CN 目录未命中并查 Intl 静态目录（/v1/responses 同 dispatch 源判定，
+    // Intl 专属 id 如 deepseek-v4.1-flash 不得 404）；Intl 专属命中跳过 CN 目录降级
+    //（降级候选发往 buddy-ai 池上游不存在）
+    let intl_only = wb_catalog::find(&catalog, &r.model).is_none()
+        && (wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), &r.model).is_some()
+            || wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), model).is_some());
+    if wb_catalog::find(&catalog, &r.model).is_none()
+        && wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), &r.model).is_none()
+        && wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), model).is_none()
+    {
         return None;
     }
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
@@ -116,11 +125,13 @@ fn resolve_wb_target(
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
     let whitelist = unified_catalog::load_whitelist(&state.data_dir);
     let in_wl = |m: &str| unified_catalog::whitelist_allows(&whitelist, m);
-    let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+    let final_model = if !intl_only
+        && state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
         wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
-    } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+    } else if !intl_only
+        && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
@@ -648,6 +659,12 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
+    // buddy-ai 源旗标（阶段 2 审查修复）：Intl 静态目录入统一目录（Intl 专属 id
+    // 可被发现/加入白名单），徽章 = 开关 && 池健康
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_ok = state.buddy_ai_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
     // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
@@ -661,14 +678,23 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             trae_ok,
             buddy_ok,
             Some((qoder_enabled, qoder_ok)),
+            Some((buddy_ai_enabled, buddy_ai_ok)),
         )
     })
     .await
     .unwrap_or_default();
-    // wb_enabled=false：仅 Buddy 源的模型过滤，双源模型保留（仍可由 Trae 源服务 §3.4）
+    // wb_enabled=false：仅 WB 系源（buddy / buddy-ai）的模型过滤，多源模型保留
+    //（仍可由 Trae 源服务 §3.4；buddy-ai 开启时 CN 目录模型经 buddy-ai 池仍可路由，
+    // 不得在准入目录层被滤掉——与 dispatch available 门控同口径）
     let mut data: Vec<Value> = list
         .iter()
-        .filter(|m| wb_enabled || !m.sources.iter().all(|s| s.pool == "buddy"))
+        .filter(|m| {
+            wb_enabled
+                || buddy_ai_enabled
+                || !m.sources
+                    .iter()
+                    .all(|s| s.pool == "buddy" || s.pool == "buddy-ai")
+        })
         .map(|m| {
             json!({
                 "id": m.id,

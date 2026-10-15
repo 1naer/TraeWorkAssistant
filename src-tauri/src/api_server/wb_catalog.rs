@@ -120,6 +120,14 @@ pub fn builtin_buddy_ai() -> Vec<WbModel> {
         .collect()
 }
 
+/// [`builtin_buddy_ai`] 进程级缓存切片（审查修复配套）：dispatch 源判定每请求
+/// 查询 Intl 目录，静态表确定性不变——OnceLock 零重复分配（CN 目录 load 走
+/// config_cache 同理）
+pub fn builtin_buddy_ai_cached() -> &'static [WbModel] {
+    static CACHE: std::sync::OnceLock<Vec<WbModel>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(builtin_buddy_ai)
+}
+
 /// 内置静态兜底目录（15 模型，§5.6；倍率为 2026-09 WorkBuddy 客户端截图快照，
 /// 多界面并列时取最低：hy4-preview / hy3 限时免费 0.00x，deepseek-v4-flash 0.03x，
 /// glm-5.3 / glm-5.2 0.78x，deepseek-v4-pro 0.51x，kimi-k3 / kimi-k3-1 1.62x，

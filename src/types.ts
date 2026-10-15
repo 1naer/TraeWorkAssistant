@@ -1127,7 +1127,8 @@ export interface BuddyAiAccountView {
   needs_relogin: boolean;
   relogin_reason: string;
   credits_balance: number | null;
-  credits_expire_at: string | null;
+  /** 积分包最近到期时刻（秒级 unix 时间戳；注意与 credits_fetched_at 的 rfc3339 串不同） */
+  credits_expire_at: number | null;
   credits_fetched_at: string | null;
   /** 凭证是否存在（vault 回填后有明文 access_token 才算可用） */
   has_credential: boolean;

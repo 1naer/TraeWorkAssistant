@@ -1637,26 +1637,38 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
-        Some(rt) => {
-            let s = &rt.shared;
-            (
-                s.wb_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                s.qoder_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
-                s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                    && s.pool.has_selectable(),
-                s.wb_pool.has_selectable(),
-                s.qoder_pool.has_selectable(),
-            )
-        }
-        None => {
-            let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
-        }
-    };
+    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok, buddy_ai_enabled, buddy_ai_ok) =
+        match safe_lock(&runtime).as_ref() {
+            Some(rt) => {
+                let s = &rt.shared;
+                (
+                    s.wb_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    s.qoder_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
+                    s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                        && s.pool.has_selectable(),
+                    s.wb_pool.has_selectable(),
+                    s.qoder_pool.has_selectable(),
+                    s.buddy_ai_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    s.buddy_ai_pool.has_selectable(),
+                )
+            }
+            None => {
+                let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
+                (
+                    pf.wb_enabled,
+                    pf.qoder_enabled,
+                    pf.trae_enabled,
+                    true,
+                    true,
+                    pf.buddy_ai_enabled,
+                    true,
+                )
+            }
+        };
     let data_dir = state.data_dir.clone();
     let mut list = crate::api_server::unified_catalog::unified_models_ex(
         &data_dir,
@@ -1664,6 +1676,7 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        Some((buddy_ai_enabled, buddy_ai_ok)),
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));

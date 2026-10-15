@@ -735,9 +735,10 @@ fn run_wb_stream(
                         String::new()
                     };
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy reasons=[{}]{}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} reasons=[{}]{}",
                         tried.len(),
                         empty_hits,
+                        state.pool_label(),
                         diag_summary.join(", "),
                         sample_note,
                     ));
@@ -988,7 +989,7 @@ fn run_wb_stream(
                             // T2.6：401 → 刷新一次凭证后同号重试（每账号每请求一次）
                             if status == 401 && !refreshed.contains(&picked.uid) {
                                 refreshed.insert(picked.uid.clone());
-                                match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, Some(&creds.token)) {
+                                match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
                                     Ok(new_token) => {
                                         state.route_pool().update_jwt(&picked.uid, &new_token);
                                         creds.token = new_token;
@@ -1144,9 +1145,10 @@ pub async fn wb_aggregate_chat(
                         // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
                                 tried.len(),
                                 empty_hits,
+                                state.pool_label(),
                                 wb_payload::fingerprint_sample(&body_vec),
                             ));
                         }
@@ -1339,7 +1341,7 @@ pub async fn wb_aggregate_chat(
                             RetryAction::SwitchKey => {
                                 if status == 401 && !refreshed.contains(&picked.uid) {
                                     refreshed.insert(picked.uid.clone());
-                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, Some(&creds.token)) {
+                                    match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
                                         Ok(new_token) => {
                                             state.route_pool().update_jwt(&picked.uid, &new_token);
                                             creds.token = new_token;
@@ -1743,7 +1745,7 @@ pub async fn wb_tool_exec_chat(
                             RetryAction::SwitchKey => {
                                 if status == 401 && !refreshed.contains(&picked.uid) {
                                     refreshed.insert(picked.uid.clone());
-                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, Some(&creds.token)) {
+                                    match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
                                         Ok(new_token) => {
                                             state.route_pool().update_jwt(&picked.uid, &new_token);
                                             creds.token = new_token;
@@ -1841,9 +1843,10 @@ pub async fn wb_tool_exec_chat(
                     // tool 消息，样本取首条 system + 工具清单，语义不受影响）
                     if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                         state.logger.log_debug_line(format!(
-                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
                             tried.len(),
                             empty_hits,
+                            state.pool_label(),
                             wb_payload::fingerprint_sample(
                                 &serde_json::to_vec(&chat_body).unwrap_or_default()
                             ),

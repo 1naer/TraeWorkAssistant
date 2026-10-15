@@ -257,8 +257,12 @@ impl FallbackReason {
 
 /// 单请求资源源集合：该模型可用的资源池（③ 统一目录查表结果）
 struct ModelSources {
-    /// Buddy 源：四段管线归一化命中（Some(最终模型, effort 提示)）
+    /// Buddy 源：四段管线归一化命中（Some(最终模型, effort 提示)）；含 Intl 静态
+    /// 目录折入（buddy_intl_only 区分来源域）
     buddy: Option<(String, Option<String>)>,
+    /// Intl 专属标记（审查修复）：buddy 源来自 Intl 静态目录而非 CN 目录——
+    /// Buddy(CN) 池不服务该模型（available 门控），仅 buddy-ai 池可取号
+    buddy_intl_only: bool,
     /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
     trae: bool,
     /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
@@ -300,10 +304,11 @@ impl ModelSources {
         if self.trae && trae_enabled {
             n += 1;
         }
-        if self.buddy.is_some() && wb_enabled {
+        if self.buddy.is_some() && wb_enabled && !self.buddy_intl_only {
             n += 1;
         }
-        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）
+        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）；Intl 专属
+        // 模型源同样计入（CN 目录未命中但 Intl 目录命中时 buddy 源存在）
         if self.buddy.is_some() && buddy_ai_enabled {
             n += 1;
         }
@@ -325,7 +330,8 @@ impl ModelSources {
     ) -> bool {
         match pool {
             TargetPool::Trae => self.trae && trae_enabled,
-            TargetPool::Buddy => self.buddy.is_some() && wb_enabled,
+            // Intl 专属模型源不得路由 Buddy(CN) 池（审查修复：CN 上游无该模型 id）
+            TargetPool::Buddy => self.buddy.is_some() && wb_enabled && !self.buddy_intl_only,
             TargetPool::BuddyAi => self.buddy.is_some() && buddy_ai_enabled,
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
             TargetPool::Custom => false,
@@ -421,20 +427,37 @@ pub fn resolve_target(
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = super::wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
+    // 审查修复（buddy-ai Intl 专属模型误路由）：CN 目录未命中时并查 Intl 静态目录
+    //（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等 Intl 专属 id
+    // 不在 CN 目录，原实现 buddy_hit=None → 落 Trae 透传语义被误路由 Trae 上游。
+    // 命中折入 buddy 源（final_model/effort/冷却链路复用），buddy_intl_only 标记
+    // 随源携带：Buddy(CN) 池不得服务 Intl 专属模型（available 门控），buddy-ai 池正常取号
+    let intl_hit = if super::wb_catalog::find(&catalog, &r.model).is_none() {
+        super::wb_catalog::find(super::wb_catalog::builtin_buddy_ai_cached(), &r.model)
+            .or_else(|| super::wb_catalog::find(super::wb_catalog::builtin_buddy_ai_cached(), model))
+            .map(|m| (m.id.clone(), None))
+    } else {
+        None
+    };
+    let buddy_intl_only = intl_hit.is_some();
     let buddy_hit = super::wb_catalog::find(&catalog, &r.model)
             .map(|_| {
                 // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
                 // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
+                // Intl 专属请求跳过降级：降级候选出自 CN 目录，替换后的模型 id 发往
+                // buddy-ai 池上游不存在（审查修复）
                 let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
                 let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
-                let final_model = if state
+                let final_model = if !buddy_intl_only
+                    && state
                     .wb_bg_downgrade
                     .load(std::sync::atomic::Ordering::Relaxed)
                     && wb_model_route::is_background_task(body)
                 {
                     wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
                         .unwrap_or_else(|| r.model.clone())
-                } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                } else if !buddy_intl_only
+                    && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
                     // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
                     && wb_model_route::estimate_input_tokens(body)
                         >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
@@ -445,7 +468,8 @@ pub fn resolve_target(
                     r.model.clone()
                 };
                 (final_model, r.effort_hint.clone())
-            });
+            })
+            .or(intl_hit);
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
     // 透传语义（单源 Trae，与现状一致）。
@@ -513,6 +537,8 @@ pub fn resolve_target(
         || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
     let sources = ModelSources {
         buddy: buddy_hit,
+        // 审查修复：Intl 专属模型源（CN 目录未命中、Intl 目录命中）
+        buddy_intl_only,
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
@@ -1160,7 +1186,7 @@ mod tests {
 
         /// 往池里塞一个健康账号（credits=10）
         fn seed_healthy(&self, trae: bool) {
-            let pool = if trae { &self.state.pool } else { &self.state.wb_pool };
+        let pool = if trae { &self.state.pool } else { &self.state.wb_pool };
             pool.sync_from_wb(
                 &[super::super::pool::WbSyncAccount {
                     uid: if trae { "t1" } else { "b1" }.into(),
@@ -1572,6 +1598,58 @@ mod tests {
         assert_eq!(r1.pool, TargetPool::Buddy);
         // 粘性表为空
         assert!(f.state.pool_sticky.lock().unwrap().is_empty());
+    }
+
+    // ---------- 阶段 2 审查修复：Intl 专属模型源判定 ----------
+
+    /// Intl 专属 id（仅 builtin_buddy_ai 目录，CN 目录无）：折入 buddy 源后路由
+    /// buddy-ai 池；原实现 buddy_hit=None 落 Trae 透传语义被误路由 Trae 上游。
+    /// 同时固化：Buddy(CN) 池不得服务 Intl 专属模型（available 门控）；
+    /// buddy-ai 关闭时显式报错而非静默投 Trae；CN 目录模型 WbDisabled 语义不变
+    #[test]
+    fn t_intl_only_model_routes_buddy_ai_pool() {
+        use std::sync::atomic::Ordering;
+        // Intl 专属模型 + buddy-ai 开启且池健康 → BuddyAi 池
+        let f = fixture(&["unrelated-trae"], Some(&["hy4"]), Some(&policy_default()));
+        f.state.wb_enabled.store(false, Ordering::Relaxed);
+        f.state.trae_enabled.store(false, Ordering::Relaxed);
+        f.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f.state.buddy_ai_pool.sync_from_wb(
+            &[super::super::pool::WbSyncAccount {
+                uid: "g1".into(),
+                name: "intl".into(),
+                token: "tk".into(),
+                domain: "www.workbuddy.ai".into(),
+                enterprise_id: String::new(),
+                global_region: true,
+                credits: Some(10.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["g1".to_string()],
+        );
+        let r = f.resolve("deepseek-v4.1-flash").expect("Intl 专属模型应可调度");
+        assert_eq!(r.pool, TargetPool::BuddyAi);
+        assert_eq!(r.model, "deepseek-v4.1-flash");
+
+        // buddy-ai 关闭 → 无可服务池，显式报错（不误投 Trae）
+        let f2 = fixture(&["unrelated-trae"], Some(&["hy4"]), Some(&policy_default()));
+        f2.state.wb_enabled.store(false, Ordering::Relaxed);
+        f2.state.trae_enabled.store(false, Ordering::Relaxed);
+        assert!(f2.resolve("deepseek-v4.1-flash").is_err());
+
+        // CN 目录模型不受 Intl 折入影响：wb 关闭 → WbDisabled 语义保持
+        //（hy4 仅 CN 目录，不在 Intl 17 表/Qoder 目录）
+        let f3 = fixture(&["unrelated-trae"], Some(&["hy4"]), Some(&policy_default()));
+        f3.state.wb_enabled.store(false, Ordering::Relaxed);
+        f3.state.trae_enabled.store(false, Ordering::Relaxed);
+        f3.state.buddy_ai_enabled.store(false, Ordering::Relaxed);
+        match f3.resolve("hy4") {
+            Err(DispatchError::WbDisabled) => {}
+            other => panic!("CN 模型 wb 关闭应报 WbDisabled，实际 {other:?}"),
+        }
     }
 
     // ---------- 策略加载与合法性 ----------

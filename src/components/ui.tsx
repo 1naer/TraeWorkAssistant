@@ -9,7 +9,8 @@ type Tone =
   | 'amber'
   | 'red'
   | 'blue'
-  | 'violet';
+  | 'violet'
+  | 'cyan';
 
 const toneMap: Record<Tone, string> = {
   slate: 'bg-slate-100 text-slate-600 dark:bg-zinc-800 dark:text-zinc-300',
@@ -19,6 +20,7 @@ const toneMap: Record<Tone, string> = {
   red: 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300',
   blue: 'bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300',
   violet: 'bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300',
+  cyan: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-500/15 dark:text-cyan-300',
 };
 
 const accentMap: Record<Tone, string> = {
@@ -29,6 +31,7 @@ const accentMap: Record<Tone, string> = {
   red: 'bg-rose-500',
   blue: 'bg-sky-500',
   violet: 'bg-violet-500',
+  cyan: 'bg-cyan-500',
 };
 
 const valueToneMap: Record<Tone, string> = {
@@ -39,6 +42,7 @@ const valueToneMap: Record<Tone, string> = {
   red: 'text-rose-600 dark:text-rose-400',
   blue: 'text-sky-600 dark:text-sky-400',
   violet: 'text-violet-600 dark:text-violet-400',
+  cyan: 'text-cyan-600 dark:text-cyan-400',
 };
 
 export function Badge({

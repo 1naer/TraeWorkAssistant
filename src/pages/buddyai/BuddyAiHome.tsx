@@ -465,10 +465,17 @@ function BuddyAiCheckinCard({ onChanged }: { onChanged: () => Promise<void> | vo
     }
   };
 
-  // 打卡进度事件（NDJSON 契约对齐 BuddyCheckin：payload 为序列化 JSON 字符串）
+  // 打卡进度事件（NDJSON 契约对齐 BuddyCheckin：payload 为序列化 JSON 字符串）。
+  // 审查 L3：挂载期注册一次——原实现 running 触发的 effect 异步注册，而 startCheckin
+  // 同步发起 invoke，后端先发的事件（start/首个账号）可能早于监听就绪而丢失；
+  // running=false 期间到达的事件（无手动触发）直接丢弃
+  const runningRef = useRef(false);
   useEffect(() => {
-    if (!running) return;
+    runningRef.current = running;
+  }, [running]);
+  useEffect(() => {
     const un = listen<string>('buddy-ai-checkin-progress', (ev) => {
+      if (!runningRef.current) return;
       let parsed: Record<string, unknown>;
       try {
         parsed = JSON.parse(ev.payload);
@@ -491,7 +498,7 @@ function BuddyAiCheckinCard({ onChanged }: { onChanged: () => Promise<void> | vo
     return () => {
       void un.then((f) => f());
     };
-  }, [running]);
+  }, []);
 
   const startCheckin = async () => {
     if (running) return;

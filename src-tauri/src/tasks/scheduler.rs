@@ -521,7 +521,13 @@ fn run_task(
                 .filter(|e| {
                     let m = e.get("message").and_then(Value::as_str).unwrap_or("");
                     e.get("status").and_then(Value::as_str) == Some("fail")
-                        && (m.contains("无凭证") || m.contains("今日已完成"))
+                        && (m.contains("无凭证")
+                            || m.contains("今日已完成")
+                            // 审查修复（M3）：凭证失效类失败（建会话/取沙箱 HTTP 401/403）
+                            // 是永久性——当日 30 分钟冷却重试只会全天重复跑六步链 +
+                            // 每轮触发「打卡失败」首败通知误报，与「无凭证」同口径剔除
+                            || m.contains("HTTP 401")
+                            || m.contains("HTTP 403"))
                 })
                 .count() as i64;
             let retryable = (failed - failed_permanent).max(0);

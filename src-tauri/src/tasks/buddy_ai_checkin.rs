@@ -393,9 +393,52 @@ fn process_account(
     result_ev(acct_id, nickname, "success", &msg)
 }
 
+/// 失败诊断用的响应摘要（审查 H5/H6 修复）：
+/// ① 先脱敏——响应可能携带沙箱凭证（② 步的 token/link 等），原样序列化会经
+///    NDJSON 进度事件广播 + app_log 明文落盘（长期存储泄漏面）；
+/// ② 再截断——serde_json 输出 UTF-8 原文，按字节切片遇非 ASCII（中文错误文案）
+///    不是字符边界会 panic 且 panic 沿 process_account 展开杀掉整轮打卡线程
 fn trim_json(v: &Value) -> String {
-    let s = v.to_string();
-    if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
+    const SENSITIVE_KEYS: [&str; 7] = [
+        "token",
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "refreshToken",
+        "authorization",
+        "link",
+    ];
+    let mut redacted = v.clone();
+    redact_sensitive(redacted.as_object_mut(), &SENSITIVE_KEYS);
+    let s = redacted.to_string();
+    if s.len() <= 200 {
+        return s;
+    }
+    let mut end = 200;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// 递归脱敏：命中敏感键（大小写不敏感）的值置为 "***"
+fn redact_sensitive(obj: Option<&mut serde_json::Map<String, Value>>, keys: &[&str]) {
+    let Some(obj) = obj else { return };
+    for (k, val) in obj.iter_mut() {
+        if keys.iter().any(|s| k.eq_ignore_ascii_case(s)) {
+            *val = Value::String("***".into());
+        } else {
+            match val {
+                Value::Object(_) => redact_sensitive(val.as_object_mut(), keys),
+                Value::Array(a) => {
+                    for x in a.iter_mut() {
+                        redact_sensitive(x.as_object_mut(), keys);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// 打卡整轮：buddy-ai 池全账号串行（NDJSON 管线复用 wb-checkin 契约）。

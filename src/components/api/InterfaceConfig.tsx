@@ -26,6 +26,8 @@ function PoolBadges({ pools }: { pools: string[] }) {
           <Badge key={p} tone="blue">Trae</Badge>
         ) : p === 'buddy' ? (
           <Badge key={p} tone="violet">Buddy</Badge>
+        ) : p === 'buddy-ai' ? (
+          <Badge key={p} tone="cyan">BuddyAi</Badge>
         ) : p === 'qoder' ? (
           <Badge key={p} tone="green">Qoder</Badge>
         ) : (
