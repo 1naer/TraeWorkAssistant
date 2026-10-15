@@ -734,6 +734,10 @@ export const api = {
         wbTagIds?: string[] | null;
         /** Qoder 池标签筛选；null/未传 = 保留原值 */
         qoderTagIds?: string[] | null;
+        /** Buddy 国际版（buddy-ai）独立池开关（阶段 2，显式开启制）；null/未传 = 保留原值 */
+        buddyAiEnabled?: boolean;
+        /** buddy-ai 显式会话粘性开关；null/未传 = 保留原值 */
+        buddyAiStickyEnabled?: boolean;
       },
       wbStrategy?: string,
     ) =>
@@ -769,6 +773,8 @@ export const api = {
         traeTagIds: wbFlags?.traeTagIds ?? null,
         wbTagIds: wbFlags?.wbTagIds ?? null,
         qoderTagIds: wbFlags?.qoderTagIds ?? null,
+        buddyAiEnabled: wbFlags?.buddyAiEnabled ?? null,
+        buddyAiStickyEnabled: wbFlags?.buddyAiStickyEnabled ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),

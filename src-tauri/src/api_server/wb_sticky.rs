@@ -120,7 +120,7 @@ pub fn fingerprint_messages(body: &serde_json::Value) -> String {
 /// key 不以任何已登记命名空间开头。**新增池命名空间时必须在此登记**，
 /// load 过滤与 save 范围删除随之生效（审查 P1：两个 store 整表替换会互删
 /// 对方运行期新增的绑定，范围化后各写各的键集）。
-const NAMESPACES: &[&str] = &["q:", "t:"];
+const NAMESPACES: &[&str] = &["q:", "t:", "g:"];
 
 /// 该 store 是否拥有持久化键 key（load_ns 过滤与 save 范围删除共用同一判定）
 fn owns_key(ns: &str, key: &str) -> bool {

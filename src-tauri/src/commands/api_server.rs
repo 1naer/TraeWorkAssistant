@@ -306,15 +306,24 @@ pub async fn do_start(
         qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_pool_sticky_ttl_secs,
         ),
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.buddy_ai_pool_sticky_ttl_secs,
+        ),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(
+            pool_file.buddy_ai_sticky_enabled,
+        ),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
+        // buddy-ai 显式会话粘性存储（§4.2）："g:" 命名空间与 wb（无前缀）/q:"/t:" 互不串绑
+        buddy_ai_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "g:"),
         // buddy-ai 独立池（§3.4 隔离清单）：开关默认关（dispatch 显式开启制）
         buddy_ai_pool,
         buddy_ai_enabled: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_enabled),
         listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -969,6 +978,9 @@ fn merge_pool_set(
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
+    // buddy-ai（国际版）显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
+    buddy_ai_sticky_enabled: Option<bool>,
+    buddy_ai_pool_sticky_ttl_secs: Option<u64>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -1034,6 +1046,9 @@ fn merge_pool_set(
         qoder_tag_ids: existing.qoder_tag_ids.clone(),
         // buddy-ai 开关同 tag_ids 口径：pool_set 命令在 merge 后追加应用（热应用 AtomicBool）
         buddy_ai_enabled: existing.buddy_ai_enabled,
+        buddy_ai_sticky_enabled: buddy_ai_sticky_enabled.unwrap_or(existing.buddy_ai_sticky_enabled),
+        buddy_ai_pool_sticky_ttl_secs: buddy_ai_pool_sticky_ttl_secs
+            .unwrap_or(existing.buddy_ai_pool_sticky_ttl_secs),
     }
 }
 
@@ -1089,6 +1104,9 @@ pub fn pool_set(
     trae_enabled: Option<bool>,
     // buddy-ai（国际版）池上游开关（默认关，dispatch 显式开启制）；None = 保留原值
     buddy_ai_enabled: Option<bool>,
+    // buddy-ai 显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
+    buddy_ai_sticky_enabled: Option<bool>,
+    buddy_ai_pool_sticky_ttl_secs: Option<u64>,
     // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
     // （与分组筛选取交集，D5 池语义）
     trae_tag_ids: Option<Vec<String>>,
@@ -1132,6 +1150,8 @@ pub fn pool_set(
         qoder_group_ids,
         qoder_strategy,
         trae_enabled,
+        buddy_ai_sticky_enabled,
+        buddy_ai_pool_sticky_ttl_secs,
     );
     // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
     // 显式空数组 = 清空标签筛选，None = 保留
@@ -1209,6 +1229,15 @@ pub fn pool_set(
         );
         rt.shared.qoder_pool_sticky_ttl_secs.store(
             pool_file.qoder_pool_sticky_ttl_secs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // buddy-ai 池粘性 TTL + 显式会话粘性热应用（§4.2）
+        rt.shared.buddy_ai_pool_sticky_ttl_secs.store(
+            pool_file.buddy_ai_pool_sticky_ttl_secs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.buddy_ai_sticky_enabled.store(
+            pool_file.buddy_ai_sticky_enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
         // Buddy 资源开关热应用（此前仅启动时读取，改动需重启服务生效）
@@ -1958,6 +1987,8 @@ mod pool_merge_tests {
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
             buddy_ai_enabled: false,
+            buddy_ai_sticky_enabled: true,
+            buddy_ai_pool_sticky_ttl_secs: 300,
         }
     }
 
@@ -1970,8 +2001,11 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            // buddy-ai 粘性开关 + 池粘性 TTL 未传 → 保留原值
+            None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
+        assert!(m.buddy_ai_sticky_enabled, "未传应保留原值");
         assert_eq!(m.strategy, "weighted");
         assert_eq!(m.wb_strategy, "p2c");
         assert_eq!(m.group_ids, vec!["g1".to_string()]);
@@ -2016,6 +2050,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -2123,6 +2158,9 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            // buddy-ai 粘性开关 + 池粘性 TTL 未传 → 保留原值
+            None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -2211,6 +2249,9 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            // buddy-ai 粘性开关 + 池粘性 TTL 未传 → 保留原值
+            None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -2245,6 +2286,7 @@ mod pool_merge_tests {
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None, None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -2263,6 +2305,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

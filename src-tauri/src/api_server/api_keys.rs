@@ -223,11 +223,12 @@ impl ResolvedKey {
     }
 }
 
-/// 解析 bind_pool 字段为静态池标识（空/非法→None）
+/// 解析 bind_pool 字段为静态池标识（空/非法→None）；buddy-ai（国际版独立池）随阶段 2 放行
 pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
+        "buddy-ai" => Some("buddy-ai"),
         "qoder" => Some("qoder"),
         _ => None,
     }

@@ -785,6 +785,12 @@ pub struct ApiPoolFile {
     /// 用户在 API 服务页显式开启国际档），未部署国际账号时不产生空池噪音
     #[serde(default)]
     pub buddy_ai_enabled: bool,
+    /// buddy-ai 显式会话粘性开关（§4.2 同 qoder_sticky_enabled 口径，默认关）
+    #[serde(default)]
+    pub buddy_ai_sticky_enabled: bool,
+    /// buddy-ai 池粘性 TTL 秒（per-pool 参数，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub buddy_ai_pool_sticky_ttl_secs: u64,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -850,6 +856,8 @@ impl Default for ApiPoolFile {
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
             buddy_ai_enabled: false,
+            buddy_ai_sticky_enabled: false,
+            buddy_ai_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
         }
     }
 }

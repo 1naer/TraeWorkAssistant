@@ -708,6 +708,12 @@ export interface ApiPoolFile {
   group_ids?: string[];
   /** WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池 */
   wb_enabled?: boolean;
+  /** Buddy 国际版（buddy-ai）独立池开关（阶段 2）：开启后 buddy-ai 档参与国际池路由；默认 false（显式开启制） */
+  buddy_ai_enabled?: boolean;
+  /** buddy-ai 显式会话粘性开关（§4.2，独立于国内档粘性）；默认 false */
+  buddy_ai_sticky_enabled?: boolean;
+  /** buddy-ai 池粘性 TTL 秒（per-pool 参数，默认 300） */
+  buddy_ai_pool_sticky_ttl_secs?: number;
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
   /** 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行 */

@@ -267,7 +267,7 @@ fn inject_trae_outbound(
 
 /// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
 fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) -> Response {
-    let rem = wb_route::model_cooling_remaining(state, model).unwrap_or(0);
+    let rem = wb_route::model_cooling_remaining_wb(state, model).unwrap_or(0);
     let msg = format!("model {} cooling down, retry after {}s", model, rem);
     match proto {
         Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
@@ -369,6 +369,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     let pool_ref = match pool {
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
+        TargetPool::BuddyAi => &state.buddy_ai_pool,
         TargetPool::Qoder => &state.qoder_pool,
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
@@ -554,14 +555,8 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "err_count": p.err_count, "state": p.state, "inflight": p.inflight,
         })
     }).collect();
-    // F-77：per-account 并发列表（活跃账号 [{uid, name, inflight}]），
-    // 供前端池状态页实时展示 busy/idle 分布（active_uid 单值的超集）
-    let active_accounts: Vec<Value> = pool
-        .iter()
-        .chain(wb_pool.iter())
-        .filter(|p| p.inflight > 0)
-        .map(|p| json!({ "uid": p.uid, "name": p.name, "inflight": p.inflight }))
-        .collect();
+    // F-77：per-account 并发列表（活跃账号 [{uid, name, inflight}]）——
+    // 见下方 buddy-ai 画像块（三池合并后统一构造）
     let model_cooldowns: Vec<Value> = {
         let map = safe_lock(&state.model_cooldowns);
         map.iter()
@@ -571,6 +566,37 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             }))
             .collect()
     };
+
+    // buddy-ai 独立池画像（阶段 2，§3.1 失败域隔离：与 wb 画面完全独立）
+    let buddy_ai_pool_status = state.buddy_ai_pool.status_list();
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_accounts: Vec<Value> = buddy_ai_pool_status.iter().map(|p| {
+        json!({
+            "uid": p.uid, "name": p.name, "credits": p.credits,
+            "cooling": p.cooling, "cooldown_until": p.cooldown_until,
+            "cooldown_reason": p.cooldown_reason, "disabled": p.disabled,
+            "err_count": p.err_count, "state": p.state, "inflight": p.inflight,
+        })
+    }).collect();
+    let buddy_ai_model_cooldowns: Vec<Value> = {
+        let map = safe_lock(&state.buddy_ai_model_cooldowns);
+        map.iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(m, (until, fails))| json!({
+                "model": m, "until": until, "remaining_s": until - now, "fails": fails,
+            }))
+            .collect()
+    };
+    // buddy-ai 活跃账号并入 busy 画像（同一网关出口，并发可视性对齐三池）
+    let active_accounts: Vec<Value> = pool
+        .iter()
+        .chain(wb_pool.iter())
+        .chain(buddy_ai_pool_status.iter())
+        .filter(|p| p.inflight > 0)
+        .map(|p| json!({ "uid": p.uid, "name": p.name, "inflight": p.inflight }))
+        .collect();
 
     Json(json!({
         "running": true,
@@ -598,6 +624,13 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             // 上游健康探针（F-34 ④/§2.2）：-1 未探测 / 0 不可达 / 1 在线
             "probe_ok": state.wb_probe_ok.load(std::sync::atomic::Ordering::Relaxed),
             "probe_ts_ms": state.wb_probe_ts_ms.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        "buddy_ai": {
+            "enabled": buddy_ai_enabled,
+            "total_accounts": buddy_ai_pool_status.len(),
+            "accounts": buddy_ai_accounts,
+            "model_cooldowns": buddy_ai_model_cooldowns,
+            "sticky_sessions": state.buddy_ai_sticky.len(),
         },
     }))
 }
@@ -754,15 +787,17 @@ pub async fn chat_completions(
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
-            TargetPool::Buddy => {
+            // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
                 let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
+                let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -883,15 +918,29 @@ pub async fn responses_api(
             );
         }
     };
-    if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    // buddy-ai（阶段 2）：wb 档关闭且国际档开启时走国际池（与 /v1/chat 的
+    // priority 语义一致：buddy 优先、buddy-ai 兜底；wb 开时保持现状 CN 路径）
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai = !wb_enabled && buddy_ai_enabled;
+    if !wb_enabled && !buddy_ai_enabled {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "wb_upstream_disabled",
             "WB 上游未启用（api_pool.json wb_enabled）",
         );
     }
-    if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
-        return model_cooling_response(&state, &resolved_model, Protocol::Responses);
+    {
+        let view = if buddy_ai {
+            wb_route::WbView::intl(state.clone())
+        } else {
+            wb_route::WbView::wb(state.clone())
+        };
+        if wb_route::model_cooling_remaining(&view, &resolved_model).is_some() {
+            return model_cooling_response(&state, &resolved_model, Protocol::Responses);
+        }
     }
 
     let mut chat_body = chat_body;
@@ -901,6 +950,7 @@ pub async fn responses_api(
     {
         return wb_route::wb_tool_exec_chat(
             state_clone,
+            buddy_ai,
             chat_body,
             resolved_model,
             stream,
@@ -918,9 +968,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools)
+        wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, encoded_tools).await
+        wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, encoded_tools).await
     }
 }
 
@@ -1093,15 +1143,17 @@ pub async fn messages(
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
-            TargetPool::Buddy => {
+            // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
                 let explicit = peek.get("thinking").map_or(false, |t| !t.is_null());
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
+                let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
@@ -1247,14 +1299,16 @@ pub async fn completions(
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
-            TargetPool::Buddy => {
+            // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考（text completions 无 effort 字段 → 默认思考直接生效）
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
+                let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
@@ -1556,7 +1610,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-        let templates = super::wb_route::load_templates(&state);
+        let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
 
         for _ in 0..MAX_ROTATE {
             // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽。
@@ -2102,7 +2156,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-        let templates = super::wb_route::load_templates(&state);
+        let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
 
         for _ in 0..MAX_ROTATE {
             // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
@@ -3076,6 +3130,7 @@ mod tests {
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -3098,8 +3153,11 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_pool: super::super::pool::ApiPool::new(),
             buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         WlFixture { dir, state }

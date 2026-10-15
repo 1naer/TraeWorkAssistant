@@ -33,12 +33,17 @@ pub fn default_priority() -> Vec<String> {
     vec!["buddy".into(), "trae".into(), "qoder".into()]
 }
 
-/// 资源池标识（对外统一 `trae` / `buddy` / `qoder`；`custom` 仅供展示/日志，
+/// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `buddy-ai`；`custom` 仅供展示/日志，
 /// 不参与策略配置——parse("custom") 返回 None）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetPool {
     Trae,
     Buddy,
+    /// Buddy 国际版（buddy-ai 独立池，阶段 2）：与 `buddy` 档平级的独立档位，
+    /// 模型源判定共用 wb 目录（R-9 两域同一账号体系，同名模型跨区不混轮靠独立池保证）；
+    /// 默认不启用（buddy_ai_enabled，用户在 API 服务页显式开启国际档——避免
+    /// 用户仍在国内账号消耗时模型被静默路由到国际池的歧义）
+    BuddyAi,
     /// 自定义模型（custom_models.json 命中即直达，用户显式配置优先；
     /// 不参与 dispatch_policy 优先级/回退——parse("custom") 返回 None）
     Custom,
@@ -51,6 +56,7 @@ impl TargetPool {
         match self {
             TargetPool::Trae => "trae",
             TargetPool::Buddy => "buddy",
+            TargetPool::BuddyAi => "buddy-ai",
             TargetPool::Custom => "custom",
             TargetPool::Qoder => "qoder",
         }
@@ -60,6 +66,7 @@ impl TargetPool {
         match s.trim().to_lowercase().as_str() {
             "trae" => Some(TargetPool::Trae),
             "buddy" => Some(TargetPool::Buddy),
+            "buddy-ai" => Some(TargetPool::BuddyAi),
             "qoder" => Some(TargetPool::Qoder),
             _ => None,
         }
@@ -282,12 +289,22 @@ impl ModelSources {
     }
 
     /// 可用源计数（感知开关状态）：智能调度重排门槛用
-    fn available_count(&self, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool) -> usize {
+    fn available_count(
+        &self,
+        trae_enabled: bool,
+        wb_enabled: bool,
+        qoder_enabled: bool,
+        buddy_ai_enabled: bool,
+    ) -> usize {
         let mut n = 0;
         if self.trae && trae_enabled {
             n += 1;
         }
         if self.buddy.is_some() && wb_enabled {
+            n += 1;
+        }
+        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）
+        if self.buddy.is_some() && buddy_ai_enabled {
             n += 1;
         }
         if self.qoder.is_some() && qoder_enabled {
@@ -298,10 +315,18 @@ impl ModelSources {
 
     /// 源是否可用（trae/buddy/qoder 各感知自己的池开关；custom 走 resolve_target
     /// 顶部短路，不进入源集合判定——恒 false 仅为匹配穷尽）
-    fn available(&self, pool: TargetPool, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool) -> bool {
+    fn available(
+        &self,
+        pool: TargetPool,
+        trae_enabled: bool,
+        wb_enabled: bool,
+        qoder_enabled: bool,
+        buddy_ai_enabled: bool,
+    ) -> bool {
         match pool {
             TargetPool::Trae => self.trae && trae_enabled,
             TargetPool::Buddy => self.buddy.is_some() && wb_enabled,
+            TargetPool::BuddyAi => self.buddy.is_some() && buddy_ai_enabled,
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
             TargetPool::Custom => false,
         }
@@ -500,14 +525,20 @@ pub fn resolve_target(
     let trae_enabled = state
         .trae_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
+    // buddy-ai 国际档开关（阶段 2）：显式开启制，默认关
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // 仅 Buddy 源模型 + wb_enabled=false → 显式报错（§4.3：保持现有
     // wb_upstream_disabled 语义；"关闭"与"不可用"是两个概念）。
     // 三源扩展（p3-3 审查修复）：Qoder 源可用时 Buddy 关闭不构成"无源可用"，
-    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）
+    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）；
+    // 阶段 2：buddy-ai 国际档开启时同源可服务，同样不早退
     if sources.buddy.is_some()
         && !sources.trae
         && !wb_enabled
+        && !buddy_ai_enabled
         && !(sources.qoder.is_some() && qoder_enabled)
     {
         return Err(DispatchError::WbDisabled);
@@ -552,7 +583,7 @@ pub fn resolve_target(
         };
         if let Some(pool) = sticky_pool {
             if bind.map_or(true, |b| pool.as_str() == b)
-                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled)
+                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled)
                 && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref())
             {
                 record_sticky(state, sk, pool);
@@ -574,13 +605,16 @@ pub fn resolve_target(
         // issue #90 修复③a：单池候选（不追加其他池，无跨池回退）
         vec![p]
     } else if let Some(b) = bind {
-        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"qoder"，无需再 parse
+        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"buddy-ai"/"qoder"，无需再 parse
         if b == "trae" {
             vec![TargetPool::Trae, TargetPool::Buddy]
         } else if b == "qoder" {
             // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
             // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
             vec![TargetPool::Qoder, TargetPool::Buddy, TargetPool::Trae]
+        } else if b == "buddy-ai" {
+            // buddy-ai 绑定：国际档优先，国内 Buddy 兜底（同源回退不跨账号体系）
+            vec![TargetPool::BuddyAi, TargetPool::Buddy, TargetPool::Trae]
         } else {
             vec![TargetPool::Buddy, TargetPool::Trae]
         }
@@ -597,7 +631,7 @@ pub fn resolve_target(
     // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
     // （issue #90 修复③a：前缀锁定 = 单池候选，不追加）
     if forced_pool.is_none() {
-        for p in [TargetPool::Buddy, TargetPool::Trae, TargetPool::Qoder] {
+        for p in [TargetPool::Buddy, TargetPool::BuddyAi, TargetPool::Trae, TargetPool::Qoder] {
             if !order.contains(&p) {
                 order.push(p);
             }
@@ -609,7 +643,7 @@ pub fn resolve_target(
     if forced_pool.is_none() && bind.is_none()
         && policy.strategy == DispatchStrategy::Smart
         && policy.per_model.get(&canonical).is_none()
-        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled) >= 2
+        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
     {
         order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
     }
@@ -617,11 +651,11 @@ pub fn resolve_target(
     let preferred = order
         .iter()
         .copied()
-        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
+        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled));
 
     let mut fallback_from: Option<(TargetPool, FallbackReason)> = None;
     for (i, pool) in order.iter().copied().enumerate() {
-        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled) {
+        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) {
             continue;
         }
         match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
@@ -659,12 +693,20 @@ pub fn resolve_target(
                 // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）
                 let has_next = order[i + 1..]
                     .iter()
-                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
+                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled));
                 let can_fallback = policy.fallback && sources.is_dual() && has_next;
                 if !can_fallback {
                     return Err(match (pool, reason) {
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
-                            let secs = super::wb_route::model_cooling_remaining(state, &final_buddy_model(&sources))
+                            let view = super::wb_route::WbView::wb(state.clone());
+                            let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
+                                .unwrap_or(0);
+                            DispatchError::ModelCooling(secs)
+                        }
+                        // buddy-ai 模型级冷却同构映射（独立冷却表：同名模型跨区不混轮）
+                        (TargetPool::BuddyAi, FallbackReason::ModelCooldown) => {
+                            let view = super::wb_route::WbView::intl(state.clone());
+                            let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
                                 .unwrap_or(0);
                             DispatchError::ModelCooling(secs)
                         }
@@ -734,6 +776,7 @@ fn smart_pool_order(
 ) -> Vec<TargetPool> {
     let trae_stats = state.pool.stats();
     let wb_stats = state.wb_pool.stats();
+    let buddy_ai_stats = state.buddy_ai_pool.stats();
     let qoder_stats = state.qoder_pool.stats();
     // 倍率数据源：Buddy = wb 目录原始值（0 = 免费）；Trae = 官网同步声明值（None = 未声明）；
     // Qoder = 目录 credits 文本解析（"x0.1 credits" → 0.1）。
@@ -764,6 +807,8 @@ fn smart_pool_order(
         let ((earliest, total), rate) = match p {
             TargetPool::Trae => (trae_stats, trae_rate),
             TargetPool::Buddy => (wb_stats, buddy_rate),
+            // buddy-ai：同目录倍率（R-9 同账号体系定价同构），积分快照取国际池
+            TargetPool::BuddyAi => (buddy_ai_stats, buddy_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
             TargetPool::Custom => ((None, 0.0), None),
         };
@@ -795,10 +840,23 @@ fn pool_health(
     match pool {
         TargetPool::Buddy => {
             let model = final_buddy_model(sources);
-            if super::wb_route::model_cooling_remaining(state, &model).is_some() {
+            let view = super::wb_route::WbView::wb(state.clone());
+            if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
             }
             if !state.wb_pool.has_selectable_in(allowed) {
+                return Err(FallbackReason::NoHealthyAccount);
+            }
+            Ok(())
+        }
+        TargetPool::BuddyAi => {
+            // 与 Buddy 同构：独立模型冷却表 + 独立池账号健康预检（§3.1 失败域隔离）
+            let model = final_buddy_model(sources);
+            let view = super::wb_route::WbView::intl(state.clone());
+            if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
+                return Err(FallbackReason::ModelCooldown);
+            }
+            if !state.buddy_ai_pool.has_selectable_in(allowed) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -850,7 +908,7 @@ fn final_buddy_model(sources: &ModelSources) -> String {
 
 fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str) -> String {
     match pool {
-        TargetPool::Buddy => final_buddy_model(sources),
+        TargetPool::Buddy | TargetPool::BuddyAi => final_buddy_model(sources),
         // Trae：后缀剥离后的基名（issue #31 T3.1；无后缀/透传语义 = 原名）
         TargetPool::Trae => sources.trae_final.0.clone(),
         // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）
@@ -861,7 +919,7 @@ fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str
 
 fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
     match pool {
-        TargetPool::Buddy => sources.buddy.as_ref().and_then(|(_, h)| h.clone()),
+        TargetPool::Buddy | TargetPool::BuddyAi => sources.buddy.as_ref().and_then(|(_, h)| h.clone()),
         // Trae：路由级 effort 提示同样随池携带（routes 层统一档位 → wire 转换下发）
         TargetPool::Trae => sources.trae_final.1.clone(),
         // Qoder：v1 无路由级 effort 通道（思考档位由执行路径按目录条目解析）
@@ -875,7 +933,7 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
 fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
     match pool {
         TargetPool::Trae => sources.trae_final.2,
-        TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder => false,
+        TargetPool::Buddy | TargetPool::BuddyAi | TargetPool::Custom | TargetPool::Qoder => false,
     }
 }
 
@@ -908,6 +966,7 @@ fn pool_sticky_ttl_secs(state: &ApiSharedState, pool: TargetPool) -> u64 {
     let cell = match pool {
         TargetPool::Trae | TargetPool::Custom => &state.trae_pool_sticky_ttl_secs,
         TargetPool::Buddy => &state.wb_pool_sticky_ttl_secs,
+        TargetPool::BuddyAi => &state.buddy_ai_pool_sticky_ttl_secs,
         TargetPool::Qoder => &state.qoder_pool_sticky_ttl_secs,
     };
     cell.load(std::sync::atomic::Ordering::Relaxed)
@@ -1002,6 +1061,7 @@ mod tests {
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
+            buddy_ai_model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -1026,8 +1086,11 @@ mod tests {
             qoder_sticky_enabled: AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_pool: super::super::pool::ApiPool::new(),
             buddy_ai_enabled: AtomicBool::new(false),
+            buddy_ai_sticky_enabled: AtomicBool::new(false),
+            buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         Fixture { dir, state }
@@ -1373,7 +1436,10 @@ mod tests {
     fn t13_buddy_only_model_cooldown_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
         f.seed_healthy(false);
-        super::super::wb_route::note_model_failure(&f.state, "hy4");
+        super::super::wb_route::note_model_failure(
+            &super::super::wb_route::WbView::wb(f.state.clone()),
+            "hy4",
+        );
         assert!(matches!(
             f.resolve("hy4").unwrap_err(),
             DispatchError::ModelCooling(_)
@@ -1386,7 +1452,10 @@ mod tests {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
         f.seed_healthy(true);
         f.seed_healthy(false);
-        super::super::wb_route::note_model_failure(&f.state, "glm-5.3");
+        super::super::wb_route::note_model_failure(
+            &super::super::wb_route::WbView::wb(f.state.clone()),
+            "glm-5.3",
+        );
         let r = f.resolve("glm-5.3").unwrap();
         assert_eq!(r.pool, TargetPool::Trae);
         assert!(f.app_log_contains("reason=model_cooldown"));

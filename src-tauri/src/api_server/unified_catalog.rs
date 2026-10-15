@@ -407,6 +407,9 @@ pub fn unified_models_ex(
     let enabled_of = |pool: TargetPool| match pool {
         TargetPool::Trae => trae_ok,
         TargetPool::Buddy => wb_enabled && buddy_ok,
+        // buddy-ai（阶段 2）：目录聚合暂随 wb 源形态（同目录）；开关读取在调用方
+        // pool 开关层，此处仅做匹配穷尽（徽章语义阶段 3 前端分区时对齐）
+        TargetPool::BuddyAi => wb_enabled && buddy_ok,
         // 自定义模型可用性 = 条目 enabled（find_enabled 只回 enabled 条目）
         TargetPool::Custom => true,
         // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）

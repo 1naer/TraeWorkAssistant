@@ -126,6 +126,9 @@ export default function BuddyApiService() {
     wbToolExec: false,
     wbBgDowngrade: false,
     wbLongctxDowngrade: false,
+    // buddy-ai（国际版独立池，阶段 2）：显式开启制，默认关
+    buddyAiEnabled: false,
+    buddyAiStickyEnabled: false,
   });
   const [wbParams, setWbParams] = useState({ ...WB_PARAM_DEFAULTS });
   // Buddy 池入池白名单（wb-<hash> 账号 id = a.id，与网关池键/PoolStatus.uid 同域；
@@ -192,6 +195,8 @@ export default function BuddyApiService() {
           wbToolExec: pf.wb_tool_exec ?? false,
           wbBgDowngrade: pf.wb_bg_downgrade ?? false,
           wbLongctxDowngrade: pf.wb_longctx_downgrade ?? false,
+          buddyAiEnabled: pf.buddy_ai_enabled ?? false,
+          buddyAiStickyEnabled: pf.buddy_ai_sticky_enabled ?? false,
         });
         setWbParams({
           wbHedgeThresholdMs: pf.wb_hedge_threshold_ms ?? WB_PARAM_DEFAULTS.wbHedgeThresholdMs,
@@ -622,6 +627,48 @@ export default function BuddyApiService() {
                     </span>
                   </label>
                 ))}
+
+                {/* 国际版（buddy-ai）独立池开关（阶段 2）：显式开启制，独立失败域/粘性/记账 */}
+                <div className="mt-3 border-t border-slate-100 pt-3 dark:border-zinc-800">
+                  <div className="mb-1.5 flex items-center gap-1.5">
+                    <span className="text-xs font-medium text-slate-600 dark:text-zinc-300">国际版（buddy-ai）</span>
+                    {wbFlags.buddyAiEnabled ? (
+                      <Badge tone="green">国际档已开启</Badge>
+                    ) : (
+                      <Badge tone="amber">默认关闭</Badge>
+                    )}
+                  </div>
+                  {(
+                    [
+                      {
+                        key: 'buddyAiEnabled' as const,
+                        label: '启用 buddy-ai 国际档',
+                        desc: '开启后「buddy-ai」档参与调度（与国内 Buddy 档平级、独立账号池/粘性/记账）；需先在 BuddyAI 页登录国际账号',
+                      },
+                      {
+                        key: 'buddyAiStickyEnabled' as const,
+                        label: 'buddy-ai 会话粘性',
+                        desc: '显式 conversationId 在国际池内绑定账号（TTL 同国内档口径）；默认关',
+                      },
+                    ] as const
+                  ).map((item) => (
+                    <label
+                      key={item.key}
+                      className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50"
+                    >
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                        checked={wbFlags[item.key]}
+                        onChange={() => setWbFlags((prev) => ({ ...prev, [item.key]: !prev[item.key] }))}
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">{item.desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
               </div>
 
               {/* 调度参数（F-76②/③/F-77：数值热参数，保存即热生效） */}
