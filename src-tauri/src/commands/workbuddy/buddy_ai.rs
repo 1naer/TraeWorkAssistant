@@ -28,16 +28,6 @@ pub(super) fn load_buddy_pool(state: &AppState) -> WbPool {
     serde_json::from_value(v).unwrap_or_default()
 }
 
-/// 跨 crate 模块（tasks/buddy_ai_checkin）访问的公开包装（读-改-写调用方自带池锁）
-pub(crate) fn load_buddy_pool_pub(state: &AppState) -> WbPool {
-    load_buddy_pool(state)
-}
-
-/// 跨 crate 模块访问的公开包装
-pub(crate) fn save_buddy_pool_pub(state: &AppState, pool: &WbPool) -> Result<(), String> {
-    save_buddy_pool(state, pool)
-}
-
 /// buddy-ai 池账号花名册（跨模块 tasks/buddy_ai_checkin 消费；WbPool 字段
 /// pub(super) 不对 tasks 暴露，经此 helper 交出 (id, 展示名, uid) 三元组）
 pub(crate) fn buddy_pool_roster(state: &AppState) -> Vec<(String, String, String)> {
