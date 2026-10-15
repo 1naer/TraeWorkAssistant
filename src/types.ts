@@ -27,8 +27,13 @@ export type ViewKey =
   | 'qoder-credits'
   | 'qoder-api-service'
   | 'qoder-settings'
-  // BuddyAI 应用页面（buddy-ai 国际版，独立池；应用显示默认不展示）
-  | 'buddyai-home';
+  // BuddyAI 应用页面（buddy-ai 国际版独立池；六页子导航对齐国内 Buddy，应用显示默认不展示）
+  | 'buddyai-overview'
+  | 'buddyai-accounts'
+  | 'buddyai-checkin'
+  | 'buddyai-credits'
+  | 'buddyai-api-service'
+  | 'buddyai-settings';
 
 /** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 / BuddyAI（buddy-ai 国际版） */
 export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao' | 'buddy-ai';
@@ -39,7 +44,7 @@ export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   buddy: 'buddy-overview',
   qoder: 'qoder-overview',
   doubao: 'doubao-overview',
-  'buddy-ai': 'buddyai-home',
+  'buddy-ai': 'buddyai-overview',
 };
 
 

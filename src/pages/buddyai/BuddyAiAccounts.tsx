@@ -6,35 +6,32 @@ import {
   KeyRound,
   Trash2,
   Loader2,
-  Coins,
-  Info,
   RotateCcw,
 } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
+import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { BuddyAiAccountView, WbModelInfo, WbOauthDone, WbOauthProgress } from '../../types';
+import type { BuddyAiAccountView, WbOauthDone, WbOauthProgress } from '../../types';
 
 /**
- * BuddyAI（buddy-ai 国际版）账号管理页（阶段 3 分区 UI 收尾）。
+ * BuddyAI（buddy-ai 国际版）账号管理页（六页子导航对齐国内 Buddy）。
  *
- * 《Buddy国际版支持落地方案.md》§3.4 隔离清单：本页所有命令走 buddy_ai_* 独立池
- * （buddy_ai_accounts / buddy_ai_tokens 表 + buddy-ai vault 命名空间），
- * 与国内 Buddy 账号页零数据共享；OAuth 事件前缀 buddy-ai-oauth-*（不与 wb-oauth 混流）。
+ * §3.4 隔离清单：本页所有命令走 buddy_ai_* 独立池（buddy_ai_accounts /
+ * buddy_ai_tokens 表 + buddy-ai vault 命名空间），与国内 Buddy 账号页零数据共享；
+ * OAuth 事件前缀 buddy-ai-oauth-*（不与 wb-oauth 混流）。
  *
- * 页面能力（阶段 3a）：账号列表 / OAuth 扫码登录 / 手工导入凭证（区域必选校验）/
- * 凭证续期 / 移除（确认弹框）/ 静态模型目录（§4.4 首版配置）。
- * 每日活跃打卡（ACP 六步链，阶段 3b）与积分同步 Intl 化随后续阶段接入。
+ * 页面能力：账号列表 / OAuth 扫码登录 / 手工导入凭证（区域必选校验）/
+ * 凭证续期 / 移除（确认弹框）。
  */
 
 type ConfirmTarget = { kind: 'remove-account'; account: BuddyAiAccountView } | null;
 
-export default function BuddyAiHome() {
+export default function BuddyAiAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [accounts, setAccounts] = useState<BuddyAiAccountView[] | null>(null);
-  const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [rowOp, setRowOp] = useState<string | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget>(null);
@@ -55,12 +52,7 @@ export default function BuddyAiHome() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [accs, cat] = await Promise.all([
-        api.buddyai.accountsList(),
-        api.apiServer.buddyAiCatalogList().catch(() => [] as WbModelInfo[]),
-      ]);
-      setAccounts(accs);
-      setCatalog(cat);
+      setAccounts(await api.buddyai.accountsList());
     } catch (err) {
       pushToast('error', `账号列表读取失败：${String(err).slice(0, 120)}`);
     } finally {
@@ -186,32 +178,24 @@ export default function BuddyAiHome() {
     ts ? new Date(ts * 1000).toLocaleString() : '-';
 
   return (
-    <div className="mx-auto max-w-5xl pt-6">
-      <BuddyAiCheckinCard onChanged={refresh} />
-
-      {/* 页头：标题 + 操作（登录 / 导入 / 刷新） */}
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white shadow">
-            <Globe size={20} />
-          </div>
-          <div>
-            <h1 className="text-lg font-semibold">BuddyAI（国际版）账号</h1>
-            <p className="text-xs text-slate-400">buddy-ai 独立池 · workbuddy.ai · 与国内 Buddy 池完全隔离</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button className="btn-secondary inline-flex items-center gap-1.5" onClick={startOauth} disabled={oauthBusy}>
-            <LogIn size={14} /> 扫码登录
-          </button>
-          <button className="btn-secondary inline-flex items-center gap-1.5" onClick={openImport}>
-            <KeyRound size={14} /> 导入凭证
-          </button>
-          <button className="btn-secondary inline-flex items-center gap-1.5" onClick={() => void refresh()} disabled={loading}>
-            {loading ? <Spinner /> : <RefreshCw size={14} />} 刷新
-          </button>
-        </div>
-      </div>
+    <div className="animate-fade-in">
+      <PageHeader
+        title="BuddyAI · 账号管理"
+        desc="buddy-ai 独立池 · workbuddy.ai · 与国内 Buddy 池完全隔离"
+        actions={
+          <>
+            <button className="btn-secondary inline-flex items-center gap-1.5" onClick={() => void startOauth()} disabled={oauthBusy}>
+              <LogIn size={14} /> 扫码登录
+            </button>
+            <button className="btn-secondary inline-flex items-center gap-1.5" onClick={openImport}>
+              <KeyRound size={14} /> 导入凭证
+            </button>
+            <button className="btn-outline inline-flex items-center gap-1.5" onClick={() => void refresh()} disabled={loading}>
+              {loading ? <Spinner /> : <RefreshCw size={14} />} 刷新
+            </button>
+          </>
+        }
+      />
 
       {/* 账号列表 */}
       <div className="card overflow-x-auto p-4">
@@ -283,39 +267,6 @@ export default function BuddyAiHome() {
             </tbody>
           </table>
         )}
-      </div>
-
-      {/* 模型目录（§4.4 首版静态配置） */}
-      <div className="card mt-4 p-4">
-        <div className="mb-2 flex items-center gap-2">
-          <Coins size={15} className="text-brand-500" />
-          <span className="text-sm font-medium">国际档模型目录</span>
-          <span className="text-xs text-slate-400">静态配置（§4.4）· 倍率占位 1.0 待官网核对回填</span>
-        </div>
-        {catalog.length === 0 ? (
-          <p className="py-2 text-xs text-slate-400">目录未加载</p>
-        ) : (
-          <div className="flex flex-wrap gap-1.5">
-            {catalog.map((m) => (
-              <span
-                key={m.id}
-                className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-[11px] dark:border-zinc-700"
-                title={`倍率 ${m.rate.toFixed(2)}x（占位）`}
-              >
-                {m.id}
-                <span className="text-slate-400">{m.rate.toFixed(2)}x</span>
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="card mt-4 p-4 text-xs text-slate-500 dark:text-zinc-400">
-        <div className="mb-1 flex items-center gap-1.5">
-          <Info size={13} /> 阶段说明
-        </div>
-        每日活跃打卡（官方 30/50 积分，ACP 六步链）与积分同步 Intl 化将在后续阶段接入本页；
-        本应用入口默认隐藏，可在 <b>系统设置 → 应用显示</b> 中勾选「BuddyAI」开启。
       </div>
 
       {/* OAuth 进度弹框 */}
@@ -416,180 +367,6 @@ export default function BuddyAiHome() {
           </div>
         ) : null}
       </Modal>
-    </div>
-  );
-}
-
-/**
- * 每日活跃打卡卡（阶段 3b）：开关/时刻/间隔配置 + 手动触发 + NDJSON 进度 + 积分同步。
- * 打卡机制见 tasks/buddy_ai_checkin.rs 模块注释（网页会话 + 沙箱 ACP，无 claim 端点）。
- */
-function BuddyAiCheckinCard({ onChanged }: { onChanged: () => Promise<void> | void }) {
-  const pushToast = useAppStore((s) => s.pushToast);
-  const settings = useAppStore((s) => s.settings);
-  const [enabled, setEnabled] = useState(false);
-  const [hhmm, setHhmm] = useState('09:20');
-  const [gap, setGap] = useState(3);
-  const [saving, setSaving] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [lines, setLines] = useState<string[]>([]);
-  const [syncing, setSyncing] = useState(false);
-
-  // 设置回填（settings store 加载后一次性同步本地表单）
-  useEffect(() => {
-    if (settings) {
-      setEnabled(settings.buddy_ai_checkin_enabled === true);
-      setHhmm(settings.buddy_ai_checkin_hhmm?.trim() || '09:20');
-      setGap(typeof settings.buddy_ai_checkin_gap_secs === 'number' ? settings.buddy_ai_checkin_gap_secs : 3);
-    }
-  }, [settings]);
-
-  const saveConfig = async (patch: { enabled?: boolean } = {}) => {
-    setSaving(true);
-    try {
-      await withMinDelay(
-        api.misc.settingsSet({
-          buddy_ai_checkin_enabled: patch.enabled ?? enabled,
-          buddy_ai_checkin_hhmm: hhmm.trim() || '09:20',
-          buddy_ai_checkin_gap_secs: gap,
-        }),
-        400,
-      );
-      pushToast('success', patch.enabled !== undefined
-        ? (patch.enabled ? '已开启每日活跃打卡（按调度时刻自动执行）' : '已关闭每日活跃打卡')
-        : '打卡配置已保存');
-    } catch (err) {
-      pushToast('error', `保存失败：${String(err).slice(0, 120)}`);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  // 打卡进度事件（NDJSON 契约对齐 BuddyCheckin：payload 为序列化 JSON 字符串）。
-  // 审查 L3：挂载期注册一次——原实现 running 触发的 effect 异步注册，而 startCheckin
-  // 同步发起 invoke，后端先发的事件（start/首个账号）可能早于监听就绪而丢失；
-  // running=false 期间到达的事件（无手动触发）直接丢弃
-  const runningRef = useRef(false);
-  useEffect(() => {
-    runningRef.current = running;
-  }, [running]);
-  useEffect(() => {
-    const un = listen<string>('buddy-ai-checkin-progress', (ev) => {
-      if (!runningRef.current) return;
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(ev.payload);
-      } catch {
-        return;
-      }
-      if (parsed.type === 'start') {
-        setLines([`开始打卡（共 ${parsed.total} 个账号）…`]);
-      } else if (parsed.type === 'done') {
-        setLines((prev) => [
-          ...prev,
-          `整轮完成：成功 ${parsed.ok} / 已完成 ${parsed.already} / 失败 ${parsed.failed}`,
-        ]);
-      } else if (parsed.index) {
-        setLines((prev) => [...prev, `#${parsed.index} ${parsed.name ?? ''}：${parsed.status ?? ''} — ${parsed.message ?? ''}`]);
-      } else if (parsed.type === 'exit') {
-        setRunning(false);
-      }
-    });
-    return () => {
-      void un.then((f) => f());
-    };
-  }, []);
-
-  const startCheckin = async () => {
-    if (running) return;
-    setRunning(true);
-    setLines([]);
-    try {
-      await api.buddyai.checkinStart();
-    } catch (err) {
-      setRunning(false);
-      pushToast('error', `发起打卡失败：${String(err).slice(0, 120)}`);
-    }
-  };
-
-  const syncCredits = async () => {
-    setSyncing(true);
-    try {
-      const n = await withMinDelay(api.buddyai.creditsFetch(), 800);
-      pushToast('success', `积分已同步（${n.filter((a) => a.credits_balance != null).length} 个账号取数成功）`);
-      await onChanged();
-    } catch (err) {
-      pushToast('error', `积分同步失败：${String(err).slice(0, 120)}`);
-    } finally {
-      setSyncing(false);
-    }
-  };
-
-  return (
-    <div className="card mt-4 p-4">
-      <div className="mb-2 flex items-center gap-2">
-        <Coins size={15} className="text-brand-500" />
-        <span className="text-sm font-medium">每日活跃打卡</span>
-        {enabled ? <Badge tone="green">已开启</Badge> : <Badge tone="amber">未开启</Badge>}
-        <span className="text-xs text-slate-400">网页会话 + 沙箱跑一轮对话，服务端自动入账 30/50 积分</span>
-      </div>
-      <div className="flex flex-wrap items-center gap-3">
-        <label className="flex cursor-pointer items-center gap-1.5 text-xs">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => {
-              setEnabled(e.target.checked);
-              void saveConfig({ enabled: e.target.checked });
-            }}
-          />
-          每日自动打卡
-        </label>
-        <label className="flex items-center gap-1.5 text-xs text-slate-500">
-          时刻
-          <input
-            className="w-20 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
-            value={hhmm}
-            onChange={(e) => setHhmm(e.target.value)}
-            onBlur={() => void saveConfig()}
-          />
-        </label>
-        <label className="flex items-center gap-1.5 text-xs text-slate-500">
-          账号间隔
-          <input
-            type="number"
-            min={0}
-            max={600}
-            className="w-16 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
-            value={gap}
-            onChange={(e) => setGap(Number(e.target.value))}
-            onBlur={() => void saveConfig()}
-          />
-          秒
-        </label>
-        <button
-          className="btn-primary inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
-          disabled={running}
-          onClick={() => void startCheckin()}
-        >
-          {running ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
-          {running ? '打卡中…' : '立即打卡'}
-        </button>
-        <button
-          className="btn-secondary inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
-          disabled={syncing}
-          onClick={() => void syncCredits()}
-        >
-          {syncing ? <Loader2 size={13} className="animate-spin" /> : <Coins size={13} />} 同步积分
-        </button>
-      </div>
-      {lines.length > 0 ? (
-        <div className="mt-2 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-slate-50 px-3 py-2 font-mono text-[11px] leading-4 text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
-          {lines.map((l, i) => (
-            <div key={i}>{l}</div>
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 }

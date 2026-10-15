@@ -429,6 +429,115 @@ function QoderTopBar() {
   );
 }
 
+/**
+ * BuddyAI 专区顶栏（buddy-ai 国际版，六页子导航对齐 Buddy 产品形态）：
+ * 左列 WorkBuddy AI / CodeBuddy 国际客户端安装徽标 + 证书/代理/API 网关状态，
+ * 右列 打开WorkBuddy AI / 打开CodeBuddy / 启动代理 / 启动API网关。
+ * 与 Buddy 顶栏同构：国际版客户端与国内为同一桌面程序（同 exe 不同登录域），
+ * 探测/打开命令复用 env 命令；上下文不串（徽标文案标注 AI / 国际客户端）。
+ */
+function BuddyAiTopBar() {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const certInstalled = useAppStore((s) => s.certInstalled);
+  const proxy = useAppStore((s) => s.proxy);
+  const apiStatus = useAppStore((s) => s.apiStatus);
+  const startProxy = useAppStore((s) => s.startProxy);
+  const stopProxy = useAppStore((s) => s.stopProxy);
+  const [wbEnv, setWbEnv] = useState<WorkBuddyEnvCheck | null>(null);
+  const [cbLocate, setCbLocate] = useState<AppLocate | null>(null);
+  const [launching, setLaunching] = useState<'wb' | 'cb' | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.workbuddy
+      .envCheck()
+      .then((e) => alive && setWbEnv(e))
+      .catch(() => {});
+    api.env
+      .locate('codebuddy')
+      .then((r) => alive && setCbLocate(r))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const launchApp = async (which: 'wb' | 'cb') => {
+    if (launching) return;
+    const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy 国际客户端';
+    setLaunching(which);
+    try {
+      if (which === 'wb') await api.env.openWorkbuddyApp();
+      else await api.env.openCodebuddyApp();
+      pushToast('success', `已启动 ${label}`);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('未检测到')) pushToast('warn', msg);
+      else pushToast('error', `打开 ${label} 失败：${msg}`);
+    } finally {
+      setLaunching(null);
+    }
+  };
+
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        {wbEnv?.installed ? (
+          <Badge tone="green" title={wbEnv.version ? `WorkBuddy AI 当前版本：v${wbEnv.version}（国际版登录 workbuddy.ai）` : 'WorkBuddy AI 客户端'}>
+            <MonitorCheck size={13} /> WorkBuddy AI已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> WorkBuddy AI未检测到
+          </Badge>
+        )}
+        {cbLocate?.exe ? (
+          <Badge tone="green" title={cbLocate.version ? `CodeBuddy 国际客户端当前版本：v${cbLocate.version}` : 'CodeBuddy 国际客户端'}>
+            <MonitorCheck size={13} /> CodeBuddy国际客户端已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> CodeBuddy国际客户端未检测到
+          </Badge>
+        )}
+        {certInstalled ? (
+          <Badge tone="green">
+            <ShieldCheck size={13} /> 证书已信任
+          </Badge>
+        ) : (
+          <Badge tone="amber">
+            <ShieldAlert size={13} /> 证书未信任
+          </Badge>
+        )}
+        <Badge tone={proxy.running ? 'blue' : 'slate'}>
+          <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
+        </Badge>
+        <Badge tone={apiStatus?.running ? 'green' : 'slate'}>
+          <Server size={13} /> {apiStatus?.running ? `API网关运行中 :${apiStatus.port}` : 'API网关未启动'}
+        </Badge>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={() => void launchApp('wb')} className="btn-outline" disabled={launching != null}>
+          {launching === 'wb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开WorkBuddy AI
+        </button>
+        <button onClick={() => void launchApp('cb')} className="btn-outline" disabled={launching != null}>
+          {launching === 'cb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开CodeBuddy
+        </button>
+        {proxy.running ? (
+          <button onClick={stopProxy} className="btn-outline">
+            <PowerOff size={15} /> 停止代理
+          </button>
+        ) : (
+          <button onClick={startProxy} className="btn-outline">
+            <Power size={15} /> 启动代理
+          </button>
+        )}
+        <GatewayButton />
+      </div>
+    </>
+  );
+}
+
 export default function TopBar() {
   const activeApp = useAppStore((s) => s.activeApp);
   return (
@@ -439,6 +548,8 @@ export default function TopBar() {
         <BuddyTopBar />
       ) : activeApp === 'qoder' ? (
         <QoderTopBar />
+      ) : activeApp === 'buddy-ai' ? (
+        <BuddyAiTopBar />
       ) : (
         <TraeTopBar />
       )}

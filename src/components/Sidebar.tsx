@@ -62,9 +62,14 @@ const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'qoder-settings', label: '环境配置', icon: Settings },
 ];
 
-/** BuddyAI 应用菜单（buddy-ai 国际版独立池，阶段 1 骨架；后续阶段扩展子页） */
+/** BuddyAI 应用菜单（buddy-ai 国际版独立池；六页子导航对齐国内 Buddy 产品形态） */
 const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
-  { key: 'buddyai-home', label: '概述', icon: LayoutDashboard },
+  { key: 'buddyai-overview', label: '概述', icon: LayoutDashboard },
+  { key: 'buddyai-accounts', label: '账号管理', icon: Users },
+  { key: 'buddyai-checkin', label: '一键签到', icon: PlayCircle },
+  { key: 'buddyai-credits', label: '积分看板', icon: Coins },
+  { key: 'buddyai-api-service', label: '资源调度', icon: Server },
+  { key: 'buddyai-settings', label: '环境配置', icon: Settings },
 ];
 
 /** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；qoder = F-80 接入；doubao = 接入中；
@@ -122,7 +127,7 @@ export default function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeApp, pinnedApp, settings?.hidden_apps]);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）；BuddyAI → 概述
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）；BuddyAI → 6 页（国际版对齐 Buddy 产品形态）
   const nav =
     activeApp === 'doubao'
       ? DOUBAO_NAV
