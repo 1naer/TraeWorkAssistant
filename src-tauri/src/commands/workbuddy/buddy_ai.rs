@@ -93,8 +93,9 @@ pub(super) fn save_buddy_pool(state: &AppState, pool: &WbPool) -> Result<(), Str
 
 /// P8：当日积分快照落库（同日覆盖 + 365 天裁剪；积分看板趋势曲线数据源）。
 /// 不持锁——调用点均在 buddy_ai_pool_lock 临界区内（write_credits /
-/// credits_fetch 回写段），池读为最新态；落库失败仅日志，不阻塞主流程
-pub(crate) fn buddy_ai_credits_snapshot_save(state: &AppState, pool: &WbPool) {
+/// credits_fetch 回写段），池读为最新态；落库失败仅日志，不阻塞主流程。
+/// 私有可见性：仅本文件两个回写点消费，避免 pub(crate) 暴露 pub(super) 的 WbPool
+fn buddy_ai_credits_snapshot_save(state: &AppState, pool: &WbPool) {
     let db = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let accounts: Vec<Value> = pool
