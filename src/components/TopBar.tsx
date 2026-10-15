@@ -431,10 +431,11 @@ function QoderTopBar() {
 
 /**
  * BuddyAI 专区顶栏（buddy-ai 国际版，六页子导航对齐 Buddy 产品形态）：
- * 左列 WorkBuddy AI / CodeBuddy 国际客户端安装徽标 + 证书/代理/API 网关状态，
- * 右列 打开WorkBuddy AI / 打开CodeBuddy / 启动代理 / 启动API网关。
- * 与 Buddy 顶栏同构：国际版客户端与国内为同一桌面程序（同 exe 不同登录域），
- * 探测/打开命令复用 env 命令；上下文不串（徽标文案标注 AI / 国际客户端）。
+ * 左列 WorkBuddy AI / CodeBuddy AI 国际客户端安装徽标 + 证书/代理/API 网关状态，
+ * 右列 打开WorkBuddy AI / 打开CodeBuddy AI / 启动代理 / 启动API网关。
+ * P1 审查修复：国际客户端与国内为不同安装目录（Programs\WorkBuddyAI 与
+ * Programs\WorkBuddy），探测/打开走 workbuddy_ai / codebuddy_ai 独立档案，
+ * 不再复用国内命令误开国内客户端。
  */
 function BuddyAiTopBar() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -443,18 +444,18 @@ function BuddyAiTopBar() {
   const apiStatus = useAppStore((s) => s.apiStatus);
   const startProxy = useAppStore((s) => s.startProxy);
   const stopProxy = useAppStore((s) => s.stopProxy);
-  const [wbEnv, setWbEnv] = useState<WorkBuddyEnvCheck | null>(null);
+  const [wbLocate, setWbLocate] = useState<AppLocate | null>(null);
   const [cbLocate, setCbLocate] = useState<AppLocate | null>(null);
   const [launching, setLaunching] = useState<'wb' | 'cb' | null>(null);
 
   useEffect(() => {
     let alive = true;
-    api.workbuddy
-      .envCheck()
-      .then((e) => alive && setWbEnv(e))
+    api.env
+      .locate('workbuddy_ai')
+      .then((r) => alive && setWbLocate(r))
       .catch(() => {});
     api.env
-      .locate('codebuddy')
+      .locate('codebuddy_ai')
       .then((r) => alive && setCbLocate(r))
       .catch(() => {});
     return () => {
@@ -464,11 +465,11 @@ function BuddyAiTopBar() {
 
   const launchApp = async (which: 'wb' | 'cb') => {
     if (launching) return;
-    const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy 国际客户端';
+    const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy AI';
     setLaunching(which);
     try {
-      if (which === 'wb') await api.env.openWorkbuddyApp();
-      else await api.env.openCodebuddyApp();
+      if (which === 'wb') await api.env.openWorkbuddyAiApp();
+      else await api.env.openCodebuddyAiApp();
       pushToast('success', `已启动 ${label}`);
     } catch (err) {
       const msg = String(err);
@@ -482,8 +483,8 @@ function BuddyAiTopBar() {
   return (
     <>
       <div className="flex items-center gap-2">
-        {wbEnv?.installed ? (
-          <Badge tone="green" title={wbEnv.version ? `WorkBuddy AI 当前版本：v${wbEnv.version}（国际版登录 workbuddy.ai）` : 'WorkBuddy AI 客户端'}>
+        {wbLocate?.exe ? (
+          <Badge tone="green" title={wbLocate.version ? `WorkBuddy AI 当前版本：v${wbLocate.version}（${wbLocate.exe}）` : wbLocate.exe}>
             <MonitorCheck size={13} /> WorkBuddy AI已安装
           </Badge>
         ) : (
@@ -492,12 +493,12 @@ function BuddyAiTopBar() {
           </Badge>
         )}
         {cbLocate?.exe ? (
-          <Badge tone="green" title={cbLocate.version ? `CodeBuddy 国际客户端当前版本：v${cbLocate.version}` : 'CodeBuddy 国际客户端'}>
-            <MonitorCheck size={13} /> CodeBuddy国际客户端已安装
+          <Badge tone="green" title={cbLocate.version ? `CodeBuddy AI 当前版本：v${cbLocate.version}（${cbLocate.exe}）` : cbLocate.exe}>
+            <MonitorCheck size={13} /> CodeBuddy AI已安装
           </Badge>
         ) : (
           <Badge tone="red">
-            <MonitorX size={13} /> CodeBuddy国际客户端未检测到
+            <MonitorX size={13} /> CodeBuddy AI未检测到
           </Badge>
         )}
         {certInstalled ? (

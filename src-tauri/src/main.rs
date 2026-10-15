@@ -148,6 +148,8 @@ fn main() {
             commands::env::open_trae_cn_app,
             commands::env::open_workbuddy_app,
             commands::env::open_codebuddy_app,
+            commands::env::open_workbuddy_ai_app,
+            commands::env::open_codebuddy_ai_app,
             commands::env::codebuddy_env_check,
             commands::cert::cert_status,
             commands::cert::cert_install,

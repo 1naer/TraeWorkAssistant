@@ -4,13 +4,14 @@ import { Badge } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { AppLocate, WorkBuddyEnvCheck } from '../../types';
+import type { AppLocate } from '../../types';
 
 /**
  * BuddyAI · 环境配置页（六页子导航对齐国内 Buddy「环境配置」）。
  *
  * 内容：应用入口可见性（系统设置 opt-in 同源开关）+ 国际客户端检测与打开
- * （WorkBuddy AI / CodeBuddy 国际客户端，与国内同一桌面程序、不同登录域）+
+ * （WorkBuddy AI @ Programs\WorkBuddyAI / CodeBuddy AI @ Programs\CodeBuddy，
+ * 与国内客户端为不同安装目录，P1 审查修复走独立探测档案）+
  * 数据隔离与配置说明。打卡调度配置归「一键签到」页，不在此重复。
  */
 export default function BuddyAiSettings() {
@@ -19,7 +20,7 @@ export default function BuddyAiSettings() {
   const refreshSettings = useAppStore((s) => s.refreshSettings);
   const [visible, setVisible] = useState(false);
   const [savingVisible, setSavingVisible] = useState(false);
-  const [wbEnv, setWbEnv] = useState<WorkBuddyEnvCheck | null>(null);
+  const [wbLocate, setWbLocate] = useState<AppLocate | null>(null);
   const [cbLocate, setCbLocate] = useState<AppLocate | null>(null);
   const [launching, setLaunching] = useState<'wb' | 'cb' | null>(null);
 
@@ -29,12 +30,12 @@ export default function BuddyAiSettings() {
 
   useEffect(() => {
     let alive = true;
-    api.workbuddy
-      .envCheck()
-      .then((e) => alive && setWbEnv(e))
+    api.env
+      .locate('workbuddy_ai')
+      .then((r) => alive && setWbLocate(r))
       .catch(() => {});
     api.env
-      .locate('codebuddy')
+      .locate('codebuddy_ai')
       .then((r) => alive && setCbLocate(r))
       .catch(() => {});
     return () => {
@@ -58,11 +59,11 @@ export default function BuddyAiSettings() {
 
   const launchApp = async (which: 'wb' | 'cb') => {
     if (launching) return;
-    const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy 国际客户端';
+    const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy AI';
     setLaunching(which);
     try {
-      if (which === 'wb') await api.env.openWorkbuddyApp();
-      else await api.env.openCodebuddyApp();
+      if (which === 'wb') await api.env.openWorkbuddyAiApp();
+      else await api.env.openCodebuddyAiApp();
       pushToast('success', `已启动 ${label}`);
     } catch (err) {
       const msg = String(err);
@@ -104,8 +105,8 @@ export default function BuddyAiSettings() {
         <div className="space-y-2.5">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              {wbEnv?.installed ? (
-                <Badge tone="green" title={wbEnv.version ? `WorkBuddy AI 当前版本：v${wbEnv.version}` : undefined}>
+              {wbLocate?.exe ? (
+                <Badge tone="green" title={wbLocate.version ? `WorkBuddy AI 当前版本：v${wbLocate.version}（${wbLocate.exe}）` : wbLocate.exe}>
                   <MonitorCheck size={13} /> WorkBuddy AI已安装
                 </Badge>
               ) : (
@@ -113,7 +114,7 @@ export default function BuddyAiSettings() {
                   <MonitorX size={13} /> WorkBuddy AI未检测到
                 </Badge>
               )}
-              <span className="text-xs text-slate-400">国际版登录 workbuddy.ai（与国内同一桌面程序，客户端路径检测/打开复用）</span>
+              <span className="text-xs text-slate-400">国际版客户端（Programs\WorkBuddyAI，登录 workbuddy.ai，与国内 WorkBuddy 为不同安装）</span>
             </div>
             <button className="btn-outline inline-flex items-center gap-1.5 text-xs" onClick={() => void launchApp('wb')} disabled={launching != null}>
               {launching === 'wb' ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />} 打开
@@ -122,12 +123,12 @@ export default function BuddyAiSettings() {
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               {cbLocate?.exe ? (
-                <Badge tone="green" title={cbLocate.version ? `CodeBuddy 国际客户端当前版本：v${cbLocate.version}` : undefined}>
-                  <MonitorCheck size={13} /> CodeBuddy国际客户端已安装
+                <Badge tone="green" title={cbLocate.version ? `CodeBuddy AI 当前版本：v${cbLocate.version}（${cbLocate.exe}）` : cbLocate.exe}>
+                  <MonitorCheck size={13} /> CodeBuddy AI已安装
                 </Badge>
               ) : (
                 <Badge tone="red">
-                  <MonitorX size={13} /> CodeBuddy国际客户端未检测到
+                  <MonitorX size={13} /> CodeBuddy AI未检测到
                 </Badge>
               )}
               <span className="text-xs text-slate-400">codebuddy 客户端（国际域登录态）</span>

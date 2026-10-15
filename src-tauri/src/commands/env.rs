@@ -257,6 +257,35 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             user_data_dir: format!("{home}\\.workbuddy"),
             settings_key: Some("workbuddy_path"),
         },
+        // WorkBuddy AI 国际版客户端（buddy-ai 独立应用顶栏/环境配置专用档案，P1 审查修复）：
+        // 与国内 WorkBuddy 是不同安装目录（用户实测 2026-10-15：
+        // %LOCALAPPDATA%\Programs\WorkBuddyAI），exe 名未知官方定式，候选覆盖三种形态；
+        // 注册表模式串收窄为 "WorkBuddyAI"/"WorkBuddy AI"，避免误匹配国内 "WorkBuddy" 卸载项
+        "workbuddy_ai" => AppProfile {
+            display: "WorkBuddy AI",
+            reg_patterns: &["WorkBuddyAI", "WorkBuddy AI"],
+            reg_exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe", "WorkBuddy.exe"],
+            exe_candidates: &[
+                "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe",
+                "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddy AI.exe",
+                "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddy.exe",
+            ],
+            proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
+            user_data_dir: format!("{home}\\.workbuddy-ai"),
+            settings_key: None,
+        },
+        // CodeBuddy AI 国际客户端档案：用户实测与 codebuddy 同目录
+        //（%LOCALAPPDATA%\Programs\CodeBuddy\CodeBuddy.exe），独立档案仅为
+        // BuddyAI 应用上下文语义清晰（徽标/打开文案标注 AI，避免与国内页共用探测口径混淆）
+        "codebuddy_ai" => AppProfile {
+            display: "CodeBuddy AI",
+            reg_patterns: &["CodeBuddy"],
+            reg_exe_names: &["CodeBuddy.exe"],
+            exe_candidates: &["%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe"],
+            proc_names: &["CodeBuddy"],
+            user_data_dir: format!("{home}\\.codebuddy"),
+            settings_key: None,
+        },
         // CodeBuddy IDE 独立探测（顶栏安装徽标/打开客户端）：默认路径同 WorkBuddy 的 Electron 惯例。
         // 本机实测（2026-09-12）：安装形态为 CodeBuddy CN（带空格），exe/进程名均为 "CodeBuddy CN"，
         // 注册表 DisplayName=CodeBuddy CN (User)，故 exe/进程/注册表候选同时覆盖不带 CN 的通用形态
@@ -342,6 +371,19 @@ pub fn open_workbuddy_app(state: State<AppState>) -> Result<(), String> {
 #[tauri::command(async)]
 pub fn open_codebuddy_app(state: State<AppState>) -> Result<(), String> {
     open_buddy_app(&state, "codebuddy", "CodeBuddy")
+}
+
+/// 打开 WorkBuddy AI 国际版客户端（buddy-ai 应用顶栏/环境配置，P1 审查修复）：
+/// 走 workbuddy_ai 独立档案探测（Programs\WorkBuddyAI），不再误开国内 WorkBuddy。
+#[tauri::command(async)]
+pub fn open_workbuddy_ai_app(state: State<AppState>) -> Result<(), String> {
+    open_buddy_app(&state, "workbuddy_ai", "WorkBuddy AI")
+}
+
+/// 打开 CodeBuddy AI 国际客户端（buddy-ai 应用上下文；探测同 codebuddy 目录）。
+#[tauri::command(async)]
+pub fn open_codebuddy_ai_app(state: State<AppState>) -> Result<(), String> {
+    open_buddy_app(&state, "codebuddy_ai", "CodeBuddy AI")
 }
 
 /// Buddy 双应用打开共用实现（open_doubao_app 的极简版：无代理注入、无进程关闭）

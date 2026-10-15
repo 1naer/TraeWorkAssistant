@@ -171,6 +171,10 @@ export const api = {
     openWorkbuddyApp: () => invoke('open_workbuddy_app'),
     /** Buddy 双应用：打开 CodeBuddy 桌面客户端（分离启动，不注入代理） */
     openCodebuddyApp: () => invoke('open_codebuddy_app'),
+    /** BuddyAI 国际客户端：打开 WorkBuddy AI（Programs\WorkBuddyAI，独立探测档案） */
+    openWorkbuddyAiApp: () => invoke('open_workbuddy_ai_app'),
+    /** BuddyAI 国际客户端：打开 CodeBuddy AI（Programs\CodeBuddy） */
+    openCodebuddyAiApp: () => invoke('open_codebuddy_ai_app'),
     /** CodeBuddy 桌面环境检测（exe/进程/auth uid；与 WorkBuddy 共享 auth 文件） */
     codebuddyEnvCheck: () => invoke<CodeBuddyEnvCheck>('codebuddy_env_check'),
   },
