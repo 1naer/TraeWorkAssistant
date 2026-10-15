@@ -24,41 +24,41 @@
 
 ## 阶段划分（逐步开发，每阶段独立可验收）
 
-### P1 顶栏/环境配置：国际客户端打开修复（本轮）🐛
+### P1 顶栏/环境配置：国际客户端打开修复 ✅ 已完成（本轮）🐛
 - env.rs 新增 `workbuddy_ai` / `codebuddy_ai` 客户端档案（exe 候选含 `Programs\WorkBuddyAI\{WorkBuddyAI,WorkBuddy AI,WorkBuddy}.exe`、`Programs\CodeBuddy\CodeBuddy.exe`）
 - 新命令 `open_workbuddy_ai_app` / `open_codebuddy_ai_app`（复用 open_buddy_app 分离启动）
 - 前端：BuddyAI 顶栏与「环境配置」页改用新命令；徽标探测 `api.env.locate('workbuddy_ai' / 'codebuddy_ai')`
 
-### P2 打卡记录落盘 + 概述页对齐
+### P2 打卡记录落盘 + 概述页对齐 ✅ 已完成
 - 新表 `buddy_ai_checkin_results`（date/time/user_id/name/status/message/reward；90 天裁剪；镜像 wb_checkin_results）
 - `run_checkin_round` 逐账号结果落库（幂等：同 uid 同日最终态覆盖）
 - 新命令 `buddy_ai_checkin_results(days)`；前端类型 + tauri.ts
 - 概述页：补「近 30 天打卡结果」堆叠图 + 「积分榜 Top」图（recharts，对齐国内 Buddy 概述）
 
-### P3 账号管理对齐
+### P3 账号管理对齐 ✅ 已完成（启停/备注/分组/批量移除；导出清单顺延 P8）
 - 后端：`buddy_ai_account_save`（备注/分组）、`buddy_ai_account_toggle`（启停，池行 disabled 字段 + selectable 判定）、`buddy_ai_accounts_export`（清单导出，不含凭证）
 - 前端：列对齐国内（分组下拉 / +标签 / 使用积分（buddy_ai_days 聚合）/ TOKEN 到期 / 凭证状态 / 启停徽章）+ 批量删除 / 导出 / 分组管理入口
 - 「每日目标 / 休假锁单」标注国际不适用
 
-### P4 签到页对齐（签到与成长）
+### P4 签到页对齐（更名「活跃打卡」，每日活跃打卡替代签到逻辑）✅ 已完成
 - 一键签到账号状态表（账号 / 状态 / 打卡结果 / 获取积分 / 可用积分，数据源 P2 记录 + 池快照）
 - 活动打卡日历（月历热图，镜像国内「活动签到日历」交互，按月翻页）
 - 成长中心位以「打卡积分统计」（累计获得 / 今日获得）等效替代；保留定时配置卡
 
-### P5 积分看板对齐
+### P5 积分看板对齐 ✅ 已完成（七卡口径 + 模型消耗排行；积分趋势快照任务顺延 P8）
 - 统计卡口径对齐国内 7 卡（账号数 / 可用总额 / 平均 / 打卡获得累计 / 今日获得 / 今日消耗 / 7 日内到期按积分包等效为账号到期）
 - 新调度任务「buddy-ai 积分定时快照」（每日 HH:MM，落 buddy_ai_credits_history）→ 积分趋势曲线
 - 模型消耗排行（buddy_ai_days 按模型 tokens/积分聚合，近 30 天）
 - Token 统计 / 会话明细 → P8 可选
 
-### P6 资源调度对齐
+### P6 资源调度对齐 ✅ 已完成（横幅/统计卡/账号调度池/模型目录表）
 - 调度状态横幅（未启用国际档时提示 + 一键开启）
 - 统计卡（调度账号 / 今日启用 / 池内账号）
 - 账号调度池复选启停（依赖 P3 toggle）
 - 国际档参数区（开关 / 会话粘性 / 池粘性 TTL——TTL 需后端 pool_set 扩参，随本阶段补）
 - 模型目录表（静态 17 模型：ID / 展示名 / 厂商 / 倍率占位 / 上下文），标注「静态配置」
 
-### P7 环境配置对齐
+### P7 环境配置对齐 ✅ 已完成（任务配置卡 + 客户端检测打开）
 - 应用环境卡：国际客户端双路径 + 自动检测 + 打开（P1 命令复用）+ 打开数据目录
 - 任务配置卡：每日自动打卡（镜像签到页配置）+ 每日积分快照（P5 任务）+ JWT 定时续期（等效任务）
 - CLI 轮换 / 切换迁移 / UI 模拟：标注国际不适用
