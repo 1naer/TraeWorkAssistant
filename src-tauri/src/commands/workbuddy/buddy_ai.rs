@@ -57,12 +57,46 @@ pub(crate) fn buddy_pool_write_credits(
     if expire_secs.is_some() {
         a.credits_expire_at = expire_secs; // 秒级时间戳（WorkBuddyAccount 口径）
     }
-    save_buddy_pool(state, &pool)
+    save_buddy_pool(state, &pool)?;
+    // P8：打卡/取数回写后刷新当日积分快照（趋势曲线数据源；锁内调用不重复加锁）
+    buddy_ai_credits_snapshot_save(state, &pool);
+    Ok(())
 }
 
 pub(super) fn save_buddy_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
     let v = serde_json::to_value(pool).map_err(|e| format!("序列化失败: {e}"))?;
     crate::store::docs::buddy_ai_pool_save(&crate::store::db(&state.data_dir), &v)
+}
+
+/// P8：当日积分快照落库（同日覆盖 + 365 天裁剪；积分看板趋势曲线数据源）。
+/// 不持锁——调用点均在 buddy_ai_pool_lock 临界区内（write_credits /
+/// credits_fetch 回写段），池读为最新态；落库失败仅日志，不阻塞主流程
+pub(crate) fn buddy_ai_credits_snapshot_save(state: &AppState, pool: &WbPool) {
+    let db = crate::store::db(&state.data_dir);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let accounts: Vec<Value> = pool
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "name": if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() },
+                "balance": a.credits_balance,
+            })
+        })
+        .collect();
+    let total: f64 = pool.accounts.iter().filter_map(|a| a.credits_balance).sum();
+    let snap = json!({
+        "date": today,
+        "ts": chrono::Utc::now().timestamp(),
+        "total_balance": total,
+        "accounts": accounts,
+        "earned": Value::Null,
+    });
+    if let Err(e) = crate::store::docs::buddy_ai_credits_history_upsert(&db, &snap) {
+        fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 积分快照落库失败: {e}"));
+    }
+    let _ = crate::store::docs::buddy_ai_credits_history_prune(&db);
 }
 
 /// token store 读取（vault 回填，仅内存不落明文）
@@ -507,6 +541,8 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
             }
         }
         save_buddy_pool(&state, &pool)?;
+        // P8：手动同步回写后刷新当日积分快照（锁内调用）
+        buddy_ai_credits_snapshot_save(&state, &pool);
     }
     // 运行池三键拨新（issue #109 同类，buddy-ai 国际池）：账号记录已回写，但网关
     // 运行池钉死在装配时刻——expire_first「有过期时间者优先」会恒压池内
@@ -782,6 +818,50 @@ pub fn buddy_ai_account_toggle(
         .ok_or_else(|| format!("账号不存在: {user_id}"))?;
     acct.disabled = disabled;
     save_buddy_pool(&state, &pool)
+}
+
+/// buddy-ai 积分历史查询（P8：趋势曲线数据源；近 N 天快照升序，默认 90 天）
+#[tauri::command(async)]
+pub fn buddy_ai_credits_history(
+    state: State<'_, AppState>,
+    days: Option<i64>,
+) -> Result<Vec<Value>, String> {
+    let days = days.unwrap_or(90).clamp(7, 365);
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string();
+    let raw = crate::store::docs::buddy_ai_credits_history_load(&crate::store::db(&state.data_dir));
+    let mut out = Vec::new();
+    if let Some(arr) = raw.get("snapshots").and_then(Value::as_array) {
+        for r in arr {
+            if r.get("date").and_then(Value::as_str).unwrap_or("") < cutoff.as_str() {
+                continue;
+            }
+            out.push(r.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// buddy-ai 账号池导出（P8 对齐 workbuddy_accounts_export；include_credentials=true
+/// 附带凭证明文副本——前端强确认 + 本地落盘，导出文件等同密码请妥善保管）
+#[tauri::command(async)]
+pub fn buddy_ai_accounts_export(
+    state: State<'_, AppState>,
+    include_credentials: Option<bool>,
+) -> Result<Value, String> {
+    let pool = load_buddy_pool(&state);
+    let mut v = serde_json::to_value(&pool).map_err(|e| format!("序列化失败: {e}"))?;
+    v["export_kind"] = json!("buddy-ai-pool");
+    v["exported_at"] = json!(chrono::Utc::now().to_rfc3339());
+    if include_credentials.unwrap_or(false) {
+        // 凭证副本（vault 回填后明文，仅内存）；落盘由前端 save 对话框完成
+        v["tokens"] = load_buddy_tokens(&state).get("tokens").cloned().unwrap_or_default();
+    } else {
+        // 脱敏导出：不含任何凭证字段（安全红线：默认路径零明文）
+        v["tokens"] = json!({});
+    }
+    Ok(v)
 }
 
 /// buddy-ai 每日活跃打卡结果查询（P2 对齐 workbuddy_checkin_results；数据源

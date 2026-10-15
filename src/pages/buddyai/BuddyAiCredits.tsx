@@ -1,11 +1,29 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { RefreshCw, Coins } from 'lucide-react';
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import { StatCard } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import type { BuddyAiAccountView, UsageDayView, WbCheckinRecord } from '../../types';
+
+/** P8 积分快照行（buddy_ai_credits_history 表） */
+interface CreditSnap {
+  date: string;
+  ts: number;
+  total_balance: number;
+  accounts: Array<{ id: string; name: string; balance: number | null }>;
+  earned: number | null;
+}
 
 /**
  * BuddyAI · 积分看板页（六页子导航对齐国内 Buddy）。
@@ -20,20 +38,23 @@ export default function BuddyAiCredits() {
   const [accounts, setAccounts] = useState<BuddyAiAccountView[] | null>(null);
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
   const [usage, setUsage] = useState<UsageDayView[]>([]);
+  const [history, setHistory] = useState<CreditSnap[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [accs, recs, usg] = await Promise.all([
+      const [accs, recs, usg, hist] = await Promise.all([
         api.buddyai.accountsList(),
         api.buddyai.checkinResults(90).catch(() => [] as WbCheckinRecord[]),
         api.apiServer.buddyAiUsageStats(30).catch(() => [] as UsageDayView[]),
+        api.buddyai.creditsHistory(90).catch(() => [] as CreditSnap[]),
       ]);
       setAccounts(accs);
       setRecords(recs);
       setUsage(usg);
+      setHistory(hist);
     } catch (err) {
       pushToast('error', `账号列表读取失败：${String(err).slice(0, 120)}`);
     } finally {
@@ -137,6 +158,34 @@ export default function BuddyAiCredits() {
         <StatCard label="今日获得" value={todayEarned > 0 ? todayEarned.toFixed(0) : '0'} hint="今日各账号打卡积分合计" tone="amber" />
         <StatCard label="7 日内到期" value={expiringSoon} hint="积分包到期账号数" tone={expiringSoon > 0 ? 'amber' : 'slate'} />
         <StatCard label="积分已过期账号" value={expiredCount} hint={expiredCount > 0 ? '积分包到期，续期后恢复' : '暂无过期'} tone={expiredCount > 0 ? 'red' : 'slate'} />
+      </div>
+
+      {/* 积分趋势（P8：buddy_ai_credits_history 每日快照，打卡回写/手动同步双挂点落库） */}
+      <div className="card mt-4 p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-medium">积分趋势</span>
+          <span className="text-[11px] text-slate-400">近 90 天可用总积分 · 每日快照（同日覆盖）</span>
+        </div>
+        {history.length === 0 ? (
+          <p className="py-6 text-center text-xs text-slate-400">
+            暂无快照数据。打卡成功或「同步积分」后会自动落当日快照，连续多日即可看到趋势。
+          </p>
+        ) : (
+          <div className="h-52">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart
+                data={history.map((h) => ({ date: h.date.slice(5), 可用总积分: Number(h.total_balance.toFixed(2)) }))}
+                margin={{ top: 4, right: 8, bottom: 0, left: -12 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#8884" vertical={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" tickLine={false} axisLine={false} />
+                <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                <Line type="monotone" dataKey="可用总积分" stroke="#10b981" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
       </div>
 
       {/* 明细表 */}

@@ -458,6 +458,17 @@ export const api = {
     /** 账号启停（停用即退出打卡花名册与网关取号） */
     accountToggle: (userId: string, disabled: boolean) =>
       invoke<void>('buddy_ai_account_toggle', { userId, disabled }),
+    /** 积分历史查询（P8 趋势曲线数据源；同日覆盖快照，默认 90 天） */
+    creditsHistory: (days?: number) =>
+      invoke<Array<{ date: string; ts: number; total_balance: number; accounts: Array<{ id: string; name: string; balance: number | null }>; earned: number | null }>>(
+        'buddy_ai_credits_history',
+        { days: days ?? null },
+      ),
+    /** 账号池导出（includeCredentials=true 附带凭证明文副本，前端强确认） */
+    accountsExport: (includeCredentials?: boolean) =>
+      invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
+        includeCredentials: includeCredentials ?? null,
+      }),
     /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
     creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
   },

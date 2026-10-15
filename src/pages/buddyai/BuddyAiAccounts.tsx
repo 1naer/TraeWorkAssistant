@@ -10,8 +10,10 @@ import {
   Power,
   PowerOff,
   Pencil,
+  Download,
 } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
+import { save } from '@tauri-apps/plugin-dialog';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
@@ -62,6 +64,10 @@ export default function BuddyAiAccounts() {
   const [editName, setEditName] = useState('');
   const [editNote, setEditNote] = useState('');
   const [editBusy, setEditBusy] = useState(false);
+  // 导出弹框（P8：默认脱敏；附带凭证副本需强确认——导出文件等同密码）
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportWithCreds, setExportWithCreds] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -225,6 +231,29 @@ export default function BuddyAiAccounts() {
     }
   };
 
+  // 导出账号池（P8 对齐国内 F-46：默认脱敏；凭证副本强确认——文件含明文 token 等同密码）
+  const doExport = async () => {
+    setExportBusy(true);
+    try {
+      const payload = await api.buddyai.accountsExport(exportWithCreds);
+      const filePath = await save({
+        defaultPath: `buddy-ai-accounts-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!filePath) {
+        setExportBusy(false);
+        return;
+      }
+      await api.misc.writeTextFile(filePath, JSON.stringify(payload, null, 2));
+      pushToast('success', `已导出 ${accounts?.length ?? 0} 个账号到 ${filePath}${exportWithCreds ? '（含凭证明文，请妥善保管）' : ''}`);
+      setExportOpen(false);
+    } catch (err) {
+      pushToast('error', `导出失败：${String(err).slice(0, 160)}`);
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
   const doRemove = async () => {
     if (!confirmTarget) return;
     setConfirmBusy(true);
@@ -272,6 +301,14 @@ export default function BuddyAiAccounts() {
             </button>
             <button className="btn-secondary inline-flex items-center gap-1.5" onClick={openImport}>
               <KeyRound size={14} /> 导入凭证
+            </button>
+            <button
+              className="btn-outline inline-flex items-center gap-1.5"
+              onClick={() => setExportOpen(true)}
+              disabled={!accounts || accounts.length === 0}
+              title="导出账号池为 JSON（可选是否附带凭证副本）"
+            >
+              <Download size={14} /> 导出账号
             </button>
             {selected.size > 0 && (
               <button
@@ -514,6 +551,43 @@ export default function BuddyAiAccounts() {
             </div>
           </div>
         ) : null}
+      </Modal>
+
+      {/* 导出弹框（P8：默认脱敏；凭证副本强确认） */}
+      <Modal open={exportOpen} onClose={() => !exportBusy && setExportOpen(false)} title="导出 BuddyAI 账号池" widthClass="max-w-sm">
+        <div className="space-y-3 text-sm">
+          <div>导出账号池为 JSON 文件，可用于备份或迁移到其他设备的 BuddyAI 应用。</div>
+          <label className="flex items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={exportWithCreds}
+              onChange={(e) => setExportWithCreds(e.target.checked)}
+            />
+            <span>
+              附带凭证副本
+              <span className="ml-1 text-xs text-slate-400">（不勾选 = 仅账号清单，导入后需重新登录/导入凭证）</span>
+            </span>
+          </label>
+          {exportWithCreds ? (
+            <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] leading-4 text-red-600 dark:bg-red-500/10 dark:text-red-300">
+              ⚠ 勾选后导出文件包含 access_token / refresh_token 明文，等同账号密码——请妥善保管，切勿通过不可信渠道传输。
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2 pt-1">
+            <button className="btn-secondary" disabled={exportBusy} onClick={() => setExportOpen(false)}>
+              取消
+            </button>
+            <button
+              className={`btn-primary inline-flex items-center gap-1.5 ${exportWithCreds ? 'bg-red-600 hover:bg-red-700' : ''}`}
+              disabled={exportBusy}
+              onClick={() => void doExport()}
+            >
+              {exportBusy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+              {exportWithCreds ? '我已知晓风险，确认导出' : '确认导出'}
+            </button>
+          </div>
+        </div>
       </Modal>
 
       {/* 移除确认弹框（删除类操作二次确认） */}

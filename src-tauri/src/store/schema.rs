@@ -199,6 +199,15 @@ const DDL: &[&str] = &[
         message TEXT NOT NULL DEFAULT '',
         reward  REAL
     )",
+    // P8：buddy-ai 每日积分快照（同日覆盖 + 365 天裁剪；镜像 wb_credits_history，
+    // 积分看板趋势曲线数据源——打卡回写与手动同步双挂点保证有数据的天不缺格）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_credits_history (
+        date          TEXT PRIMARY KEY,
+        ts            INTEGER NOT NULL DEFAULT 0,
+        total_balance REAL NOT NULL DEFAULT 0,
+        accounts      TEXT NOT NULL DEFAULT '[]',
+        earned        REAL
+    )",
     "CREATE TABLE IF NOT EXISTS doubao_health_events (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         payload TEXT NOT NULL

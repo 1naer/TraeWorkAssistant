@@ -2051,6 +2051,68 @@ pub fn buddy_ai_checkin_results_save(s: &Store, root: &Value) -> Result<(), Stri
     })
 }
 
+// ── P8：buddy-ai 每日积分快照（镜像 wb_credits_history 同构）───────────────
+
+/// 读回 {snapshots: [...]}（按日期升序）
+pub fn buddy_ai_credits_history_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, ts, total_balance, accounts, earned FROM buddy_ai_credits_history ORDER BY date",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let accounts: String = r.get(3)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "total_balance": r.get::<_, f64>(2)?,
+                        "accounts": serde_json::from_str::<Value>(&accounts)
+                            .unwrap_or(Value::Array(vec![])),
+                        "earned": r.get::<_, Option<f64>>(4)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "snapshots": rows })
+}
+
+/// 同日覆盖 UPSERT（打卡回写/手动同步双挂点调用，当日多账号回写自然收敛为最终态）
+pub fn buddy_ai_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺 date 字段".into());
+    }
+    let ts = snap.get("ts").and_then(Value::as_i64).unwrap_or(0);
+    let total = snap.get("total_balance").and_then(Value::as_f64).unwrap_or(0.0);
+    let accounts = serde_json::to_string(
+        snap.get("accounts").unwrap_or(&Value::Array(vec![])),
+    )
+    .map_err(|e| format!("序列化失败: {e}"))?;
+    let earned = snap.get("earned").and_then(Value::as_f64);
+    s.with_conn(move |c| {
+        c.execute(
+            "INSERT INTO buddy_ai_credits_history(date, ts, total_balance, accounts, earned) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, total_balance = excluded.total_balance, accounts = excluded.accounts, earned = excluded.earned",
+            rusqlite::params![date, ts, total, accounts, earned],
+        )?;
+        Ok(())
+    })
+}
+
+/// 365 天滚动裁剪
+pub fn buddy_ai_credits_history_prune(s: &Store) -> Result<(), String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        c.execute("DELETE FROM buddy_ai_credits_history WHERE date < ?1", [cutoff.as_str()])?;
+        Ok(())
+    })
+}
+
 // ── 豆包运维历史（doubao_health_history.json → doubao_health_events 表）──────
 
 pub fn doubao_health_load(s: &Store) -> Vec<Value> {
