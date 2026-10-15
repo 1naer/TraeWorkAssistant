@@ -12,7 +12,7 @@
 //! - R-9：workbuddy.ai ↔ codebuddy.ai 同一账号体系，单一鉴权门面即可。
 
 use serde_json::{json, Value};
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -471,7 +471,7 @@ pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
 /// TotalDosage）→ 回写池 credits 三键（buddy_ai_pool_lock 短临界区）→ 返回刷新后视图。
 /// 手动触发与调度器看板同步共用解析 fn（fetch_total_dosage）。
 #[tauri::command(async)]
-pub fn buddy_ai_credits_fetch(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<Vec<Value>, String> {
     let agent = crate::tasks::http_agent(30);
     let pool = load_buddy_pool(&state);
     let tokens = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
@@ -512,6 +512,38 @@ pub fn buddy_ai_credits_fetch(state: State<'_, AppState>) -> Result<Vec<Value>, 
             }
         }
         save_buddy_pool(&state, &pool)?;
+    }
+    // 运行池三键拨新（issue #109 同类，buddy-ai 国际池）：账号记录已回写，但网关
+    // 运行池钉死在装配时刻——expire_first「有过期时间者优先」会恒压池内
+    // expire=None 的账号，充值续期后的新到期进不了池。快照缺到期信息时保留池内
+    // 旧值（对齐上方账号记录 expire 仅 Some 才覆盖的口径），余额以本次取数为准
+    {
+        let rt = app
+            .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let shared = rt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|g| g.shared.clone());
+        if let Some(shared) = shared {
+            let current: std::collections::HashMap<String, Option<i64>> = shared
+                .buddy_ai_pool
+                .status_list()
+                .into_iter()
+                .map(|s| (s.uid, s.credits_expire_at))
+                .collect();
+            let m: std::collections::HashMap<String, (f64, Option<i64>)> = out
+                .iter()
+                .filter_map(|(id, snap)| {
+                    let (total, expire) = snap.as_ref()?;
+                    let expire = (*expire).or_else(|| current.get(id).copied().flatten());
+                    Some((id.clone(), (*total, expire)))
+                })
+                .collect();
+            if !m.is_empty() {
+                shared.buddy_ai_pool.update_credits_snapshot(&m);
+            }
+        }
     }
     fs_utils::app_log(
         &state.data_dir,

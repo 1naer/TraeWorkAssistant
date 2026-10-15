@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::usage_history::{UsageSessionView, UsageSessionsResult};
 use crate::fs_utils;
@@ -16,7 +16,9 @@ use super::common::{as_str, auth_file_path_of, load_pool, save_pool};
 
 #[tauri::command(async)]
 pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: Option<String>, fresh: Option<bool>) -> Result<serde_json::Value, String> {
-    let _ = &app; // 预留：wb-credits-updated 事件随批次2趋势图启用
+    // 运行池句柄：刷新落账后即时三键拨新（issue #109 同类，WB 池运行期保鲜）
+    let rt_state =
+        app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
     // Rust 直调 tasks::wb_credits（原 python workbuddy_credits.py 移植）；
     // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
     let fresh = fresh.unwrap_or(false);
@@ -26,11 +28,11 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
     // 与「无缓存」仍走同步路径，语义与耗时保持原样。
     if !fresh {
         if let Some(reply) = crate::tasks::wb_credits::stale_reply(&state, uid) {
-            spawn_background_refresh(&state);
+            spawn_background_refresh(&state, &app);
             return Ok(reply);
         }
     }
-    credits_refresh_now(&state, uid, fresh)
+    credits_refresh_now(&state, uid, fresh, Some(rt_state.inner()))
 }
 
 /// 同步取数一轮：取数（缓存/网络）→ 池余额回写 → 套餐回填 → 非缓存命中时追加快照。
@@ -39,10 +41,11 @@ fn credits_refresh_now(
     state: &AppState,
     uid: Option<&str>,
     fresh: bool,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<serde_json::Value, String> {
     let parsed = crate::tasks::wb_credits::fetch_credits(state, uid, fresh)?;
-    // 回写账号池余额缓存（列表/概述展示）
-    write_back_pool_balances(state, &parsed);
+    // 回写账号池余额缓存（列表/概述展示），并经 runtime 句柄三键拨新运行池
+    write_back_pool_balances(state, &parsed, runtime);
     // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
     backfill_edition_from_payment_type(state);
     // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
@@ -57,7 +60,7 @@ fn credits_refresh_now(
 /// 另加最小间隔节流（issue #84，2026-10-10）：缓存 10min 过期后若页面 30s 轮询一次，
 /// 每次都会重新触发后台全量取数；节流窗口内直接跳过（调用方已回旧值，无感知），
 /// 待窗口过后下一次调用再真正刷新。上次刷新未完成时不记账（避免把在途轮误当已完成）。
-fn spawn_background_refresh(state: &State<AppState>) {
+fn spawn_background_refresh(state: &State<AppState>, app: &AppHandle) {
     static LAST_BG_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
         std::sync::Mutex::new(None);
     const BG_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -80,6 +83,7 @@ fn spawn_background_refresh(state: &State<AppState>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     let st = state.inner().clone();
+    let app = app.clone();
     std::thread::spawn(move || {
         // 复位兜底（2026-10-08 评审）：线程 panic 时 Drop 守卫仍复位 IN_FLIGHT，
         // 否则原子标记永久卡 true、后台刷新静默失效（SWR 恒回旧值）
@@ -94,7 +98,9 @@ fn spawn_background_refresh(state: &State<AppState>) {
         // panic 兜底（审查 P6，同 scheduler.rs 调度线程先例）：任务体 panic 照常落日志；
         // IN_FLIGHT 复位由上方 Drop 守卫保证，此处仅补可观测性
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            credits_refresh_now(&st, None, true)
+            let rt = app
+                .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+            credits_refresh_now(&st, None, true, Some(rt.inner()))
         }));
         match outcome {
             Ok(Ok(_)) => fs_utils::app_log(
@@ -125,11 +131,18 @@ fn spawn_background_refresh(state: &State<AppState>) {
 /// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）。
 /// 持 wb_pool_lock 罩住整段读-改-写：命令线程/后台刷新线程/调度器三方并发时
 /// 不持锁的整文档写回会用旧副本抹掉彼此改动（lost-update）
-fn write_back_pool_balances(state: &AppState, parsed: &Value) {
+fn write_back_pool_balances(
+    state: &AppState,
+    parsed: &Value,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) {
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
         let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = load_pool(state);
         let now_ts = chrono::Utc::now().timestamp();
+        // 运行池三键拨新数据源（ok=true 账号）：uid → (balance, earliest_expire)
+        let mut snapshot: std::collections::HashMap<String, (f64, Option<i64>)> =
+            std::collections::HashMap::new();
         for acc in accounts {
             let uid = acc.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
             // ok=false（该账号本次查询失败）时不回写 balance/fetched_at/expire_at，
@@ -147,10 +160,32 @@ fn write_back_pool_balances(state: &AppState, parsed: &Value) {
                 // 仅成功取数的账号回写
                 a.credits_expire_at = earliest_pack_expire(acc, now_ts);
             }
+            if let Some(bal) = bal {
+                snapshot.insert(uid.to_string(), (bal, earliest_pack_expire(acc, now_ts)));
+            }
         }
         if let Err(e) = save_pool(state, &pool) {
             // 缓存级回填失败不中断主流程，但落日志不静默（对齐代码库写失败落 app_log 惯例）
             fs_utils::app_log(&state.data_dir, &format!("workbuddy: 积分回填落池失败: {e}"));
+        }
+        drop(_guard); // 先释放账号锁再取 runtime 锁：持锁再取其他锁违反项目锁纪律
+        // 运行池三键拨新（issue #109 同类，WB 池）：账号记录已回写，但网关运行池此前
+        // 钉死在装配时刻——expire_first「有过期时间者优先」会恒压池内 expire=None 的
+        // 新登录账号，充值续期后的新到期也进不了池。仅 ok=true 账号入表，失败账号
+        // 不提及即保留旧值（update_credits_snapshot 的 get_mut 纪律）。
+        // buddy-ai 池装配源与 WB store 完全隔离（apply_pool_snapshot 独立装配），
+        // 不推 WB 快照以免备份重导入窗口 uid 碰撞误写
+        if let Some(rt) = runtime {
+            let shared = rt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|g| g.shared.clone());
+            if let Some(shared) = shared {
+                if !snapshot.is_empty() {
+                    shared.wb_pool.update_credits_snapshot(&snapshot);
+                }
+            }
         }
     }
 }
@@ -175,10 +210,14 @@ fn earliest_pack_expire(acc: &Value, now_ts: i64) -> Option<i64> {
 /// 每日积分余额快照任务（调度器 `wb-credits-snapshot`；补齐近 7 日用量时序的关键）：
 /// 强制刷新全部账号积分 → 回写池余额 → 追加当日快照（同日覆盖）。
 /// 此前快照仅在「打开积分页且非缓存命中」时写入，应用内调度器到点自动建快照，
-/// 差分序列不再因未打开页面而断档。
-pub(crate) fn wb_credits_snapshot_task(state: &AppState) -> Result<Value, String> {
+/// 差分序列不再因未打开页面而断档。runtime 句柄用于运行池三键拨新（issue #109
+/// 同类）：GUI/网关进程传 Some，CLI 无网关传 None 跳过（对齐 qoder run_snapshot_task）
+pub(crate) fn wb_credits_snapshot_task(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<Value, String> {
     let parsed = crate::tasks::wb_credits::fetch_credits(state, None, true)?;
-    write_back_pool_balances(state, &parsed);
+    write_back_pool_balances(state, &parsed, runtime);
     append_credits_snapshot(state, &parsed);
     fs_utils::app_log(
         &state.data_dir,

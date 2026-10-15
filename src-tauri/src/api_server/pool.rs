@@ -415,28 +415,14 @@ impl ApiPool {
         }
     }
 
-    /// 运行期积分回写（issue #67）：仅更新池内条目的 credits 快照，
-    /// 不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts 全量重建互补——
-    /// 后者会重置 hard_until/last_used 等运行状态）。未提及的账号保持原值。
-    /// 修复「秃号内存中 credits>0 永远 selectable、策略持续命中同一账号」。
-    /// 回写同时拨新快照时间戳（issue #91 缓存保鲜）：新数据即新鲜，
-    /// reserve 过滤自动恢复生效
-    pub fn update_credits(&self, credits: &HashMap<String, f64>) {
-        let mut entries = safe_lock(&self.entries);
-        let now = now_ts();
-        for (uid, c) in credits {
-            if let Some(e) = entries.get_mut(uid) {
-                e.credits = Some(*c);
-                e.credits_fetched_at = Some(now);
-            }
-        }
-    }
-
-    /// Qoder 池运行期三键拨新（issue #102 运行期保鲜）：credits + credits_expire_at +
-    /// credits_fetched_at 一并回写。与 update_credits（Trae/WB 只拨余额+时间戳）不同，
-    /// Qoder 的 selectable 到期过滤与 smart 排序键①「先到期先消耗」依赖
-    /// credits_expire_at——旧值钉死会让充值/续期后的账号持续被排除直到网关重启。
-    /// 未提及的账号保持原值，不触碰冷却/inflight/禁用等运行态（对齐 update_credits 纪律）
+    /// 池运行期三键拨新（issue #67 运行期回写 + issue #102 Qoder / issue #109
+    /// Trae/WB 运行期保鲜）：credits + credits_expire_at + credits_fetched_at 一并回写。
+    /// selectable 到期过滤与 expire_first/smart「先到期先消耗」排序依赖
+    /// credits_expire_at——旧值钉死会让充值/续期后的账号持续被排除、新登录账号
+    /// expire=None 被「有过期时间者优先」恒压，直到网关重启；快照时间戳同步拨新
+    /// （issue #91 缓存保鲜），reserve 过滤自动恢复生效。
+    /// 未提及的账号保持原值，不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts
+    /// 全量重建互补——后者会重置 hard_until/last_used 等运行状态）
     pub fn update_credits_snapshot(&self, snapshot: &HashMap<String, (f64, Option<i64>)>) {
         let mut entries = safe_lock(&self.entries);
         let now = now_ts();
@@ -1495,7 +1481,7 @@ mod tests {
     #[test]
     fn reserve_credits_stale_snapshot_fail_open() {
         // issue #91 缓存问题：reserve 过滤仅对新鲜积分快照生效。
-        // 陈旧快照 fail-open（不误杀），保鲜靠启动刷新与 update_credits 拨新
+        // 陈旧快照 fail-open（不误杀），保鲜靠启动刷新与 update_credits_snapshot 拨新
         let pool = build_pool(&[("uid_low", 30.0, 4_000_001_000)]);
         pool.set_reserve_credits(50.0);
         // 新鲜快照：低余额被过滤
@@ -1531,10 +1517,53 @@ mod tests {
         }
         assert_eq!(pool.selectable_stats_in(None), (1, 1));
 
-        // update_credits 拨新时间戳：过滤自动恢复
-        pool.update_credits(&[("uid_low".to_string(), 30.0)].into_iter().collect());
+        // update_credits_snapshot 拨新时间戳（expire 保持原值）：过滤自动恢复
+        pool.update_credits_snapshot(
+            &[("uid_low".to_string(), (30.0, Some(4_000_001_000)))]
+                .into_iter()
+                .collect(),
+        );
         assert!(!pool.has_stale_credits());
         assert_eq!(pool.selectable_stats_in(None), (0, 0));
+    }
+
+    /// issue #109 运行期保鲜（Trae 池）：网关启动后新登录/新刷新的账号池内
+    /// expire=None，被 expire_first「有过期时间者优先」恒压——调度持续命中带旧
+    /// 到期信息的老账号（新会话同样命中）；三键拨新带上下拉新 expire 后选号纠正
+    #[test]
+    fn credits_snapshot_push_fixes_expire_first_ordering() {
+        // uid_a 无到期信息（expire=0 等价 None），uid_b 有到期信息 → 恒选 uid_b
+        let pool = build_pool(&[("uid_a", 100.0, 0), ("uid_b", 50.0, 4_000_000_000)]);
+        let picked = pool
+            .pick_excluding_constrained(&HashSet::new(), None, None)
+            .unwrap();
+        assert_eq!(picked.uid, "uid_b");
+        // 运行期三键拨新：uid_a 带上最早到期时间（早于 uid_b）→ 选号纠正为 uid_a；
+        // 未提及的 uid_b 保持原值
+        let mut m = HashMap::new();
+        m.insert("uid_a".to_string(), (100.0, Some(3_900_000_000)));
+        pool.update_credits_snapshot(&m);
+        let picked = pool
+            .pick_excluding_constrained(&HashSet::new(), None, None)
+            .unwrap();
+        assert_eq!(picked.uid, "uid_a");
+    }
+
+    /// issue #109 充值/续期场景：池内旧 expire 已过期被 selectable 整体排除，
+    /// 三键拨新带回新到期时间后恢复可选
+    #[test]
+    fn credits_snapshot_push_revives_recharged_account() {
+        // uid_a 旧到期时间已过 → 不可选
+        let pool = build_pool(&[("uid_a", 100.0, 1), ("uid_b", 50.0, 4_000_000_000)]);
+        let uid_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
+        assert!(!pool.has_selectable_in(Some(&uid_a)));
+        assert!(pool.pick_by_uid("uid_a").is_none());
+        // 运行期拨新（续期后新到期）→ 恢复可选且可被粘性取号
+        let mut m = HashMap::new();
+        m.insert("uid_a".to_string(), (100.0, Some(4_000_000_000)));
+        pool.update_credits_snapshot(&m);
+        assert!(pool.has_selectable_in(Some(&uid_a)));
+        assert!(pool.pick_by_uid("uid_a").is_some());
     }
 
     #[test]
