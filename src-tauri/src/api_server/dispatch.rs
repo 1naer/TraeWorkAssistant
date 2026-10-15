@@ -1026,6 +1026,8 @@ mod tests {
             qoder_sticky_enabled: AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_pool: super::super::pool::ApiPool::new(),
+            buddy_ai_enabled: AtomicBool::new(false),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         Fixture { dir, state }

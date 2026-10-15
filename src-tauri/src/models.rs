@@ -355,6 +355,12 @@ pub struct Settings {
     /// 缺失/非法回退 APP_TABS 内置默认图标）
     #[serde(default)]
     pub app_icons: HashMap<String, String>,
+    /// BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）：
+    /// 独立于 hidden_apps——存量用户 hidden_apps 已持久化为 []，若借道隐藏列表
+    /// 无法区分「默认隐藏」与「用户显式取消隐藏」，故用独立 opt-in 字段；
+    /// 系统设置-应用显示面板勾选后置 true
+    #[serde(default)]
+    pub buddy_ai_visible: bool,
 }
 
 fn default_api_port() -> u16 {
@@ -774,6 +780,11 @@ pub struct ApiPoolFile {
     /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
     #[serde(default = "default_sticky_ttl_secs")]
     pub qoder_sticky_ttl_secs: u64,
+    /// Buddy 国际版（buddy-ai）池上游开关：开启后 buddy-ai 目录模型路由到国际池。
+    /// 默认 false——dispatch「buddy-ai」档显式开启制（§4.2：避免模型路由歧义，
+    /// 用户在 API 服务页显式开启国际档），未部署国际账号时不产生空池噪音
+    #[serde(default)]
+    pub buddy_ai_enabled: bool,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -838,6 +849,7 @@ impl Default for ApiPoolFile {
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
+            buddy_ai_enabled: false,
         }
     }
 }

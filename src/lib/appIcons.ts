@@ -127,4 +127,5 @@ export const DEFAULT_APP_ICONS: Record<AppKey, string> = {
   buddy: 'Bot',
   qoder: 'Boxes',
   doubao: 'LayoutGrid',
+  'buddy-ai': 'Globe',
 };

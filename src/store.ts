@@ -255,10 +255,12 @@ function defaultSettings(): Settings {
     notify_bark_url: null,
     notify_webhook_url: null,
     notify_serverchan_sendkey: null,
-    // 侧边栏应用显示：默认固定 Trae，其余应用全部显示
+    // 侧边栏应用显示：默认固定 Trae，其余应用全部显示；
+    // BuddyAI（buddy-ai 国际版）默认不展示（独立 opt-in 开关，见应用显示面板）
     pinned_app: 'trae',
     hidden_apps: [],
     app_icons: {},
+    buddy_ai_visible: false,
     // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到）；
     // 积分数据同步与 Buddy/Trae 同款四模式（默认 every_hours 每2小时，daily 时刻 23:40）
     qoder_ide_path: null,
@@ -752,12 +754,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 合法值，保证设置页下拉正确回显、pushToast 不再走兼容分支
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
-      // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见
-      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
-      if (!validApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
+      // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见；
+      // buddy-ai（国际版）不参与固定应用（脏值回退 trae，与后端 state.rs 归一口径一致）
+      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
+      const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
+      if (!pinnableApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
       settings.hidden_apps = (settings.hidden_apps ?? []).filter(
         (a): a is AppKey => validApps.includes(a) && a !== settings.pinned_app,
       );
+      // BuddyAI 显示开关缺省归一为 false（默认不展示）
+      settings.buddy_ai_visible = settings.buddy_ai_visible === true;
       // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {

@@ -187,11 +187,13 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
+    let buddy_ai_pool = ApiPool::new();
     // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
+    buddy_ai_pool.set_log_ctx(&state.data_dir, "buddy-ai");
     // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
     //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
@@ -199,7 +201,7 @@ pub async fn do_start(
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
-        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &buddy_ai_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -307,6 +309,9 @@ pub async fn do_start(
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
+        // buddy-ai 独立池（§3.4 隔离清单）：开关默认关（dispatch 显式开启制）
+        buddy_ai_pool,
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_enabled),
         listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
@@ -733,6 +738,7 @@ fn apply_pool_snapshot(
     pool: &ApiPool,
     wb_pool: &ApiPool,
     qoder_pool: &ApiPool,
+    buddy_ai_pool: &ApiPool,
 ) -> (usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file = load_pool_file(&state.data_dir);
@@ -860,6 +866,13 @@ fn apply_pool_snapshot(
     let qoder_ids: Vec<String> = qoder_sync.iter().map(|a| a.uid.clone()).collect();
     let qoder_uids = effective_qoder_uids(&pool_file, &qoder_ids);
     qoder_pool.sync_from_qoder(&qoder_sync, &qoder_uids);
+    // buddy-ai 独立池装配（阶段 1 骨架）：buddy_ai_accounts 表独立取号独立入池，
+    // 与 wb 池零混居（§3.1 硬约束 1）；fail-open 全量含凭证账号入池（禁用由
+    // needs_relogin 表达，对齐 Qoder 池语义）；国际池暂无分组体系，阶段 3 分区 UI 再对齐。
+    // 开关 buddy_ai_enabled 在网关路由层消费（默认关，dispatch 显式开启制）
+    let buddy_ai_accounts = crate::commands::workbuddy::buddy_ai_upstream_accounts(state);
+    let buddy_ai_uids: Vec<String> = buddy_ai_accounts.iter().map(|a| a.uid.clone()).collect();
+    buddy_ai_pool.sync_from_wb(&buddy_ai_accounts, &buddy_ai_uids);
     (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count())
 }
 
@@ -874,8 +887,13 @@ pub fn reload_pools_if_running(
 ) {
     let guard = safe_lock(runtime);
     let Some(rt) = guard.as_ref() else { return };
-    let (trae, wb_uids, wb_total, qoder) =
-        apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool, &rt.shared.qoder_pool);
+    let (trae, wb_uids, wb_total, qoder) = apply_pool_snapshot(
+        state,
+        &rt.shared.pool,
+        &rt.shared.wb_pool,
+        &rt.shared.qoder_pool,
+        &rt.shared.buddy_ai_pool,
+    );
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -1014,6 +1032,8 @@ fn merge_pool_set(
         trae_tag_ids: existing.trae_tag_ids.clone(),
         wb_tag_ids: existing.wb_tag_ids.clone(),
         qoder_tag_ids: existing.qoder_tag_ids.clone(),
+        // buddy-ai 开关同 tag_ids 口径：pool_set 命令在 merge 后追加应用（热应用 AtomicBool）
+        buddy_ai_enabled: existing.buddy_ai_enabled,
     }
 }
 
@@ -1067,6 +1087,8 @@ pub fn pool_set(
     qoder_strategy: Option<String>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
+    // buddy-ai（国际版）池上游开关（默认关，dispatch 显式开启制）；None = 保留原值
+    buddy_ai_enabled: Option<bool>,
     // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
     // （与分组筛选取交集，D5 池语义）
     trae_tag_ids: Option<Vec<String>>,
@@ -1121,6 +1143,16 @@ pub fn pool_set(
     }
     if let Some(v) = qoder_tag_ids {
         pool_file.qoder_tag_ids = v;
+    }
+    // buddy-ai 开关在 merge 后追加应用（对齐 tag_ids 先例：merge_pool_set 纯函数
+    // 签名不动，存量单测零改动）；运行中热应用到 AtomicBool
+    if let Some(v) = buddy_ai_enabled {
+        pool_file.buddy_ai_enabled = v;
+        if let Some(rt) = safe_lock(&runtime).as_ref() {
+            rt.shared
+                .buddy_ai_enabled
+                .store(v, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
@@ -1262,6 +1294,7 @@ pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, Str
         jwt_refresh_lock: state.inner().jwt_refresh_lock.clone(),
         qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
         wb_pool_lock: state.inner().wb_pool_lock.clone(),
+        buddy_ai_pool_lock: state.inner().buddy_ai_pool_lock.clone(),
         doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
         group_defs_lock: state.inner().group_defs_lock.clone(),
     };
@@ -1924,6 +1957,7 @@ mod pool_merge_tests {
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
+            buddy_ai_enabled: false,
         }
     }
 

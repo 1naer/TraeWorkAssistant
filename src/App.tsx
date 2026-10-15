@@ -27,6 +27,7 @@ import QoderAccounts from './pages/qoder/QoderAccounts';
 import QoderCheckin from './pages/qoder/QoderCheckin';
 import QoderApiService from './pages/qoder/QoderApiService';
 import QoderSettings from './pages/qoder/QoderSettings';
+import BuddyAiHome from './pages/buddyai/BuddyAiHome';
 import ApiManagerModal from './components/api/ApiManagerModal';
 import TraeWorkMigrationGuide from './components/TraeWorkMigrationGuide';
 
@@ -78,6 +79,8 @@ function renderView(view: string) {
       return <QoderApiService key="qoder-api-service" />;
     case 'qoder-settings':
       return <QoderSettings />;
+    case 'buddyai-home':
+      return <BuddyAiHome />;
     default:
       return <Dashboard />;
   }

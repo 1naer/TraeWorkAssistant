@@ -475,7 +475,10 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
     let wb_ok = wb_enabled && state.wb_pool.has_selectable();
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = qoder_enabled && state.qoder_pool.has_selectable();
-    if solo_ok || wb_ok || qoder_ok {
+    // buddy-ai 独立池（§3.4 隔离清单）：healthz 四池化——仅部署 Intl 账号时探活同样正常
+    let buddy_ai_enabled = state.buddy_ai_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_ok = buddy_ai_enabled && state.buddy_ai_pool.has_selectable();
+    if solo_ok || wb_ok || qoder_ok || buddy_ai_ok {
         (
             StatusCode::OK,
             axum::Json(json!({
@@ -483,6 +486,7 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
                 "solo_available": solo_ok,
                 "wb_available": wb_ok,
                 "qoder_available": qoder_ok,
+                "buddy_ai_available": buddy_ai_ok,
             })),
         )
             .into_response()
@@ -3094,6 +3098,8 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_pool: super::super::pool::ApiPool::new(),
+            buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         WlFixture { dir, state }

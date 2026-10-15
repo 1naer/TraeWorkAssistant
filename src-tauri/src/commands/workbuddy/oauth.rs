@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter};
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{account_id_of, as_str, load_pool, save_pool, upsert_token_store, WorkBuddyAccount};
+use super::common::{account_id_of, as_str, load_pool, save_pool, upsert_token_store, WorkBuddyAccount, WbPool};
 
 static OAUTH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -103,8 +103,11 @@ fn find_state_credential(body: &serde_json::Value) -> Option<(&'static str, Stri
 ///    → 按已验证形态构造 `copilot.tencent.com/login?platform=CLI&state=<state>`
 ///    （antigravity-tools 卡密登录链接同款拼法；workbuddy-switch 缺 authUrl 时亦按此回退），
 ///    绝不原样打开缺 state 的登录页链接，也绝不回退裸基础域 URL。
-fn resolve_auth_url(body: &serde_json::Value, state_id: &str) -> Result<String, String> {
-    const LOGIN_BASE: &str = "https://copilot.tencent.com";
+fn resolve_auth_url(
+    body: &serde_json::Value,
+    state_id: &str,
+    ep: &crate::tasks::wb_common::WbRegionEndpoints,
+) -> Result<String, String> {
     let state_id = state_id.trim();
     if state_id.is_empty() {
         return Err("auth/state 响应中 state 为空，无法构造登录链接".into());
@@ -118,7 +121,15 @@ fn resolve_auth_url(body: &serde_json::Value, state_id: &str) -> Result<String, 
                 .filter(|v| v.starts_with("https://") || v.starts_with("http://"))
                 .filter(|v| auth_url_query_has_key(v, "state"))
         })
-        .unwrap_or_else(|| format!("{LOGIN_BASE}/login?platform=CLI&state={state_id}"));
+        .unwrap_or_else(|| {
+            // 回退构造（CN：`copilot.tencent.com/login?platform=CLI&state=<state>` 原形态；
+            // Intl：R-1 实测官方带 version 参数，对齐带上）
+            let mut link = format!("{}/login?platform={}&state={}", ep.login_base, ep.platform, state_id);
+            if !ep.client_version.is_empty() {
+                link.push_str(&format!("&version={}", ep.client_version));
+            }
+            link
+        });
     Ok(complete)
 }
 
@@ -135,34 +146,99 @@ fn mask_phone(p: &str) -> String {
     }
 }
 
-/// OAuth 主流程（后台线程执行）：进度经 wb-oauth-progress 事件推送，结果经 wb-oauth-done。
-fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), String> {
-    // API 上游在 copilot.tencent.com（workbuddy2api main.go:28 同款）——打到
-    // www.codebuddy.cn 会拿到与 CLI 登录流程不匹配的裸登录链接（上一轮故障根因）
-    const BASE: &str = "https://copilot.tencent.com";
-    const WEB_ORIGIN: &str = "https://www.codebuddy.cn";
-    // UA/头模拟官方 CLI 客户端（workbuddy2api main.go:29,38-45 同款）；
+/// OAuth 入池落库后端（§3.1 不交织：CN 走 wb 池现状不动，Intl 走 buddy-ai 独立池）
+pub(super) enum PoolSink {
+    /// 国内 wb 池（wb_accounts / wb_tokens 表 + vault ns "wb"）
+    Cn,
+    /// 国际 buddy-ai 独立池（buddy_ai_accounts / buddy_ai_tokens 表 + vault ns "buddy-ai"）
+    BuddyAi,
+}
+
+impl PoolSink {
+    /// 事件前缀（wb-oauth-* / buddy-ai-oauth-*，UI 分区原则不混流）
+    pub(super) fn event_prefix(&self) -> &'static str {
+        match self {
+            Self::Cn => "wb",
+            Self::BuddyAi => "buddy-ai",
+        }
+    }
+
+    fn lock<'a>(&self, state: &'a AppState) -> std::sync::MutexGuard<'a, ()> {
+        match self {
+            Self::Cn => state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner()),
+            Self::BuddyAi => state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    fn load(&self, state: &AppState) -> WbPool {
+        match self {
+            Self::Cn => load_pool(state),
+            Self::BuddyAi => super::buddy_ai::load_buddy_pool(state),
+        }
+    }
+
+    fn save(&self, state: &AppState, pool: &WbPool) -> Result<(), String> {
+        match self {
+            Self::Cn => save_pool(state, pool),
+            Self::BuddyAi => super::buddy_ai::save_buddy_pool(state, pool),
+        }
+    }
+
+    fn upsert_token(&self, state: &AppState, id: &str, creds: &serde_json::Value) -> Result<(), String> {
+        match self {
+            Self::Cn => upsert_token_store(state, id, creds),
+            Self::BuddyAi => {
+                crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, id, creds)
+            }
+        }
+    }
+}
+
+/// OAuth 主流程（后台线程执行）：进度经 `<prefix>-oauth-progress` 事件推送，结果经 `<prefix>-oauth-done`。
+/// 区域参数化（§4.1）：CN 保持 copilot.tencent.com 链路原样；Intl 按 R-1 实测结果注入
+/// `WbRegionEndpoints::REGION_GLOBAL`（auth_base/workbuddy.ai + platform=workbuddy-ai + version）。
+pub(super) fn oauth_flow(
+    app: &AppHandle,
+    state: &AppState,
+    ep: &'static crate::tasks::wb_common::WbRegionEndpoints,
+    sink: PoolSink,
+) -> Result<(String, String), String> {
+    // API 上游按区域取用：CN = copilot.tencent.com（workbuddy2api main.go:28 同款——打到
+    // www.codebuddy.cn 会拿到与 CLI 登录流程不匹配的裸登录链接）；Intl = www.workbuddy.ai（R-1）
+    let base = ep.auth_base;
+    let web_origin = ep.web_origin;
+    // UA/头模拟官方客户端（CN = CLI 2.63.2 / Intl = WorkBuddy 桌面端身份，R-3 附录 A）；
     // 自造 UA 可能被服务端降级处理
-    const CLIENT_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
+    let client_ua = ep.ua;
+    let intl = ep.platform == "workbuddy-ai";
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
     let mut jar = std::collections::HashMap::new();
+    let progress_event = format!("{}-oauth-progress", sink.event_prefix());
     let emit = |stage: &str, message: &str, auth_url: Option<&str>| {
         let _ = app.emit(
-            "wb-oauth-progress",
+            &progress_event,
             serde_json::json!({ "stage": stage, "message": message, "auth_url": auth_url }),
         );
     };
 
-    // ① 发起：auth/state?platform=CLI
+    // ① 发起：auth/state?platform=<区域 platform>
     emit("init", "正在请求登录 state…", None);
     let mut req = agent
-        .post(&format!("{BASE}/v2/plugin/auth/state?platform=CLI"))
-        .set("User-Agent", CLIENT_UA)
+        .post(&format!("{base}/v2/plugin/auth/state?platform={}", ep.platform))
+        .set("User-Agent", client_ua)
         .set("Accept", "application/json, text/plain, */*")
         .set("X-Requested-With", "XMLHttpRequest")
-        .set("Origin", WEB_ORIGIN)
-        .set("Referer", &format!("{WEB_ORIGIN}/"))
+        .set("Origin", web_origin)
+        .set("Referer", &format!("{web_origin}/"))
         .set("Content-Type", "application/json");
+    if intl {
+        // 附录 B：state 端点匿名四连头（agent2api 同款；与既有 X-No-* 占位机制同源）
+        req = req
+            .set("X-No-Authorization", "true")
+            .set("X-No-User-Id", "true")
+            .set("X-No-Enterprise-Id", "true")
+            .set("X-No-Department-Info", "true");
+    }
     if let Some(c) = oauth_cookie_header(&jar) {
         req = req.set("Cookie", &c);
     }
@@ -173,7 +249,7 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     let state_id = find_state_credential(&body)
         .map(|(_, v)| v)
         .ok_or("auth/state 响应中未找到 state")?;
-    let auth_url = resolve_auth_url(&body, &state_id)?;
+    let auth_url = resolve_auth_url(&body, &state_id, ep)?;
 
     // ② 浏览器打开登录页
     open_in_browser(&auth_url)?;
@@ -192,7 +268,8 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "workbuddy: OAuth auth/state 响应键[{}] data键[{}]，打开登录页 {auth_url}",
+            "{}: OAuth auth/state 响应键[{}] data键[{}]，打开登录页 {auth_url}",
+            if intl { "buddy-ai" } else { "workbuddy" },
             keys_of(&body),
             body.get("data").map(|d| keys_of(d)).unwrap_or_default()
         ),
@@ -211,12 +288,12 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
             emit("polling", "等待登录完成…（最长 300 秒）", None);
         }
         let mut req = agent
-            .get(&format!("{BASE}/v2/plugin/auth/token?state={state_id}"))
-            .set("User-Agent", CLIENT_UA)
+            .get(&format!("{base}/v2/plugin/auth/token?state={state_id}"))
+            .set("User-Agent", client_ua)
             .set("Accept", "application/json, text/plain, */*")
             .set("X-Requested-With", "XMLHttpRequest")
-            .set("Origin", WEB_ORIGIN)
-            .set("Referer", &format!("{WEB_ORIGIN}/"));
+            .set("Origin", web_origin)
+            .set("Referer", &format!("{web_origin}/"));
         if let Some(c) = oauth_cookie_header(&jar) {
             req = req.set("Cookie", &c);
         }
@@ -244,13 +321,16 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     let mut nickname = String::new();
     let mut phone_masked = String::new();
     let mut edition = String::new();
+    // ④ 取账号资料：CN = /v2/plugin/login/account（带 Bearer，workbuddy2api 同款）；
+    // Intl = /v2/plugin/auth/account（R-1 实测国际域单数端点 404 → 静默容错，
+    // uid 走 JWT sub 兜底、账号标识落 billing 侧，与端点矩阵口径一致）
     let mut req = agent
-        .get(&format!("{BASE}/v2/plugin/login/account?state={state_id}"))
-        .set("User-Agent", CLIENT_UA)
+        .get(&format!("{base}{}?state={state_id}", ep.account_path))
+        .set("User-Agent", client_ua)
         .set("Accept", "application/json, text/plain, */*")
         .set("X-Requested-With", "XMLHttpRequest")
-        .set("Origin", WEB_ORIGIN)
-        .set("Referer", &format!("{WEB_ORIGIN}/"))
+        .set("Origin", web_origin)
+        .set("Referer", &format!("{web_origin}/"))
         .set("Authorization", &format!("Bearer {token}"));
     if let Some(c) = oauth_cookie_header(&jar) {
         req = req.set("Cookie", &c);
@@ -281,8 +361,8 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     // 读-改-写互斥：块作用域罩住 load→合并→save 池段，防旧副本整文档覆盖；
     // upsert_token_store 留在锁外，缩短临界区
     let target_id = {
-        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = load_pool(state);
+        let _guard = sink.lock(state);
+        let mut pool = sink.load(state);
         let target_id = if let Some(a) = super::accounts::find_uid_or_id(&mut pool, &uid, &id) {
             if !uid.is_empty() {
                 a.uid = uid.clone();
@@ -314,7 +394,7 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
             });
             id.clone()
         };
-        save_pool(state, &pool)?;
+        sink.save(state, &pool)?;
         target_id
     };
     let creds = serde_json::json!({
@@ -322,8 +402,14 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
         "refresh_token": if refresh_token.is_empty() { None } else { Some(refresh_token) },
         "expires_at_ms": exp_s.map(|s| s * 1000),
     });
-    upsert_token_store(state, &target_id, &creds)?;
-    fs_utils::app_log(&state.data_dir, &format!("workbuddy: OAuth 扫码入池 {target_id}（{nickname}）"));
+    sink.upsert_token(state, &target_id, &creds)?;
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "{}: OAuth 扫码入池 {target_id}（{nickname}）",
+            if intl { "buddy-ai" } else { "workbuddy" }
+        ),
+    );
 
     let label = if nickname.is_empty() { target_id.clone() } else { nickname.clone() };
     emit("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
@@ -333,12 +419,23 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
 /// OAuth 扫码登录（F-50）：后台线程执行全流程，事件驱动 UI；同时仅允许一个流程。
 #[tauri::command(async)]
 pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
+    oauth_login_async(app, &crate::tasks::wb_common::REGION_CN, PoolSink::Cn)
+}
+
+/// 通用异步启动器（CN/Intl 共用 OAUTH_RUNNING 全局闸门，一次仅允许一个流程；
+/// 进度/终态事件按池前缀分流：wb-oauth-* / buddy-ai-oauth-*）
+pub(super) fn oauth_login_async(
+    app: AppHandle,
+    ep: &'static crate::tasks::wb_common::WbRegionEndpoints,
+    sink: PoolSink,
+) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 扫码流程进行中".into());
     }
+    let done_event = format!("{}-oauth-done", sink.event_prefix());
     std::thread::spawn(move || {
-        let payload = match AppState::new().and_then(|st| oauth_flow(&app, &st)) {
+        let payload = match AppState::new().and_then(|st| oauth_flow(&app, &st, ep, sink)) {
             Ok((id, nickname)) => serde_json::json!({
                 "ok": true,
                 "id": id,
@@ -348,7 +445,7 @@ pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
             Err(e) => serde_json::json!({ "ok": false, "message": e }),
         };
         // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
-        crate::events::emit_logged(&app, "wb-oauth-done", payload, None);
+        crate::events::emit_logged(&app, &done_event, payload, None);
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
     });
     Ok(())
@@ -379,20 +476,25 @@ mod oauth_tests {
         serde_json::from_str(json).expect("valid json")
     }
 
+    /// 测试便捷包装：CN 端点形态（与既有断言字面量同源）
+    fn resolve_cn(body: &serde_json::Value, state_id: &str) -> Result<String, String> {
+        resolve_auth_url(body, state_id, &crate::tasks::wb_common::REGION_CN)
+    }
+
     /// ① 服务端 authUrl 已含 state → 原样打开，不补参不构造
     ///    （workbuddy2api `fmt.Println(st.AuthURL)` 同款）；data 信封包裹同样可解析
     #[test]
     fn resolve_auth_url_complete_field_untouched() {
         let body = oauth_body(r#"{"state":"s1","auth_url":"https://login.example/auth?state=tok9"}"#);
         assert_eq!(
-            resolve_auth_url(&body, "s1").unwrap(),
+            resolve_cn(&body, "s1").unwrap(),
             "https://login.example/auth?state=tok9"
         );
         let wrapped = oauth_body(
             r#"{"code":0,"msg":"","data":{"state":"st-1","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=st-1"}}"#,
         );
         assert_eq!(
-            resolve_auth_url(&wrapped, "st-1").unwrap(),
+            resolve_cn(&wrapped, "st-1").unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=st-1"
         );
     }
@@ -404,12 +506,12 @@ mod oauth_tests {
     fn resolve_auth_url_bare_url_replaced_by_canonical_login_link() {
         let body = oauth_body(r#"{"state":"st-123","url":"https://www.codebuddy.cn/login?platform=CLI"}"#);
         assert_eq!(
-            resolve_auth_url(&body, "st-123").unwrap(),
+            resolve_cn(&body, "st-123").unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=st-123"
         );
         let wrapped = oauth_body(r#"{"data":{"authState":"AB-9","authUrl":"https://cb.cn/login"}}"#);
         assert_eq!(
-            resolve_auth_url(&wrapped, "AB-9").unwrap(),
+            resolve_cn(&wrapped, "AB-9").unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=AB-9"
         );
         assert_eq!(find_state_credential(&wrapped).map(|(_, v)| v), Some("AB-9".to_string()));
@@ -420,17 +522,17 @@ mod oauth_tests {
     #[test]
     fn resolve_auth_url_missing_or_invalid_errors() {
         assert_eq!(
-            resolve_auth_url(&oauth_body(r#"{"state":"s1"}"#), "s1").unwrap(),
+            resolve_cn(&oauth_body(r#"{"state":"s1"}"#), "s1").unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=s1"
         );
         // 非法 authUrl（javascript:）视同缺失 → 构造，绝不打开
         assert_eq!(
-            resolve_auth_url(&oauth_body(r#"{"authUrl":"javascript:alert(1)","state":"s1"}"#), "s1").unwrap(),
+            resolve_cn(&oauth_body(r#"{"authUrl":"javascript:alert(1)","state":"s1"}"#), "s1").unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=s1"
         );
         // 入参 state 为空（响应亦无 state 字段可兜底）→ 报错
-        assert!(resolve_auth_url(&oauth_body(r#"{"authUrl":"https://cb.cn/login?state=x"}"#), "").is_err());
-        assert!(resolve_auth_url(&serde_json::json!({}), "  ").is_err());
+        assert!(resolve_cn(&oauth_body(r#"{"authUrl":"https://cb.cn/login?state=x"}"#), "").is_err());
+        assert!(resolve_cn(&serde_json::json!({}), "  ").is_err());
     }
 
     /// ④ OAuth 自动入池的幂等匹配决策（复用 accounts::find_uid_or_id）：

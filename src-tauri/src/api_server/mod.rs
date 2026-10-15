@@ -143,6 +143,13 @@ pub struct ApiSharedState {
     /// Qoder 会话粘性存储（F-80-余 v2）：与 wb_sticky 共用 sticky_bindings 表，
     /// 键命名空间 "q:" 隔离，互不串绑
     pub qoder_sticky: wb_sticky::StickyStore,
+    // ── Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）─────────────────────
+    /// buddy-ai 上游账号池：与 wb 池并列的独立池实例（§3.1 硬约束 1：禁止混居；
+    /// 阶段 1 仅注册 + healthz selectable，dispatch 接线在阶段 2）
+    pub buddy_ai_pool: ApiPool,
+    /// buddy-ai 上游开关（api_pool.json.buddy_ai_enabled；默认关——dispatch
+    /// 「buddy-ai」档显式开启制，由用户在 API 服务页显式开启国际档）
+    pub buddy_ai_enabled: std::sync::atomic::AtomicBool,
     /// Trae 池会话粘性存储（per-pool 会话粘性批次新增）：与 wb/qoder sticky 共用
     /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
     ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
@@ -775,6 +782,8 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
+            buddy_ai_pool: pool::ApiPool::new(),
+            buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         };
         {

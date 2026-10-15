@@ -26,10 +26,12 @@ export type ViewKey =
   | 'qoder-checkin'
   | 'qoder-credits'
   | 'qoder-api-service'
-  | 'qoder-settings';
+  | 'qoder-settings'
+  // BuddyAI 应用页面（buddy-ai 国际版，独立池；应用显示默认不展示）
+  | 'buddyai-home';
 
-/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 */
-export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao';
+/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 / BuddyAI（buddy-ai 国际版） */
+export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao' | 'buddy-ai';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
@@ -37,6 +39,7 @@ export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   buddy: 'buddy-overview',
   qoder: 'qoder-overview',
   doubao: 'doubao-overview',
+  'buddy-ai': 'buddyai-home',
 };
 
 
@@ -471,6 +474,13 @@ export interface Settings {
   hidden_apps: AppKey[];
   /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
   app_icons: Partial<Record<AppKey, string>>;
+  /**
+   * BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）。
+   * 独立于 hidden_apps：存量配置 hidden_apps 已持久化为 []，借道隐藏列表无法
+   * 区分「默认隐藏」与「用户显式取消隐藏」，故用 opt-in 字段；
+   * 系统设置-应用显示面板勾选后生效
+   */
+  buddy_ai_visible: boolean;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

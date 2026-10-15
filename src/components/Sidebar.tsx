@@ -14,6 +14,7 @@ import {
   Bot,
   Boxes,
   LayoutGrid,
+  Globe,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
@@ -61,19 +62,26 @@ const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'qoder-settings', label: '环境配置', icon: Settings },
 ];
 
-/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；qoder = F-80 接入；doubao = 接入中 */
+/** BuddyAI 应用菜单（buddy-ai 国际版独立池，阶段 1 骨架；后续阶段扩展子页） */
+const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'buddyai-home', label: '概述', icon: LayoutDashboard },
+];
+
+/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；qoder = F-80 接入；doubao = 接入中；
+ *  buddy-ai = 国际版独立池（默认隐藏，系统设置-应用显示 opt-in） */
 export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
   { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（IDE / Work / CLI）' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
+  { key: 'buddy-ai', label: 'BuddyAI', icon: Globe, title: 'Buddy 国际版（buddy-ai 独立池）' },
 ];
 
 /** 全部合法应用 key（settings 脏值兜底用） */
 export const APP_KEYS = APP_TABS.map((t) => t.key);
 
 /** 栅格列数必须使用字面量，Tailwind JIT 才能扫描生成 */
-const GRID_COLS = ['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4'] as const;
+const GRID_COLS = ['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4', 'grid-cols-5'] as const;
 
 export default function Sidebar({
   view,
@@ -91,10 +99,20 @@ export default function Sidebar({
   const [showSystem, setShowSystem] = useState(false);
 
   // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤。
-  // pinned 非法/缺失回退 trae（后端 state.rs 已归一，此处对前端旧缓存双保险）
-  const pinnedApp = (APP_KEYS.includes(settings?.pinned_app as AppKey) ? settings?.pinned_app : 'trae') as AppKey;
+  // pinned 非法/缺失回退 trae（后端 state.rs 已归一，此处对前端旧缓存双保险）；
+  // buddy-ai（国际版）不参与固定应用、默认隐藏，仅 settings.buddy_ai_visible = true 时显示
+  const pinnedApp = (
+    APP_KEYS.includes(settings?.pinned_app as AppKey) && settings?.pinned_app !== 'buddy-ai'
+      ? settings?.pinned_app
+      : 'trae'
+  ) as AppKey;
   const hiddenApps = settings?.hidden_apps ?? [];
-  const visibleTabs = APP_TABS.filter((t) => t.key === pinnedApp || !hiddenApps.includes(t.key));
+  const visibleTabs = APP_TABS.filter(
+    (t) =>
+      t.key === pinnedApp ||
+      (t.key === 'buddy-ai' && settings?.buddy_ai_visible === true) ||
+      (t.key !== 'buddy-ai' && !hiddenApps.includes(t.key)),
+  );
 
   // 当前激活应用被隐藏（或固定项变更）时自动回落固定应用主页，避免停留在无 Tab 的应用
   useEffect(() => {
@@ -104,7 +122,7 @@ export default function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeApp, pinnedApp, settings?.hidden_apps]);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）；BuddyAI → 概述
   const nav =
     activeApp === 'doubao'
       ? DOUBAO_NAV
@@ -112,6 +130,8 @@ export default function Sidebar({
       ? BUDDY_NAV
       : activeApp === 'qoder'
       ? QODER_NAV
+      : activeApp === 'buddy-ai'
+      ? BUDDYAI_NAV
       : NAV;
 
   // 主题轮询：每次点击切换到下一个主题并持久化

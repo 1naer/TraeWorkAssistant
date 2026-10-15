@@ -212,6 +212,117 @@ pub fn token_store_upsert_secure(
     })
 }
 
+// ── buddy-ai（国际版）token store：独立表 + 独立 vault 命名空间 ──────────────
+//
+// §3.4 隔离清单：与 wb 池零共享（表 / vault ns 双维度隔离）；secure 收敛口径
+// （敏感字段进 vault、DB 占位）与 wb 侧完全一致，仅表名/命名空间参数化。
+
+/// buddy-ai token store 表名（schema.rs ROW_TABLES 白名单内）
+pub const BUDDY_AI_TOKEN_TABLE: &str = "buddy_ai_tokens";
+/// buddy-ai vault 命名空间（与 wb 池 "wb" 隔离）
+pub const BUDDY_AI_VAULT_NS: &str = "buddy-ai";
+
+/// 通用 secure 读取（table + vault ns 参数化）：与 token_store_load_secure 同口径
+fn token_store_load_secure_in(data_dir: &std::path::Path, table: &str, ns: &str) -> Value {
+    let mut store = crate::store::docs::token_store_load(table, &crate::store::db(data_dir));
+    let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return store;
+    };
+    for (id, rec) in tokens.iter_mut() {
+        let Some(rm) = rec.as_object_mut() else { continue };
+        let Some(sec) = crate::vault::ns_get(data_dir, ns, id) else { continue };
+        let acc = sec.get("access_token").and_then(Value::as_str).unwrap_or("");
+        let rt = sec.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+        let mut has_access_key = false;
+        let mut has_refresh_key = false;
+        for k in TOKEN_SENSITIVE_KEYS {
+            let is_access = k.ends_with("ccess_token");
+            let val = if is_access { acc } else { rt };
+            if !rm.contains_key(k) {
+                continue;
+            }
+            if is_access {
+                has_access_key = true;
+            } else {
+                has_refresh_key = true;
+            }
+            if !val.is_empty()
+                && rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty())
+            {
+                rm.insert(k.to_string(), serde_json::json!(val));
+            }
+        }
+        if !acc.is_empty() && !has_access_key {
+            rm.insert("access_token".into(), serde_json::json!(acc));
+        }
+        if !rt.is_empty() && !has_refresh_key {
+            rm.insert("refresh_token".into(), serde_json::json!(rt));
+        }
+    }
+    store
+}
+
+/// 通用 secure upsert（table + vault ns 参数化）：与 token_store_upsert_secure 同口径
+fn token_store_upsert_secure_in(
+    data_dir: &std::path::Path,
+    table: &str,
+    ns: &str,
+    id: &str,
+    rec: &Value,
+) -> Result<(), String> {
+    let mut rec = rec.clone();
+    let Some(rm) = rec.as_object_mut() else {
+        return crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec);
+    };
+    let mut acc = String::new();
+    let mut rt = String::new();
+    for k in TOKEN_SENSITIVE_KEYS {
+        let v = rm.get(k).and_then(Value::as_str).unwrap_or("");
+        if v.is_empty() {
+            continue;
+        }
+        if k.ends_with("ccess_token") {
+            acc = v.to_string();
+        } else {
+            rt = v.to_string();
+        }
+    }
+    let vault_result = if acc.is_empty() && rt.is_empty() {
+        Ok(())
+    } else {
+        let mut entry = crate::vault::ns_get(data_dir, ns, id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !acc.is_empty() {
+            entry["access_token"] = serde_json::json!(acc);
+        }
+        if !rt.is_empty() {
+            entry["refresh_token"] = serde_json::json!(rt);
+        }
+        crate::vault::ns_set(data_dir, ns, id, &entry)
+    };
+    for k in TOKEN_SENSITIVE_KEYS {
+        if rm.contains_key(k) {
+            rm.insert(k.to_string(), serde_json::json!(""));
+        }
+    }
+    crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec)?;
+    vault_result.map_err(|e| format!("凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}"))
+}
+
+/// buddy-ai token store 读取（vault 回填，仅内存不落明文）
+pub fn buddy_ai_token_store_load(data_dir: &std::path::Path) -> Value {
+    token_store_load_secure_in(data_dir, BUDDY_AI_TOKEN_TABLE, BUDDY_AI_VAULT_NS)
+}
+
+/// buddy-ai token store 单账号 UPSERT（敏感字段进 buddy-ai vault 命名空间，DB 占位）
+pub fn buddy_ai_token_store_upsert(
+    data_dir: &std::path::Path,
+    id: &str,
+    rec: &Value,
+) -> Result<(), String> {
+    token_store_upsert_secure_in(data_dir, BUDDY_AI_TOKEN_TABLE, BUDDY_AI_VAULT_NS, id, rec)
+}
+
 /// 生效凭证 = token store 与 auth 文件中 expiresAtMs 更晚者（F-10 谁新用谁）。
 /// auth 文件仅当其 uid 与账号匹配时参与双源比较（桌面当前登录态）。
 /// 读 token store（SQLite 化 P3：wb_tokens 表；结构 {version, tokens:{id:rec}}）。
@@ -492,6 +603,92 @@ pub fn billing_bases(domain: &str) -> [&'static str; 2] {
         BILLING_BASE_CN
     };
     [main, alt]
+}
+
+// ── 区域端点结构体（buddy-ai 国际版，阶段 1 开工项）────────────────────────
+//
+// 《Buddy国际版支持落地方案.md》§4.1：从硬编码提升为 WbRegionEndpoints，
+// CN/Global 两份静态实例。Gate 阻塞层已全部实测收口（2026-10-15，§5）：
+// R-1 OAuth 全链路 / R-2a refresh / R-3 身份 / R-6 billing 字段同构。
+// 身份基座 = WorkBuddy 桌面端身份（§8-1 推荐候选：模型目录最全 51 个、
+// 两外部项目长期实证）；UA/版本号单点维护，版本更新仅改常量。
+
+/// 区域端点集（常量仅承载，不接线；阶段 2 网关转发按账号 region 分流——
+/// chat/refresh/billing 三字段届时由 wb_upstream/wb_common 消费，当前仅 auth 链读用）
+#[allow(dead_code)]
+pub struct WbRegionEndpoints {
+    /// chat 网关 base（/v2/chat/completions）
+    pub chat_base: &'static str,
+    /// OAuth 三件套 base（auth/state → auth/token → login/account）
+    pub auth_base: &'static str,
+    /// authUrl 缺失/不完整时的登录页构造 base（resolve_auth_url 回退形态）
+    pub login_base: &'static str,
+    /// auth/state platform 参数——国际版的灵魂差异（附录 B 修正 3：必须纳入字段）
+    pub platform: &'static str,
+    /// OAuth 请求 Origin/Referer（CN=www.codebuddy.cn / Intl=www.workbuddy.ai）
+    pub web_origin: &'static str,
+    /// OAuth ④ 步账号资料端点路径（R-1：国际域单数 `/v2/plugin/auth/account` 404，
+    /// 账号标识走 JWT sub 兜底；CN 为 `/v2/plugin/login/account`）
+    pub account_path: &'static str,
+    /// token refresh base（/v2/plugin/auth/token/refresh 前缀）
+    pub refresh_base: &'static str,
+    /// billing/meter base
+    pub billing_base: &'static str,
+    /// 出站身份 UA（桌面腿）
+    pub ua: &'static str,
+    /// 客户端版本（authUrl version 参数，R-1：官方桌面端实证 5.7.6；可选参数）
+    pub client_version: &'static str,
+}
+
+/// CN 区（现状，不动）：国内 CLI 身份（SaaS + platform=CLI）——该身份不可平移国际区
+pub const REGION_CN: WbRegionEndpoints = WbRegionEndpoints {
+    chat_base: "https://copilot.tencent.com",
+    auth_base: "https://copilot.tencent.com",
+    login_base: "https://copilot.tencent.com",
+    platform: "CLI",
+    web_origin: "https://www.codebuddy.cn",
+    account_path: "/v2/plugin/login/account",
+    refresh_base: "https://www.codebuddy.cn",
+    billing_base: BILLING_BASE_CN,
+    ua: "CLI/2.63.2 CodeBuddy/2.63.2",
+    client_version: "",
+};
+
+/// Global 区（buddy-ai）：workbuddy.ai 单一鉴权门面（R-9 实锤两域同账号体系，无双门面）
+pub const REGION_GLOBAL: WbRegionEndpoints = WbRegionEndpoints {
+    chat_base: "https://www.workbuddy.ai",
+    auth_base: "https://www.workbuddy.ai",
+    login_base: "https://www.workbuddy.ai",
+    platform: "workbuddy-ai",
+    web_origin: "https://www.workbuddy.ai",
+    account_path: "/v2/plugin/auth/account",
+    refresh_base: "https://www.workbuddy.ai",
+    billing_base: BILLING_BASE_GLOBAL,
+    // R-3 附录 A：桌面端身份 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`
+    ua: "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1",
+    // R-1：官方桌面端 authUrl 实证带 version=5.7.6（比 UA 基准 5.5.2 新，跟进官方）
+    client_version: "5.7.6",
+};
+
+/// 区域端点取用（唯一入口，杜绝散落硬编码；阶段 2 网关转发接线时启用）
+#[allow(dead_code)]
+pub fn region_endpoints(global_region: bool) -> &'static WbRegionEndpoints {
+    if global_region {
+        &REGION_GLOBAL
+    } else {
+        &REGION_CN
+    }
+}
+
+/// token refresh URL 按区域收敛（G-2）：三处硬编码统一到本函数。
+/// R-2a 实测收口（2026-10-15）：`www.workbuddy.ai/v2/plugin/auth/token/refresh` code 0，
+/// `X-Auth-Refresh-Source` 取 plugin / workbuddy 均接受，refreshToken 每次轮换（回写为准）。
+pub fn region_refresh_url(domain: &str) -> &'static str {
+    if is_global_region(domain) {
+        "https://www.workbuddy.ai/v2/plugin/auth/token/refresh"
+    } else {
+        REFRESH_URL
+    }
 }
 
 // ── token 刷新（F-09）──────────────────────────────────────────────────────

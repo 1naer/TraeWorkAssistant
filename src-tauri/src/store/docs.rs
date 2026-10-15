@@ -1445,6 +1445,85 @@ pub fn wb_token_store_save_version(s: &Store, version: i64) -> Result<(), String
     s.kv_set_raw("wb_tokens_meta", &version.to_string())
 }
 
+// ── 行文档表泛化原语（token store 通用化：wb / buddy-ai 双命名空间复用）──────
+
+/// 任意 token store 表读取（结构 {version, tokens: {id: rec}}；损坏行过滤）
+pub fn token_store_load(table: &str, s: &Store) -> Value {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all(table)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let meta_key = format!("{table}_meta");
+    let version = s.kv_get_raw(&meta_key).and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 任意 token store 表单账号 UPSERT
+pub fn token_store_upsert(s: &Store, table: &str, id: &str, rec: &Value) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    s.row_upsert(table, id, rec)
+}
+
+/// 任意 token store 表删除单账号（迁移/移除路径）
+pub fn token_store_remove(s: &Store, table: &str, id: &str) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    s.row_delete(table, id)
+}
+
+/// 任意 token store 表整库替换（version 闸门由调用方维持；buddy-ai 迁移/阶段 2 接线用）
+#[allow(dead_code)]
+pub fn token_store_save(table: &str, s: &Store, store_val: &Value) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> =
+        tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace(table, &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw(&format!("{table}_meta"), &v.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Buddy 国际版（buddy-ai）独立池（buddy_ai_accounts / buddy_ai_tokens 表）──
+//
+// §3.4 隔离清单：与 wb 池零共享；账号结构与 WorkBuddyAccount serde 同构
+//（复用序列化形态，落库表独立）。
+
+/// 读 buddy-ai 整池（结构 {accounts: [...]}）
+pub fn buddy_ai_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("buddy_ai_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 写 buddy-ai 整池（pk = 账号 id，缺 id 用序号占位，语义同 wb_pool_save）
+pub fn buddy_ai_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("buddy_ai_accounts", &rows)
+}
+
 // ── API 用量（api_usage.json → api_usage 表，(bucket, day) 行文档）───────────
 
 fn bucket_name(b: UsageBucket) -> &'static str {

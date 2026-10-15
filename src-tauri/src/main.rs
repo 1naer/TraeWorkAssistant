@@ -344,6 +344,12 @@ fn main() {
             commands::workbuddy::workbuddy_accounts_export,
             commands::workbuddy::workbuddy_accounts_import,
             commands::workbuddy::workbuddy_oauth_login,
+            // Buddy 国际版（buddy-ai）独立池（阶段 1）
+            commands::workbuddy::buddy_ai_oauth_login,
+            commands::workbuddy::buddy_ai_account_import_creds,
+            commands::workbuddy::buddy_ai_accounts_list,
+            commands::workbuddy::buddy_ai_account_remove,
+            commands::workbuddy::buddy_ai_refresh_token,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,
@@ -662,6 +668,15 @@ fn main() {
                 let app2 = app.handle().clone();
                 let st = app.state::<AppState>();
                 commands::workbuddy::startup_auto_checkin(&app2, &st);
+            }
+
+            // buddy-ai 存量迁移（§4.7）：wb 池混居的 global_region=true 账号一次性
+            // 迁入 buddy-ai 独立池（kv 标记幂等；失败不置位下次重试，不阻断启动）
+            {
+                let st = app.state::<AppState>();
+                if let Err(e) = commands::workbuddy::migrate_wb_global_accounts(&st) {
+                    fs_utils::app_log(&st.data_dir, &format!("buddy-ai: 存量迁移失败（下次启动重试）: {e}"));
+                }
             }
 
             // Qoder 启动自动补签（F-80，F-55 同款模式）：独立开关，与 WB 补签互不影响
