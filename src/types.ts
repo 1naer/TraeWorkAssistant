@@ -481,6 +481,12 @@ export interface Settings {
    * 系统设置-应用显示面板勾选后生效
    */
   buddy_ai_visible: boolean;
+  /** buddy-ai 每日活跃打卡调度开关（默认关，国际档显式开启制） */
+  buddy_ai_checkin_enabled: boolean;
+  /** buddy-ai 打卡调度时刻 HH:MM（默认 09:20） */
+  buddy_ai_checkin_hhmm: string;
+  /** buddy-ai 打卡多账号间隔秒（默认 3，0 = 关闭） */
+  buddy_ai_checkin_gap_secs: number | null;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

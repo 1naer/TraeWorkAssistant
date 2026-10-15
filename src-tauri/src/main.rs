@@ -352,6 +352,9 @@ fn main() {
             commands::workbuddy::buddy_ai_accounts_list,
             commands::workbuddy::buddy_ai_account_remove,
             commands::workbuddy::buddy_ai_refresh_token,
+            // Buddy 国际版每日活跃打卡（阶段 3b）
+            commands::workbuddy::buddy_ai_checkin_start,
+            commands::workbuddy::buddy_ai_credits_fetch,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,
@@ -679,6 +682,14 @@ fn main() {
                 if let Err(e) = commands::workbuddy::migrate_wb_global_accounts(&st) {
                     fs_utils::app_log(&st.data_dir, &format!("buddy-ai: 存量迁移失败（下次启动重试）: {e}"));
                 }
+            }
+
+            // buddy-ai 启动打卡补跑（阶段 3b，对齐 startup_auto_checkin 形态；
+            // 独立开关 buddy_ai_checkin_enabled 默认关，抢不到轮次锁幂等跳过）
+            {
+                let app2 = app.handle().clone();
+                let st = app.state::<AppState>();
+                commands::workbuddy::startup_auto_checkin_buddy_ai(&app2, &st);
             }
 
             // Qoder 启动自动补签（F-80，F-55 同款模式）：独立开关，与 WB 补签互不影响

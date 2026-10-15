@@ -261,6 +261,10 @@ function defaultSettings(): Settings {
     hidden_apps: [],
     app_icons: {},
     buddy_ai_visible: false,
+    // buddy-ai 每日活跃打卡（阶段 3b）：调度开关默认关（显式开启制）、时刻 09:20、间隔 3s
+    buddy_ai_checkin_enabled: false,
+    buddy_ai_checkin_hhmm: '09:20',
+    buddy_ai_checkin_gap_secs: 3,
     // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到）；
     // 积分数据同步与 Buddy/Trae 同款四模式（默认 every_hours 每2小时，daily 时刻 23:40）
     qoder_ide_path: null,
@@ -764,6 +768,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       // BuddyAI 显示开关缺省归一为 false（默认不展示）
       settings.buddy_ai_visible = settings.buddy_ai_visible === true;
+      // buddy-ai 打卡配置归一（开关默认关；时刻零值回填 09:20，与后端 state.rs 同口径）
+      settings.buddy_ai_checkin_enabled = settings.buddy_ai_checkin_enabled === true;
+      if (!settings.buddy_ai_checkin_hhmm?.trim()) settings.buddy_ai_checkin_hhmm = '09:20';
+      settings.buddy_ai_checkin_gap_secs =
+        typeof settings.buddy_ai_checkin_gap_secs === 'number' ? settings.buddy_ai_checkin_gap_secs : 3;
       // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {

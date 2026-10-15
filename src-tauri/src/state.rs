@@ -284,6 +284,10 @@ impl AppState {
         if s.wb_checkin_hhmm.trim().is_empty() {
             s.wb_checkin_hhmm = "09:10".into();
         }
+        // buddy-ai 打卡时刻零值回填（Settings::default 路径 String=""）
+        if s.buddy_ai_checkin_hhmm.trim().is_empty() {
+            s.buddy_ai_checkin_hhmm = "09:20".into();
+        }
         // Trae 每日签到时刻零值回填（默认 09:00；签到恒开无独立开关）
         if s.trae_checkin_hhmm.trim().is_empty() {
             s.trae_checkin_hhmm = "09:00".into();

@@ -438,6 +438,10 @@ export const api = {
     accountRemove: (userId: string) => invoke('buddy_ai_account_remove', { userId }),
     /** 凭证续期（R-2a 实测端点，rt 轮换回写；失败按暂态不标 needs_relogin） */
     refreshToken: (userId: string) => invoke<string>('buddy_ai_refresh_token', { userId }),
+    /** 每日活跃打卡（手动触发；进度经 buddy-ai-checkin-progress NDJSON 推送） */
+    checkinStart: () => invoke<void>('buddy_ai_checkin_start'),
+    /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
+    creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
   },
   // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
   workbuddy: {

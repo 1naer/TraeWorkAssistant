@@ -12,7 +12,7 @@
 //! - R-9：workbuddy.ai ↔ codebuddy.ai 同一账号体系，单一鉴权门面即可。
 
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -26,6 +26,47 @@ use super::oauth::{oauth_login_async, PoolSink};
 pub(super) fn load_buddy_pool(state: &AppState) -> WbPool {
     let v = crate::store::docs::buddy_ai_pool_load(&crate::store::db(&state.data_dir));
     serde_json::from_value(v).unwrap_or_default()
+}
+
+/// 跨 crate 模块（tasks/buddy_ai_checkin）访问的公开包装（读-改-写调用方自带池锁）
+pub(crate) fn load_buddy_pool_pub(state: &AppState) -> WbPool {
+    load_buddy_pool(state)
+}
+
+/// 跨 crate 模块访问的公开包装
+pub(crate) fn save_buddy_pool_pub(state: &AppState, pool: &WbPool) -> Result<(), String> {
+    save_buddy_pool(state, pool)
+}
+
+/// buddy-ai 池账号花名册（跨模块 tasks/buddy_ai_checkin 消费；WbPool 字段
+/// pub(super) 不对 tasks 暴露，经此 helper 交出 (id, 展示名, uid) 三元组）
+pub(crate) fn buddy_pool_roster(state: &AppState) -> Vec<(String, String, String)> {
+    load_buddy_pool(state)
+        .accounts
+        .iter()
+        .map(|a| (a.id.clone(), if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() }, a.uid.clone()))
+        .collect()
+}
+
+/// buddy-ai 池单账号积分快照回写（持 buddy_ai_pool_lock 短临界区；三键口径
+/// 对齐 write_back_pool_balances：balance / fetched_at / 最早未来到期）
+pub(crate) fn buddy_pool_write_credits(
+    state: &AppState,
+    acct_id: &str,
+    balance: f64,
+    expire_secs: Option<i64>,
+) -> Result<(), String> {
+    let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = load_buddy_pool(state);
+    let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct_id) else {
+        return Ok(()); // 账号已移除（打卡期间竞态）：静默丢弃
+    };
+    a.credits_balance = Some(balance);
+    a.credits_fetched_at = Some(chrono::Utc::now().to_rfc3339());
+    if expire_secs.is_some() {
+        a.credits_expire_at = expire_secs; // 秒级时间戳（WorkBuddyAccount 口径）
+    }
+    save_buddy_pool(state, &pool)
 }
 
 pub(super) fn save_buddy_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
@@ -337,6 +378,196 @@ pub fn buddy_ai_refresh_token(state: State<'_, AppState>, user_id: String) -> Re
 
 const MIGRATION_MARKER: &str = "buddy_ai_pool_migrated_v1";
 const MIGRATION_BACKUP_KEY: &str = "buddy_ai_migration_backup";
+
+// ── 每日活跃打卡（阶段 3b，§4.5 补篇）：NDJSON 进度管线 + 积分同步命令 ──────
+
+/// 打卡整轮轮次互斥（独立于 WB_ROUND_LOCK——不与国内签到互斥，两池零交织）。
+/// AtomicBool CAS 而非 MutexGuard：guard 不能跨 thread::spawn 移动（!Send），
+/// 忙标志由各执行线程 finally 复位
+static BUDDY_AI_ROUND_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 抢打卡轮次（调度器 run_task / 启动钩子 / UI 命令三路复用；CAS 幂等语义）
+pub(crate) fn try_acquire_buddy_ai_round() -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    BUDDY_AI_ROUND_BUSY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| ())
+        .map_err(|_| "已有 buddy-ai 打卡任务在执行中".to_string())
+}
+
+/// 释放打卡轮次（执行线程收尾调用；调度器 skipped_busy 路径不涉及）
+fn release_buddy_ai_round() {
+    BUDDY_AI_ROUND_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// buddy-ai 每日活跃打卡启动（手动触发，UI 进度经 buddy-ai-checkin-progress NDJSON 推送）
+#[tauri::command(async)]
+pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
+    // 轮次互斥：CAS 抢占（运行中重复点击显式拒绝）
+    try_acquire_buddy_ai_round()?;
+    std::thread::spawn(move || {
+        let st = AppState::new();
+        let payload = match st {
+            Ok(st) => {
+                let mut events: Vec<Value> = Vec::new();
+                let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, &mut |ev| {
+                    // NDJSON 契约对齐 wb-checkin：payload 为序列化 JSON 字符串
+                    let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(ev).unwrap_or_default());
+                    events.push(ev.clone());
+                });
+                // 汇总落日志（含单账号明细，排查打卡失败形态）
+                fs_utils::app_log(
+                    &st.data_dir,
+                    &format!(
+                        "buddy-ai: 活跃打卡整轮完成——ok={} already={} failed={} {}",
+                        done.get("ok").and_then(Value::as_i64).unwrap_or(0),
+                        done.get("already").and_then(Value::as_i64).unwrap_or(0),
+                        done.get("failed").and_then(Value::as_i64).unwrap_or(0),
+                        events.iter().filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                            .map(|e| format!("{}({})", e.get("id").and_then(Value::as_str).unwrap_or("?"), e.get("message").and_then(Value::as_str).unwrap_or("")))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                );
+                done
+            }
+            Err(e) => json!({ "type": "done", "ok": 0, "already": 0, "failed": 1, "message": e }),
+        };
+        let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(&json!({"type":"exit"})).unwrap_or_default());
+        let _ = payload;
+        release_buddy_ai_round();
+    });
+    Ok(())
+}
+
+/// buddy-ai 积分同步（阶段 3b Intl 化）：全池账号 get-user-resource（R-6 字段链
+/// TotalDosage）→ 回写池 credits 三键（buddy_ai_pool_lock 短临界区）→ 返回刷新后视图。
+/// 手动触发与调度器看板同步共用解析 fn（fetch_total_dosage）。
+#[tauri::command(async)]
+pub fn buddy_ai_credits_fetch(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let agent = crate::tasks::http_agent(30);
+    let pool = load_buddy_pool(&state);
+    let tokens = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
+        .get("tokens")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for a in &pool.accounts {
+        let rec = tokens.get(&a.id).cloned().unwrap_or_default();
+        let token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default().to_string();
+        if token.is_empty() {
+            continue;
+        }
+        let uid = if a.uid.is_empty() {
+            as_str(fs_utils::dig(&rec, &["uid"])).unwrap_or_default().to_string()
+        } else {
+            a.uid.clone()
+        };
+        let base = crate::tasks::wb_common::region_activity_base(&intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"]))));
+        let snap = crate::tasks::buddy_ai_checkin::fetch_total_dosage(&agent, base, &token, &uid);
+        out.push((a.id.clone(), snap));
+    }
+    // 短临界区回写快照三键
+    {
+        let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = load_buddy_pool(&state);
+        let now = chrono::Utc::now().to_rfc3339();
+        for (id, snap) in &out {
+            if let Some(a) = pool.accounts.iter_mut().find(|a| &a.id == id) {
+                if let Some((total, expire)) = snap {
+                    a.credits_balance = Some(*total);
+                    a.credits_fetched_at = Some(now.clone());
+                    if expire.is_some() {
+                        a.credits_expire_at = *expire; // 秒级时间戳
+                    }
+                }
+            }
+        }
+        save_buddy_pool(&state, &pool)?;
+    }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "buddy-ai: 积分同步完成——{} 账号，{} 成功取数",
+            out.len(),
+            out.iter().filter(|(_, s)| s.is_some()).count()
+        ),
+    );
+    // 返回刷新后的账号视图（前端直接替换列表，免二次拉取）
+    let pool = load_buddy_pool(&state);
+    let tokens2 = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
+        .get("tokens")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Ok(pool
+        .accounts
+        .iter()
+        .map(|a| {
+            let rec = tokens2.get(&a.id).cloned().unwrap_or_default();
+            json!({
+                "id": a.id, "uid": a.uid, "nickname": a.nickname, "note": a.note,
+                "group_id": a.group_id,
+                "access_token_expires_at": a.access_token_expires_at,
+                "refresh_token_expires_at": a.refresh_token_expires_at,
+                "auth_saved_at": a.auth_saved_at,
+                "needs_relogin": a.needs_relogin, "relogin_reason": a.relogin_reason,
+                "credits_balance": a.credits_balance, "credits_expire_at": a.credits_expire_at,
+                "credits_fetched_at": a.credits_fetched_at,
+                "has_credential": rec.get("access_token").and_then(Value::as_str).map(|t| !t.is_empty()).unwrap_or(false),
+                "domain": rec.get("domain").and_then(Value::as_str).unwrap_or("www.workbuddy.ai"),
+            })
+        })
+        .collect())
+}
+
+/// buddy-ai 打卡调度开关（scheduler enabled 分支用）
+pub(crate) fn buddy_ai_checkin_enabled(state: &AppState) -> bool {
+    state.settings().buddy_ai_checkin_enabled
+}
+
+/// 启动打卡补跑（对齐 startup_auto_checkin 形态）：60s 延迟 → 抢轮次锁 →
+/// 整轮静默执行 → 汇总落日志；失败 push_notify（main.rs 启动钩子调用）
+pub fn startup_auto_checkin_buddy_ai(app: &tauri::AppHandle, state: &AppState) {
+    if !state.settings().buddy_ai_checkin_enabled {
+        return;
+    }
+    let app2 = app.clone();
+    let data_dir = state.data_dir.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        // 抢不到轮次锁（UI 手动打卡在跑）= 幂等跳过
+        let Ok(_guard) = try_acquire_buddy_ai_round() else {
+            return;
+        };
+        let st = AppState::new();
+        let Ok(st) = st else { return };
+        let mut events: Vec<Value> = Vec::new();
+        let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, &mut |ev| events.push(ev.clone()));
+        let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+        let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+        fs_utils::app_log(
+            &data_dir,
+            &format!("buddy-ai: 启动补跑活跃打卡——ok={ok} already={} failed={failed}",
+                done.get("already").and_then(Value::as_i64).unwrap_or(0)),
+        );
+        if failed > 0 {
+            let names: Vec<String> = events
+                .iter()
+                .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                .map(|e| e.get("name").and_then(Value::as_str).unwrap_or("?").to_string())
+                .collect();
+            crate::commands::workbuddy::push_notify(
+                Some(&app2),
+                &data_dir,
+                "Buddy 国际版打卡",
+                &format!("{} 个账号打卡失败：{}", failed, names.join("、")),
+                crate::notify::NotifyEvent::TaskFail,
+            );
+        }
+    });
+}
 
 /// 启动迁移（幂等，kv 标记置位后不重跑）：
 /// 1. 扫 wb 池 + wb token store（secure 回填），token rec `domain` 含 `.workbuddy.ai`

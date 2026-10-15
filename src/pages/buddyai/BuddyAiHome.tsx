@@ -187,6 +187,8 @@ export default function BuddyAiHome() {
 
   return (
     <div className="mx-auto max-w-5xl pt-6">
+      <BuddyAiCheckinCard onChanged={refresh} />
+
       {/* 页头：标题 + 操作（登录 / 导入 / 刷新） */}
       <div className="mb-4 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -414,6 +416,173 @@ export default function BuddyAiHome() {
           </div>
         ) : null}
       </Modal>
+    </div>
+  );
+}
+
+/**
+ * 每日活跃打卡卡（阶段 3b）：开关/时刻/间隔配置 + 手动触发 + NDJSON 进度 + 积分同步。
+ * 打卡机制见 tasks/buddy_ai_checkin.rs 模块注释（网页会话 + 沙箱 ACP，无 claim 端点）。
+ */
+function BuddyAiCheckinCard({ onChanged }: { onChanged: () => Promise<void> | void }) {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const settings = useAppStore((s) => s.settings);
+  const [enabled, setEnabled] = useState(false);
+  const [hhmm, setHhmm] = useState('09:20');
+  const [gap, setGap] = useState(3);
+  const [saving, setSaving] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [lines, setLines] = useState<string[]>([]);
+  const [syncing, setSyncing] = useState(false);
+
+  // 设置回填（settings store 加载后一次性同步本地表单）
+  useEffect(() => {
+    if (settings) {
+      setEnabled(settings.buddy_ai_checkin_enabled === true);
+      setHhmm(settings.buddy_ai_checkin_hhmm?.trim() || '09:20');
+      setGap(typeof settings.buddy_ai_checkin_gap_secs === 'number' ? settings.buddy_ai_checkin_gap_secs : 3);
+    }
+  }, [settings]);
+
+  const saveConfig = async (patch: { enabled?: boolean } = {}) => {
+    setSaving(true);
+    try {
+      await withMinDelay(
+        api.misc.settingsSet({
+          buddy_ai_checkin_enabled: patch.enabled ?? enabled,
+          buddy_ai_checkin_hhmm: hhmm.trim() || '09:20',
+          buddy_ai_checkin_gap_secs: gap,
+        }),
+        400,
+      );
+      pushToast('success', patch.enabled !== undefined
+        ? (patch.enabled ? '已开启每日活跃打卡（按调度时刻自动执行）' : '已关闭每日活跃打卡')
+        : '打卡配置已保存');
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err).slice(0, 120)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 打卡进度事件（NDJSON 契约对齐 BuddyCheckin：payload 为序列化 JSON 字符串）
+  useEffect(() => {
+    if (!running) return;
+    const un = listen<string>('buddy-ai-checkin-progress', (ev) => {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(ev.payload);
+      } catch {
+        return;
+      }
+      if (parsed.type === 'start') {
+        setLines([`开始打卡（共 ${parsed.total} 个账号）…`]);
+      } else if (parsed.type === 'done') {
+        setLines((prev) => [
+          ...prev,
+          `整轮完成：成功 ${parsed.ok} / 已完成 ${parsed.already} / 失败 ${parsed.failed}`,
+        ]);
+      } else if (parsed.index) {
+        setLines((prev) => [...prev, `#${parsed.index} ${parsed.name ?? ''}：${parsed.status ?? ''} — ${parsed.message ?? ''}`]);
+      } else if (parsed.type === 'exit') {
+        setRunning(false);
+      }
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [running]);
+
+  const startCheckin = async () => {
+    if (running) return;
+    setRunning(true);
+    setLines([]);
+    try {
+      await api.buddyai.checkinStart();
+    } catch (err) {
+      setRunning(false);
+      pushToast('error', `发起打卡失败：${String(err).slice(0, 120)}`);
+    }
+  };
+
+  const syncCredits = async () => {
+    setSyncing(true);
+    try {
+      const n = await withMinDelay(api.buddyai.creditsFetch(), 800);
+      pushToast('success', `积分已同步（${n.filter((a) => a.credits_balance != null).length} 个账号取数成功）`);
+      await onChanged();
+    } catch (err) {
+      pushToast('error', `积分同步失败：${String(err).slice(0, 120)}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  return (
+    <div className="card mt-4 p-4">
+      <div className="mb-2 flex items-center gap-2">
+        <Coins size={15} className="text-brand-500" />
+        <span className="text-sm font-medium">每日活跃打卡</span>
+        {enabled ? <Badge tone="green">已开启</Badge> : <Badge tone="amber">未开启</Badge>}
+        <span className="text-xs text-slate-400">网页会话 + 沙箱跑一轮对话，服务端自动入账 30/50 积分</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="flex cursor-pointer items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => {
+              setEnabled(e.target.checked);
+              void saveConfig({ enabled: e.target.checked });
+            }}
+          />
+          每日自动打卡
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-slate-500">
+          时刻
+          <input
+            className="w-20 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+            value={hhmm}
+            onChange={(e) => setHhmm(e.target.value)}
+            onBlur={() => void saveConfig()}
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-slate-500">
+          账号间隔
+          <input
+            type="number"
+            min={0}
+            max={600}
+            className="w-16 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+            value={gap}
+            onChange={(e) => setGap(Number(e.target.value))}
+            onBlur={() => void saveConfig()}
+          />
+          秒
+        </label>
+        <button
+          className="btn-primary inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+          disabled={running}
+          onClick={() => void startCheckin()}
+        >
+          {running ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
+          {running ? '打卡中…' : '立即打卡'}
+        </button>
+        <button
+          className="btn-secondary inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+          disabled={syncing}
+          onClick={() => void syncCredits()}
+        >
+          {syncing ? <Loader2 size={13} className="animate-spin" /> : <Coins size={13} />} 同步积分
+        </button>
+      </div>
+      {lines.length > 0 ? (
+        <div className="mt-2 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-slate-50 px-3 py-2 font-mono text-[11px] leading-4 text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
+          {lines.map((l, i) => (
+            <div key={i}>{l}</div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

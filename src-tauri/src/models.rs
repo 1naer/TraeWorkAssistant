@@ -217,6 +217,17 @@ pub struct Settings {
     /// WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改）
     #[serde(default = "default_wb_checkin_hhmm")]
     pub wb_checkin_hhmm: String,
+    // ── Buddy 国际版（buddy-ai）每日活跃打卡（§4.5 补篇，阶段 3b） ──
+    /// buddy-ai 打卡调度开关（默认关——国际档显式开启制，与 buddy_ai_enabled 独立；
+    /// BuddyAI 页打卡卡可开）
+    #[serde(default)]
+    pub buddy_ai_checkin_enabled: bool,
+    /// buddy-ai 打卡调度触发时刻 HH:MM（默认 09:20，对齐外部项目口径）
+    #[serde(default = "default_buddy_ai_checkin_hhmm")]
+    pub buddy_ai_checkin_hhmm: String,
+    /// buddy-ai 打卡多账号间隔秒（默认 3s，0 = 关闭；复用 effective_checkin_gap）
+    #[serde(default)]
+    pub buddy_ai_checkin_gap_secs: Option<u64>,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
     /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认）
     #[serde(default = "default_credits_sync_mode")]
@@ -410,6 +421,10 @@ fn default_wb_growth_hhmm() -> String {
 }
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
+}
+/// buddy-ai 打卡调度默认 09:20（§4.5 补篇：对齐外部项目 scheduler 口径）
+fn default_buddy_ai_checkin_hhmm() -> String {
+    "09:20".into()
 }
 /// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
 fn default_qoder_checkin_hhmm() -> String {

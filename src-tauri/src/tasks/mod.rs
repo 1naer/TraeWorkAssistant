@@ -29,6 +29,7 @@ pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
+pub mod buddy_ai_checkin;
 pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;

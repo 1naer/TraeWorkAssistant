@@ -70,6 +70,10 @@ const TASKS: &[SchedTask] = &[
     // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
     //（§2.2 调度设计结论；settings.qoder_checkin_hhmm 可改，任务配置页）
     SchedTask { key: "qoder-checkin", name: "Qoder 每日签到", hhmm: "10:15", kind: "fix" },
+    // Buddy 国际版每日活跃打卡（阶段 3b，§4.5 补篇）：网页会话 + 沙箱 ACP 跑完一轮
+    // → completed 后服务端自动入账 30/50 积分（无 claim 端点）；默认 09:20 可改
+    //（settings.buddy_ai_checkin_hhmm）；开关独立（buddy_ai_checkin_enabled，默认关）
+    SchedTask { key: "buddy-ai-checkin", name: "Buddy 国际版每日活跃打卡", hhmm: "09:20", kind: "fix" },
     // 看板数据同步（原快照任务升级为可配置频率：每日 HH:MM / 每小时 / 关闭）：
     // wb 侧含积分 fresh 拉取+池回写+快照、Token 统计重扫与官方用量刷新；
     // 排到晚間接近日末，差分口径最准；此前无定时写入是近 7 日消耗缺天的根因
@@ -333,6 +337,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
         "qoder-checkin" => Some(st.settings().qoder_checkin_hhmm),
+        "buddy-ai-checkin" => Some(st.settings().buddy_ai_checkin_hhmm),
         "qoder-credits-snapshot" => Some(st.settings().qoder_credits_sync_hhmm),
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
@@ -373,6 +378,8 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "wb-growth" => st.settings().wb_growth_enabled,
         // F-80 Qoder：签到跟随环境配置开关（qoder_settings.auto_checkin 默认开）
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
+        // Buddy 国际版每日活跃打卡（阶段 3b）：独立开关（默认关，国际档显式开启制）
+        "buddy-ai-checkin" => crate::commands::workbuddy::buddy_ai_checkin_enabled(st),
         // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
         // Qoder 会话流水定时合并（环境配置页可关；默认开，每日 04:30）
@@ -499,6 +506,34 @@ fn run_task(
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
+        // Buddy 国际版每日活跃打卡（阶段 3b）：抢轮次锁与 UI 路径互斥（skipped_busy
+        // 幂等跳过同 wb-checkin）；可重试失败返 Err 交 30 分钟冷却重试，永久性
+        // 凭证失败（无凭证/打卡幂等戳已成功）剔除
+        "buddy-ai-checkin" => {
+            let Ok(_round) = crate::commands::workbuddy::try_acquire_buddy_ai_round() else {
+                return Ok(json!({ "ok": true, "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过", "skipped_busy": true }));
+            };
+            let mut events: Vec<Value> = Vec::new();
+            let done = super::buddy_ai_checkin::run_checkin_round(st, &mut |ev| events.push(ev.clone()));
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
+                    e.get("status").and_then(Value::as_str) == Some("fail")
+                        && (m.contains("无凭证") || m.contains("今日已完成"))
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
+                return Err(format!(
+                    "buddy-ai 打卡：{ok} 成功 / {already} 已完成 / {retryable} 失败（稍后自动重试）"
+                ));
+            }
+            Ok(done)
+        }
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
