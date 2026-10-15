@@ -231,11 +231,8 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
             continue;
         };
         let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
-        let base = if domain.contains("workbuddy.ai") {
-            "https://www.workbuddy.ai"
-        } else {
-            "https://www.workbuddy.cn"
-        };
+        // 域名收敛（§4.5）：活动/积分网关 base 单点取用 region_activity_base
+        let base = crate::tasks::wb_common::region_activity_base(&domain);
         let Ok(v) = billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &token) else {
             continue;
         };
@@ -790,14 +787,13 @@ fn usage_official_fetch(
 ) -> Result<(serde_json::Value, Vec<WbSessionRow>), String> {
     // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
     // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
-    let base = if domain.contains("workbuddy.ai") {
-        "https://www.workbuddy.ai".to_string()
-    } else if domain.is_empty() {
-        "https://www.workbuddy.cn".to_string()
+    // 域名收敛（§4.5）：判定 + base 构造单点化 region_activity_base（显式 URL domain 保留）
+    let base = if domain.is_empty() {
+        crate::tasks::wb_common::region_activity_base("").to_string()
     } else if domain.starts_with("http://") || domain.starts_with("https://") {
         domain.trim_end_matches('/').to_string()
     } else {
-        format!("https://{}", domain.trim_end_matches('/'))
+        crate::tasks::wb_common::region_activity_base(&domain).to_string()
     };
     let url = format!("{base}/billing/meter/get-user-request-usage");
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)).build();
@@ -1410,12 +1406,8 @@ pub fn workbuddy_activity_info(
         }));
     };
 
-    // 区域路由（F-36，§5.2）：billing/activity 随账号 domain
-    let base = if domain.contains("workbuddy.ai") {
-        "https://www.workbuddy.ai".to_string()
-    } else {
-        "https://www.workbuddy.cn".to_string()
-    };
+    // 区域路由（F-36，§5.2）：billing/activity 随账号 domain（域名收敛 §4.5 单点化）
+    let base = crate::tasks::wb_common::region_activity_base(&domain).to_string();
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
     let mut errors: Vec<String> = vec![];
 

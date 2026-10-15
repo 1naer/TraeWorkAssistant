@@ -580,7 +580,21 @@ pub fn get_json(
 
 pub const BILLING_BASE_CN: &str = "https://www.codebuddy.cn";
 pub const BILLING_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
+/// CN 活动/积分网关（签到/活动 banner/成长任务/积分领取走 www.workbuddy.cn，
+/// 与 BILLING_BASE_CN=codebuddy.cn（token refresh）是**两个不同域**——
+/// credits.rs 三处散点收敛到此单点（§4.5 域名收敛，CN 行为保持不变）
+pub const ACTIVITY_BASE_CN: &str = "https://www.workbuddy.cn";
 pub const REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
+
+/// 活动/积分网关 base 按区域取用（§4.5 域名收敛：Global=workbuddy.ai、
+/// CN=workbuddy.cn，消除 credits.rs 中「含 workbuddy.ai 判定 + 双域混用」散点）
+pub fn region_activity_base(domain: &str) -> &'static str {
+    if is_global_region(domain) {
+        BILLING_BASE_GLOBAL
+    } else {
+        ACTIVITY_BASE_CN
+    }
+}
 
 pub fn is_global_region(domain: &str) -> bool {
     domain.contains(".workbuddy.ai")
