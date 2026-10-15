@@ -356,6 +356,7 @@ fn main() {
             commands::workbuddy::buddy_ai_refresh_token,
             // Buddy 国际版每日活跃打卡（阶段 3b）
             commands::workbuddy::buddy_ai_checkin_start,
+            commands::workbuddy::buddy_ai_checkin_results,
             commands::workbuddy::buddy_ai_credits_fetch,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,

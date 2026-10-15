@@ -731,6 +731,41 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
     Ok((moved_accounts.len(), stay_ids.len()))
 }
 
+/// buddy-ai 每日活跃打卡结果查询（P2 对齐 workbuddy_checkin_results；数据源
+/// buddy_ai_checkin_results 表，run_checkin_round 整轮落库，90 天裁剪）。
+/// 概述趋势图 / 签到日历 / 结果列表共用此数据源
+#[tauri::command(async)]
+pub fn buddy_ai_checkin_results(
+    state: State<'_, AppState>,
+    days: Option<i64>,
+) -> Result<Vec<super::checkin::WbCheckinRecord>, String> {
+    let days = days.unwrap_or(30).clamp(1, 90);
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string();
+    let raw: serde_json::Value =
+        crate::store::docs::buddy_ai_checkin_results_load(&crate::store::db(&state.data_dir));
+    let mut out = Vec::new();
+    if let Some(arr) = raw.get("results").and_then(|v| v.as_array()) {
+        for r in arr {
+            let date = r.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            if date < cutoff.as_str() {
+                continue;
+            }
+            out.push(super::checkin::WbCheckinRecord {
+                date: date.into(),
+                time: r.get("time").and_then(|v| v.as_str()).unwrap_or("").into(),
+                user_id: r.get("user_id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
+                status: r.get("status").and_then(|v| v.as_str()).unwrap_or("").into(),
+                message: r.get("message").and_then(|v| v.as_str()).unwrap_or("").into(),
+                reward: r.get("reward").and_then(|v| v.as_f64()),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

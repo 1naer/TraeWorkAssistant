@@ -188,6 +188,17 @@ const DDL: &[&str] = &[
         message TEXT NOT NULL DEFAULT '',
         reward  REAL
     )",
+    // buddy-ai 每日活跃打卡结果（P2 对齐国内 wb_checkin_results：日期趋势/日历/结果列表数据源）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_checkin_results (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        date    TEXT NOT NULL DEFAULT '',
+        time    TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        name    TEXT NOT NULL DEFAULT '',
+        status  TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        reward  REAL
+    )",
     "CREATE TABLE IF NOT EXISTS doubao_health_events (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         payload TEXT NOT NULL
@@ -257,6 +268,7 @@ const DDL: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_credits_history_date ON credits_history(date)",
     "CREATE INDEX IF NOT EXISTS idx_wb_checkin_results_date ON wb_checkin_results(date)",
+    "CREATE INDEX IF NOT EXISTS idx_buddy_ai_checkin_results_date ON buddy_ai_checkin_results(date)",
     "CREATE INDEX IF NOT EXISTS idx_checkin_results_day ON checkin_results(day)",
 ];
 

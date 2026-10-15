@@ -390,7 +390,12 @@ fn process_account(
             before.map(|(b, _)| b).unwrap_or(0.0), after.map(|(a, _)| a).unwrap_or(0.0)),
         None => "活跃打卡完成（会话 completed，奖励自动入账）".to_string(),
     };
-    result_ev(acct_id, nickname, "success", &msg)
+    let mut ev = result_ev(acct_id, nickname, "success", &msg);
+    // P2：积分增量随事件落盘（打卡结果表 reward 列，趋势/日历展示用）
+    if let Some(g) = gain {
+        ev["reward"] = json!(g);
+    }
+    ev
 }
 
 /// 失败诊断用的响应摘要（审查 H5/H6 修复）：
@@ -487,6 +492,53 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
     let ok = events.iter().filter(|e| e["status"] == "success").count();
     let already = events.iter().filter(|e| e["status"] == "already").count();
     let failed = events.len() - ok - already;
+
+    // P2：打卡结果按日落库（镜像 wb_checkin_results，90 天裁剪；同 uid 同日以
+    // 最后一次为准——重试轮自然合并为最终态）。落库失败仅日志，不影响打卡结果
+    {
+        let now = chrono::Local::now();
+        let date = now.format("%Y-%m-%d").to_string();
+        let time = now.format("%H:%M:%S").to_string();
+        let db = crate::store::db(&state.data_dir);
+        let mut root = crate::store::docs::buddy_ai_checkin_results_load(&db);
+        let mut merged = root
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // 本轮涉及账号的当日旧行移除（最终态覆盖）
+        merged.retain(|r| {
+            !(r.get("date").and_then(Value::as_str) == Some(date.as_str())
+                && events
+                    .iter()
+                    .any(|e| e.get("id").and_then(Value::as_str) == r.get("user_id").and_then(Value::as_str)))
+        });
+        for e in &events {
+            merged.push(json!({
+                "date": date,
+                "time": time,
+                "user_id": e.get("id").cloned().unwrap_or_default(),
+                "name": e.get("name").cloned().unwrap_or_default(),
+                "status": e.get("status").cloned().unwrap_or_default(),
+                "message": e.get("message").cloned().unwrap_or_default(),
+                "reward": e.get("reward").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        // 90 天裁剪
+        let cutoff = (now.date_naive() - chrono::Duration::days(90))
+            .format("%Y-%m-%d")
+            .to_string();
+        merged.retain(|r| {
+            r.get("date")
+                .and_then(Value::as_str)
+                .map_or(true, |d| d >= cutoff.as_str())
+        });
+        root["results"] = Value::Array(merged);
+        if let Err(err) = crate::store::docs::buddy_ai_checkin_results_save(&db, &root) {
+            crate::fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 打卡结果落库失败: {err}"));
+        }
+    }
+
     let done = json!({ "type": "done", "ok": ok, "already": already, "failed": failed });
     emit(&done);
     done

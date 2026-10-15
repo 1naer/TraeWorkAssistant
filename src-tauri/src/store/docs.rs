@@ -1990,6 +1990,67 @@ pub fn wb_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
     })
 }
 
+// ── buddy-ai 每日活跃打卡结果（P2 对齐 wb_checkin_results；镜像同构）──
+
+/// 读回 {results: [...]}（按 id 升序 = 原追加序）
+pub fn buddy_ai_checkin_results_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, time, user_id, name, status, message, reward FROM buddy_ai_checkin_results ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let reward: Option<f64> = r.get(6)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "time": r.get::<_, String>(1)?,
+                        "user_id": r.get::<_, String>(2)?,
+                        "name": r.get::<_, String>(3)?,
+                        "status": r.get::<_, String>(4)?,
+                        "message": r.get::<_, String>(5)?,
+                        "reward": reward,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "results": rows })
+}
+
+/// 整表替换（裁剪由调用方计算）
+pub fn buddy_ai_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("results").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN; DELETE FROM buddy_ai_checkin_results;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO buddy_ai_checkin_results(date, time, user_id, name, status, message, reward) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in arr {
+                let reward = r.get("reward").and_then(Value::as_f64);
+                stmt.execute(rusqlite::params![
+                    r.get("date").and_then(Value::as_str).unwrap_or(""),
+                    r.get("time").and_then(Value::as_str).unwrap_or(""),
+                    r.get("user_id").and_then(Value::as_str).unwrap_or(""),
+                    r.get("name").and_then(Value::as_str).unwrap_or(""),
+                    r.get("status").and_then(Value::as_str).unwrap_or(""),
+                    r.get("message").and_then(Value::as_str).unwrap_or(""),
+                    reward,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
 // ── 豆包运维历史（doubao_health_history.json → doubao_health_events 表）──────
 
 pub fn doubao_health_load(s: &Store) -> Vec<Value> {

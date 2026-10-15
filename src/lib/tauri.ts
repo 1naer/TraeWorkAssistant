@@ -444,6 +444,9 @@ export const api = {
     refreshToken: (userId: string) => invoke<string>('buddy_ai_refresh_token', { userId }),
     /** 每日活跃打卡（手动触发；进度经 buddy-ai-checkin-progress NDJSON 推送） */
     checkinStart: () => invoke<void>('buddy_ai_checkin_start'),
+    /** 打卡结果按日查询（近 N 天，默认 30；概述趋势/签到日历共用） */
+    checkinResults: (days?: number) =>
+      invoke<WbCheckinRecord[]>('buddy_ai_checkin_results', { days: days ?? null }),
     /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
     creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
   },
