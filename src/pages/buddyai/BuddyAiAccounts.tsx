@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   RefreshCw,
   Globe,
@@ -7,6 +7,9 @@ import {
   Trash2,
   Loader2,
   RotateCcw,
+  Power,
+  PowerOff,
+  Pencil,
 } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
@@ -14,45 +17,61 @@ import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { BuddyAiAccountView, WbOauthDone, WbOauthProgress } from '../../types';
+import type { BuddyAiAccountView, GroupView, WbOauthDone, WbOauthProgress } from '../../types';
 
 /**
- * BuddyAI（buddy-ai 国际版）账号管理页（六页子导航对齐国内 Buddy）。
+ * BuddyAI（buddy-ai 国际版）账号管理页（P3 对齐国内 Buddy 账号管理）。
  *
- * §3.4 隔离清单：本页所有命令走 buddy_ai_* 独立池（buddy_ai_accounts /
- * buddy_ai_tokens 表 + buddy-ai vault 命名空间），与国内 Buddy 账号页零数据共享；
- * OAuth 事件前缀 buddy-ai-oauth-*（不与 wb-oauth 混流）。
+ * 列对齐：账号（昵称+uid）/ 分组（共享分组下拉）/ 备注 / 积分 / TOKEN 到期 /
+ * 凭证状态 / 启停 / 操作（编辑·启停·续期·移除）+ 批量勾选移除。
+ * 国际不适用项（不展示）：每日目标 / 休假锁单 / 签到策略（intl 打卡为 ACP 链，
+ * 无 UI 签到通道与签到点概念）。
  *
- * 页面能力：账号列表 / OAuth 扫码登录 / 手工导入凭证（区域必选校验）/
- * 凭证续期 / 移除（确认弹框）。
+ * §3.4 隔离清单：本页所有命令走 buddy_ai_* 独立池；OAuth 事件前缀 buddy-ai-oauth-*。
  */
 
-type ConfirmTarget = { kind: 'remove-account'; account: BuddyAiAccountView } | null;
+type ConfirmTarget =
+  | { kind: 'remove-account'; account: BuddyAiAccountView }
+  | { kind: 'remove-batch'; ids: string[] }
+  | null;
 
 export default function BuddyAiAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [accounts, setAccounts] = useState<BuddyAiAccountView[] | null>(null);
+  const [groups, setGroups] = useState<GroupView[]>([]);
   const [loading, setLoading] = useState(true);
   const [rowOp, setRowOp] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  // OAuth 弹框
   const [oauthOpen, setOauthOpen] = useState(false);
   const [oauthStage, setOauthStage] = useState('');
   const [oauthMessage, setOauthMessage] = useState('');
   const [oauthAuthUrl, setOauthAuthUrl] = useState<string | null>(null);
   const [oauthBusy, setOauthBusy] = useState(false);
-  // 手工导入弹框（access_token 必填 / refresh_token 可选 / 备注名可选）
+  // 手工导入弹框
   const [importOpen, setImportOpen] = useState(false);
   const [importName, setImportName] = useState('');
   const [importAccess, setImportAccess] = useState('');
   const [importRefresh, setImportRefresh] = useState('');
   const [importBusy, setImportBusy] = useState(false);
   const importAccessRef = useRef<HTMLInputElement>(null);
+  // 编辑弹框（昵称/备注）
+  const [editTarget, setEditTarget] = useState<BuddyAiAccountView | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editNote, setEditNote] = useState('');
+  const [editBusy, setEditBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setAccounts(await api.buddyai.accountsList());
+      const [accs, gs] = await Promise.all([
+        api.buddyai.accountsList(),
+        api.groups.sharedList().catch(() => [] as GroupView[]),
+      ]);
+      setAccounts(accs);
+      setGroups(gs);
     } catch (err) {
       pushToast('error', `账号列表读取失败：${String(err).slice(0, 120)}`);
     } finally {
@@ -65,8 +84,13 @@ export default function BuddyAiAccounts() {
     void refresh();
   }, [refresh]);
 
-  // OAuth 弹框事件契约：与 BuddyAccounts wb-oauth 模式同构，事件前缀 buddy-ai-oauth-*
-  // （后端 oauth_login_async 按 PoolSink 分流；310s 看门狗兜底事件丢失）
+  const groupName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const g of groups) m.set(g.id, g.name);
+    return m;
+  }, [groups]);
+
+  // OAuth 弹框事件契约：事件前缀 buddy-ai-oauth-*（310s 看门狗兜底事件丢失）
   useEffect(() => {
     if (!oauthOpen && !oauthBusy) return;
     let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -138,7 +162,6 @@ export default function BuddyAiAccounts() {
       setImportOpen(false);
       await refresh();
     } catch (err) {
-      // 区域校验失败等业务错误原样透出（§4.1 双重保险）
       pushToast('error', `导入失败：${String(err).slice(0, 160)}`);
     } finally {
       setImportBusy(false);
@@ -152,10 +175,53 @@ export default function BuddyAiAccounts() {
       pushToast('success', `${a.nickname || a.id}：${msg}`);
       await refresh();
     } catch (err) {
-      // Intl 刷新失败按暂态处理（后端不标 needs_relogin），提示重新导入通道
       pushToast('error', `续期失败：${String(err).slice(0, 160)}`);
     } finally {
       setRowOp(null);
+    }
+  };
+
+  const doToggle = async (a: BuddyAiAccountView) => {
+    setRowOp(`toggle:${a.id}`);
+    try {
+      await withMinDelay(api.buddyai.accountToggle(a.id, !a.disabled), 400);
+      pushToast('success', a.disabled ? `已启用 ${a.nickname || a.id}` : `已停用 ${a.nickname || a.id}（退出打卡与网关取号）`);
+      await refresh();
+    } catch (err) {
+      pushToast('error', `启停失败：${String(err).slice(0, 120)}`);
+    } finally {
+      setRowOp(null);
+    }
+  };
+
+  const openEdit = (a: BuddyAiAccountView) => {
+    setEditTarget(a);
+    setEditName(a.nickname);
+    setEditNote(a.note);
+  };
+
+  const confirmEdit = async () => {
+    if (!editTarget) return;
+    setEditBusy(true);
+    try {
+      await api.buddyai.accountSave(editTarget.id, { name: editName.trim(), note: editNote.trim() });
+      pushToast('success', '账号信息已保存');
+      setEditTarget(null);
+      await refresh();
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err).slice(0, 120)}`);
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const setGroup = async (a: BuddyAiAccountView, group_id: string) => {
+    try {
+      await api.buddyai.accountSave(a.id, { group_id });
+      pushToast('success', '分组已更新');
+      await refresh();
+    } catch (err) {
+      pushToast('error', `分组更新失败：${String(err).slice(0, 120)}`);
     }
   };
 
@@ -163,8 +229,16 @@ export default function BuddyAiAccounts() {
     if (!confirmTarget) return;
     setConfirmBusy(true);
     try {
-      await withMinDelay(api.buddyai.accountRemove(confirmTarget.account.id), 800);
-      pushToast('info', `已移除 ${confirmTarget.account.nickname || confirmTarget.account.id}`);
+      if (confirmTarget.kind === 'remove-account') {
+        await withMinDelay(api.buddyai.accountRemove(confirmTarget.account.id), 800);
+        pushToast('info', `已移除 ${confirmTarget.account.nickname || confirmTarget.account.id}`);
+      } else {
+        for (const id of confirmTarget.ids) {
+          await api.buddyai.accountRemove(id);
+        }
+        pushToast('info', `已批量移除 ${confirmTarget.ids.length} 个账号`);
+      }
+      setSelected(new Set());
       setConfirmTarget(null);
       await refresh();
     } catch (err) {
@@ -174,8 +248,17 @@ export default function BuddyAiAccounts() {
     }
   };
 
-  const expText = (ts: number | null) =>
-    ts ? new Date(ts * 1000).toLocaleString() : '-';
+  const toggleSelect = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const allSelected = accounts != null && accounts.length > 0 && selected.size === accounts.length;
+  const expText = (ts: number | null) => (ts ? new Date(ts * 1000).toLocaleString() : '-');
 
   return (
     <div className="animate-fade-in">
@@ -190,6 +273,14 @@ export default function BuddyAiAccounts() {
             <button className="btn-secondary inline-flex items-center gap-1.5" onClick={openImport}>
               <KeyRound size={14} /> 导入凭证
             </button>
+            {selected.size > 0 && (
+              <button
+                className="btn-secondary inline-flex items-center gap-1.5 text-red-500"
+                onClick={() => setConfirmTarget({ kind: 'remove-batch', ids: [...selected] })}
+              >
+                <Trash2 size={14} /> 批量移除（{selected.size}）
+              </button>
+            )}
             <button className="btn-outline inline-flex items-center gap-1.5" onClick={() => void refresh()} disabled={loading}>
               {loading ? <Spinner /> : <RefreshCw size={14} />} 刷新
             </button>
@@ -210,12 +301,21 @@ export default function BuddyAiAccounts() {
             hint="点击「扫码登录」走 workbuddy.ai OAuth，或「导入凭证」手工导入国际账号 token（须为 .workbuddy.ai 域）"
           />
         ) : (
-          <table className="w-full min-w-[760px] text-sm">
+          <table className="w-full min-w-[900px] text-sm">
             <thead>
               <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
+                <th className="py-2 pl-1 pr-2">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    onChange={(e) => setSelected(e.target.checked ? new Set(accounts.map((a) => a.id)) : new Set())}
+                  />
+                </th>
                 <th className="py-2 pr-3 font-medium">账号</th>
-                <th className="py-2 pr-3 font-medium">域名</th>
-                <th className="py-2 pr-3 font-medium">token 到期</th>
+                <th className="py-2 pr-3 font-medium">分组</th>
+                <th className="py-2 pr-3 font-medium">积分</th>
+                <th className="py-2 pr-3 font-medium">TOKEN 到期</th>
+                <th className="py-2 pr-3 font-medium">凭证状态</th>
                 <th className="py-2 pr-3 font-medium">状态</th>
                 <th className="py-2 pr-3 text-right font-medium">操作</th>
               </tr>
@@ -223,11 +323,33 @@ export default function BuddyAiAccounts() {
             <tbody>
               {accounts.map((a) => (
                 <tr key={a.id} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
+                  <td className="py-2.5 pl-1 pr-2">
+                    <input type="checkbox" checked={selected.has(a.id)} onChange={() => toggleSelect(a.id)} />
+                  </td>
                   <td className="py-2.5 pr-3">
-                    <div className="font-medium">{a.nickname || a.id}</div>
+                    <div className="font-medium">
+                      {a.nickname || a.id}
+                      {a.note ? <span className="ml-1.5 text-[11px] font-normal text-slate-400">（{a.note}）</span> : null}
+                    </div>
                     <div className="text-[11px] text-slate-400">{a.uid || a.id}</div>
                   </td>
-                  <td className="py-2.5 pr-3 text-xs text-slate-500">{a.domain}</td>
+                  <td className="py-2.5 pr-3">
+                    <select
+                      className="rounded-md border border-slate-200 bg-transparent px-1.5 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                      value={a.group_id}
+                      onChange={(e) => void setGroup(a, e.target.value)}
+                    >
+                      <option value="">未分组</option>
+                      {groups.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.name}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="py-2.5 pr-3 tabular-nums">
+                    {a.credits_balance != null ? a.credits_balance.toFixed(2) : <span className="text-xs text-slate-400">—</span>}
+                  </td>
                   <td className="py-2.5 pr-3 text-xs tabular-nums text-slate-500">{expText(a.access_token_expires_at)}</td>
                   <td className="py-2.5 pr-3">
                     {!a.has_credential ? (
@@ -235,14 +357,44 @@ export default function BuddyAiAccounts() {
                     ) : a.needs_relogin ? (
                       <Badge tone="amber">需重新登录</Badge>
                     ) : (
-                      <Badge tone="green">可用</Badge>
+                      <Badge tone="green">已授权</Badge>
                     )}
                     {a.needs_relogin && a.relogin_reason ? (
                       <div className="mt-0.5 text-[11px] text-slate-400">{a.relogin_reason}</div>
                     ) : null}
                   </td>
                   <td className="py-2.5 pr-3">
-                    <div className="flex items-center justify-end gap-1.5">
+                    {a.disabled ? (
+                      <Badge tone="slate">已停用</Badge>
+                    ) : (
+                      <Badge tone="green">启用</Badge>
+                    )}
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    <div className="flex items-center justify-end gap-1">
+                      <button
+                        className="btn-ghost inline-flex items-center gap-1 px-2 py-1 text-xs"
+                        title="编辑昵称/备注"
+                        disabled={rowOp !== null}
+                        onClick={() => openEdit(a)}
+                      >
+                        <Pencil size={13} /> 编辑
+                      </button>
+                      <button
+                        className="btn-ghost inline-flex items-center gap-1 px-2 py-1 text-xs"
+                        title={a.disabled ? '启用（恢复打卡与网关取号）' : '停用（退出打卡与网关取号）'}
+                        disabled={rowOp !== null}
+                        onClick={() => void doToggle(a)}
+                      >
+                        {rowOp === `toggle:${a.id}` ? (
+                          <Loader2 size={13} className="animate-spin" />
+                        ) : a.disabled ? (
+                          <Power size={13} className="text-emerald-500" />
+                        ) : (
+                          <PowerOff size={13} className="text-amber-500" />
+                        )}
+                        {a.disabled ? '启用' : '停用'}
+                      </button>
                       <button
                         className="btn-ghost inline-flex items-center gap-1 px-2 py-1 text-xs"
                         title="凭证续期（refreshToken 轮换回写）"
@@ -293,11 +445,7 @@ export default function BuddyAiAccounts() {
             登录流程：浏览器完成 workbuddy.ai 授权后，网关自动轮询拿票并国际账号入池（最长 300 秒）。
           </p>
           <div className="flex justify-end">
-            <button
-              className="btn-secondary"
-              disabled={oauthBusy}
-              onClick={() => setOauthOpen(false)}
-            >
+            <button className="btn-secondary" disabled={oauthBusy} onClick={() => setOauthOpen(false)}>
               {oauthBusy ? '运行中…' : '关闭'}
             </button>
           </div>
@@ -344,12 +492,42 @@ export default function BuddyAiAccounts() {
         </div>
       </Modal>
 
+      {/* 编辑弹框 */}
+      <Modal open={editTarget !== null} onClose={() => !editBusy && setEditTarget(null)} title="编辑账号" widthClass="max-w-sm">
+        {editTarget ? (
+          <div className="space-y-3 text-sm">
+            <div>
+              <label className="label">昵称</label>
+              <input className="input" value={editName} onChange={(e) => setEditName(e.target.value)} />
+            </div>
+            <div>
+              <label className="label">备注</label>
+              <input className="input" value={editNote} onChange={(e) => setEditNote(e.target.value)} placeholder="如：主力打卡号" />
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button className="btn-secondary" disabled={editBusy} onClick={() => setEditTarget(null)}>
+                取消
+              </button>
+              <button className="btn-primary inline-flex items-center gap-1.5" disabled={editBusy} onClick={() => void confirmEdit()}>
+                {editBusy ? <Loader2 size={14} className="animate-spin" /> : null} 保存
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
+
       {/* 移除确认弹框（删除类操作二次确认） */}
       <Modal open={confirmTarget !== null} onClose={() => !confirmBusy && setConfirmTarget(null)} title="确认移除账号" widthClass="max-w-sm">
         {confirmTarget ? (
           <div className="space-y-3 text-sm">
             <p>
-              确定移除国际账号 <b>{confirmTarget.account.nickname || confirmTarget.account.id}</b>？
+              {confirmTarget.kind === 'remove-account' ? (
+                <>
+                  确定移除国际账号 <b>{confirmTarget.account.nickname || confirmTarget.account.id}</b>？
+                </>
+              ) : (
+                <>确定批量移除 <b>{confirmTarget.ids.length}</b> 个国际账号？</>
+              )}
               将同时清除其凭证记录与 buddy-ai vault 条目，不可恢复。
             </p>
             <div className="flex justify-end gap-2">

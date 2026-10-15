@@ -447,6 +447,17 @@ export const api = {
     /** 打卡结果按日查询（近 N 天，默认 30；概述趋势/签到日历共用） */
     checkinResults: (days?: number) =>
       invoke<WbCheckinRecord[]>('buddy_ai_checkin_results', { days: days ?? null }),
+    /** 编辑账号（昵称/备注/分组；P3 对齐 workbuddy_account_save） */
+    accountSave: (userId: string, patch: { name?: string; note?: string; group_id?: string }) =>
+      invoke<void>('buddy_ai_account_save', {
+        userId,
+        name: patch.name ?? null,
+        note: patch.note ?? null,
+        groupId: patch.group_id ?? null,
+      }),
+    /** 账号启停（停用即退出打卡花名册与网关取号） */
+    accountToggle: (userId: string, disabled: boolean) =>
+      invoke<void>('buddy_ai_account_toggle', { userId, disabled }),
     /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
     creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
   },
@@ -864,6 +875,9 @@ export const api = {
     // WB 上游用量统计（wb_days 桶，Buddy「资源调度」页专用，与 Trae 侧分账）
     wbUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_wb_usage_stats', { days: days ?? null }),
+    // buddy-ai 国际池用量统计（buddy_ai_days 桶，BuddyAI「积分看板·模型消耗排行」专用）
+    buddyAiUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_buddy_ai_usage_stats', { days: days ?? null }),
     // 自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选）
     customUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_custom_usage_stats', { days: days ?? null }),

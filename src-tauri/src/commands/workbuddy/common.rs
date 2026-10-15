@@ -81,6 +81,10 @@ pub struct WorkBuddyAccount {
     pub group_id: String,
     #[serde(default)]
     pub note: String,
+    /// 启停（P3 账号管理/资源调度「账号调度池」）：true = 已停用——不参与打卡
+    /// 花名册与网关取号（serde default 兼容旧池 JSON；国内页暂不消费该字段）
+    #[serde(default)]
+    pub disabled: bool,
     /// 余额缓存（credits_fetch 成功后回写，供列表/概述展示）
     #[serde(default)]
     pub credits_balance: Option<f64>,

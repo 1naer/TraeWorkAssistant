@@ -34,6 +34,7 @@ pub(crate) fn buddy_pool_roster(state: &AppState) -> Vec<(String, String, String
     load_buddy_pool(state)
         .accounts
         .iter()
+        .filter(|a| !a.disabled) // P3 启停：停用账号不参与打卡花名册
         .map(|a| (a.id.clone(), if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() }, a.uid.clone()))
         .collect()
 }
@@ -97,6 +98,9 @@ pub(crate) fn buddy_ai_upstream_accounts(state: &AppState) -> Vec<crate::api_ser
         .unwrap_or_default();
     let mut out = Vec::new();
     for a in &pool.accounts {
+        if a.disabled {
+            continue; // P3 启停：停用账号不入网关池（不参与取号/调度）
+        }
         let rec = tokens.get(&a.id).cloned().unwrap_or_default();
         let token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default();
         if token.is_empty() {
@@ -235,6 +239,7 @@ pub fn buddy_ai_accounts_list(state: State<'_, AppState>) -> Result<Vec<Value>, 
                 "auth_saved_at": a.auth_saved_at,
                 "needs_relogin": a.needs_relogin,
                 "relogin_reason": a.relogin_reason,
+                "disabled": a.disabled,
                 "credits_balance": a.credits_balance,
                 "credits_expire_at": a.credits_expire_at,
                 "credits_fetched_at": a.credits_fetched_at,
@@ -729,6 +734,54 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
         ),
     );
     Ok((moved_accounts.len(), stay_ids.len()))
+}
+
+/// 编辑 buddy-ai 账号（P3 对齐 workbuddy_account_save：昵称/备注/分组；
+/// 池读-改-写互斥 buddy_ai_pool_lock，防并发旧副本整文档覆盖丢改动）
+#[tauri::command(async)]
+pub fn buddy_ai_account_save(
+    state: State<'_, AppState>,
+    user_id: String,
+    name: Option<String>,
+    note: Option<String>,
+    group_id: Option<String>,
+) -> Result<(), String> {
+    let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = load_buddy_pool(&state);
+    let acct = pool
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == user_id)
+        .ok_or_else(|| format!("账号不存在: {user_id}"))?;
+    if let Some(n) = name {
+        acct.nickname = n;
+    }
+    if let Some(n) = note {
+        acct.note = n;
+    }
+    if let Some(g) = group_id {
+        acct.group_id = g;
+    }
+    save_buddy_pool(&state, &pool)
+}
+
+/// buddy-ai 账号启停（P3/P6「账号调度池」）：停用即退出打卡花名册与网关取号
+///（roster/upstream_accounts 双过滤）；池读-改-写互斥同上
+#[tauri::command(async)]
+pub fn buddy_ai_account_toggle(
+    state: State<'_, AppState>,
+    user_id: String,
+    disabled: bool,
+) -> Result<(), String> {
+    let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = load_buddy_pool(&state);
+    let acct = pool
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == user_id)
+        .ok_or_else(|| format!("账号不存在: {user_id}"))?;
+    acct.disabled = disabled;
+    save_buddy_pool(&state, &pool)
 }
 
 /// buddy-ai 每日活跃打卡结果查询（P2 对齐 workbuddy_checkin_results；数据源

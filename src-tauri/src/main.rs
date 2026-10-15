@@ -234,6 +234,7 @@ fn main() {
             commands::api_server::api_models_sync,
             commands::api_server::api_usage_stats,
             commands::api_server::api_wb_usage_stats,
+            commands::api_server::api_buddy_ai_usage_stats,
             commands::api_server::api_custom_usage_stats,
             commands::api_server::api_qoder_usage_stats,
             commands::api_server::api_keys_list,
@@ -357,6 +358,8 @@ fn main() {
             // Buddy 国际版每日活跃打卡（阶段 3b）
             commands::workbuddy::buddy_ai_checkin_start,
             commands::workbuddy::buddy_ai_checkin_results,
+            commands::workbuddy::buddy_ai_account_save,
+            commands::workbuddy::buddy_ai_account_toggle,
             commands::workbuddy::buddy_ai_credits_fetch,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,

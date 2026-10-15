@@ -66,7 +66,7 @@ const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
 const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddyai-overview', label: '概述', icon: LayoutDashboard },
   { key: 'buddyai-accounts', label: '账号管理', icon: Users },
-  { key: 'buddyai-checkin', label: '一键签到', icon: PlayCircle },
+  { key: 'buddyai-checkin', label: '活跃打卡', icon: PlayCircle },
   { key: 'buddyai-credits', label: '积分看板', icon: Coins },
   { key: 'buddyai-api-service', label: '资源调度', icon: Server },
   { key: 'buddyai-settings', label: '环境配置', icon: Settings },

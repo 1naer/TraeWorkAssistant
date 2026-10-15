@@ -1516,6 +1516,20 @@ pub fn api_custom_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> 
     )
 }
 
+/// 查询最近 N 天的 buddy-ai 国际池用量统计（buddy_ai_days 桶，BuddyAI「积分看板·模型消耗排行」专用）
+#[tauri::command]
+pub fn api_buddy_ai_usage_stats(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(30).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::BuddyAi,
+    )
+}
+
 /// 查询最近 N 天的 Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
 #[tauri::command]
 pub fn api_qoder_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {

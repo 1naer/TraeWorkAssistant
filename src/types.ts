@@ -1131,6 +1131,8 @@ export interface BuddyAiAccountView {
   auth_saved_at: number | null;
   needs_relogin: boolean;
   relogin_reason: string;
+  /** 启停（P3）：true = 已停用——不参与打卡花名册与网关取号 */
+  disabled: boolean;
   credits_balance: number | null;
   /** 积分包最近到期时刻（秒级 unix 时间戳；注意与 credits_fetched_at 的 rfc3339 串不同） */
   credits_expire_at: number | null;

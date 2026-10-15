@@ -16,6 +16,7 @@ import type { AppLocate } from '../../types';
  */
 export default function BuddyAiSettings() {
   const pushToast = useAppStore((s) => s.pushToast);
+  const setView = useAppStore((s) => s.setView);
   const settings = useAppStore((s) => s.settings);
   const refreshSettings = useAppStore((s) => s.refreshSettings);
   const [visible, setVisible] = useState(false);
@@ -137,6 +138,51 @@ export default function BuddyAiSettings() {
               {launching === 'cb' ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />} 打开
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* 任务配置（P7 对齐国内「任务配置」的国际可用子集） */}
+      <div className="card mt-4 p-4">
+        <div className="mb-3 text-sm font-medium">任务配置</div>
+        <div className="space-y-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm">每日自动打卡</div>
+              <div className="text-[11px] text-slate-400">
+                调度器按时刻自动执行活跃打卡（幂等跳过当日已完成账号）；配置在「活跃打卡」页
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {settings?.buddy_ai_checkin_enabled ? <Badge tone="green">已开启</Badge> : <Badge tone="amber">未开启</Badge>}
+              <button className="btn-outline shrink-0 text-xs" onClick={() => setView('buddyai-checkin')}>
+                去配置
+              </button>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm">凭证自动续期</div>
+              <div className="text-[11px] text-slate-400">
+                网关 401 / token 临期自动走 workbuddy.ai 刷新端点轮换（每账号刷新锁互斥，rt 轮换防覆盖）
+              </div>
+            </div>
+            <Badge tone="green">自动</Badge>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm">积分数据同步</div>
+              <div className="text-[11px] text-slate-400">
+                打卡成功后自动回写积分快照；全量同步在「积分看板」手动触发
+              </div>
+            </div>
+            <button className="btn-outline shrink-0 text-xs" onClick={() => setView('buddyai-credits')}>
+              去同步
+            </button>
+          </div>
+        </div>
+        <div className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
+          国际不适用项：JWT 定时预刷（intl 为透明 token 体系，401 自动续期覆盖）、CLI 五重防护自动轮换、
+          切号迁移、UI 模拟点击签到（intl 打卡为 ACP 沙箱链，无 UI 签到通道）。
         </div>
       </div>
 
