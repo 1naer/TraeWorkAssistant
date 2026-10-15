@@ -417,6 +417,27 @@ fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
     }
 }
 
+/// 国际凭证判定（§4.7 兼容窗口，区域双重保险之二）：CN 池导入入口拒绝国际账号。
+/// 真源 = token rec 的 domain 字段（is_global_region）；auth 文件无 domain 时以
+/// JWT iss 含 workbuddy.ai 兜底（国际 OAuth 为 Keycloak 风格，iss 指向国际域）。
+/// 二者皆缺 → 放行（fail-open，不误伤国内凭证导入）。
+fn is_intl_credential(domain: Option<&str>, access_token: Option<&str>) -> bool {
+    if let Some(d) = domain {
+        if crate::tasks::wb_common::is_global_region(d) {
+            return true;
+        }
+    }
+    if let Some(t) = access_token {
+        let intl_iss = super::oauth::jwt_claims(t)
+            .and_then(|c| c.get("iss").and_then(|v| v.as_str()).map(str::to_string))
+            .map_or(false, |iss| iss.contains("workbuddy.ai"));
+        if intl_iss {
+            return true;
+        }
+    }
+    false
+}
+
 /// auth 文件导入入池（F-04）：写账号池 + 工具侧凭证副本（掩码入池、凭证不外泄）。
 /// 按 uid 幂等：重复导入（同 token 或同账号换 token）原位更新并保留原 id，不产生重复条目。
 #[tauri::command(async)]
@@ -428,6 +449,12 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
     let raw = fs_utils::read_json::<serde_json::Value>(&path);
     // token 键对齐 creds_of 超集 + 失败分类报错（issue #58，与 scan 同口径）
     let access = extract_access_token(&raw)?;
+    // §4.7 兼容窗口：CN 池不收国际凭证——auth 文件来自国际版客户端时直接拒绝，
+    // 国际账号统一走 BuddyAi 页导入（buddy-ai 独立池），防混居复发（迁移仅一次性兜底）
+    let auth_domain = as_str(fs_utils::dig(&raw, &["domain"]));
+    if is_intl_credential(auth_domain.as_deref(), Some(&access)) {
+        return Err("该凭证属国际版账号（workbuddy.ai），请走 BuddyAi 页导入（buddy-ai 独立池）".into());
+    }
     let refresh = as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"]));
     let id = account_id_of(&access);
     let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
@@ -583,11 +610,14 @@ pub fn workbuddy_refresh_token(
     }
 
     // 红线：X-Refresh-Token 仅出现在 refresh 端点；30s 超时（审查 P2，与其余 ureq 调用点一致）
+    // G-2 收敛：刷新端点经 region_refresh_url 按账号 domain 分区（token rec 的 domain
+    // 是区域判定唯一真源；混居残留的国际账号也能打到正确端点，CN 账号 domain 空回落国内端点）
+    let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
     let resp = agent
-        .post("https://www.codebuddy.cn/v2/plugin/auth/token/refresh")
+        .post(crate::tasks::wb_common::region_refresh_url(&domain))
         .set("Authorization", "Bearer")
         .set("User-Agent", crate::tasks::wb_common::WB_DESKTOP_UA)
         .set("X-Refresh-Token", &refresh)
@@ -805,6 +835,16 @@ pub fn workbuddy_accounts_import(
             rejected.push(serde_json::json!({ "id": id, "reason": "id 不符合 wb-<12位十六进制小写> 规则" }));
             continue;
         }
+        // §4.7 兼容窗口：凭证 rec 的 domain 含 .workbuddy.ai = 国际账号，拒绝入 CN 池
+        // （迁移仅一次性兜底，导入侧拦截防混居复发；国际账号统一走 BuddyAi 页导入）
+        let cred_domain = a.get("credential").and_then(|c| c.get("domain")).and_then(|v| v.as_str());
+        if is_intl_credential(cred_domain, None) {
+            rejected.push(serde_json::json!({
+                "id": id,
+                "reason": "国际版账号（workbuddy.ai），请走 BuddyAi 页导入（buddy-ai 独立池）",
+            }));
+            continue;
+        }
         // 按 uid 幂等（uid 优先，id 兜底，同 find_uid_or_id）：命中 → 原位更新并保留原 id
         // （换 token / 异机 id 的同账号不再产生重复条目，快照与分组引用不悬空）。
         // group_id/note/phone_masked 属本地/用户可编辑数据，更新时不覆盖，仅新增时采用。
@@ -911,8 +951,8 @@ pub fn workbuddy_accounts_import(
 #[cfg(test)]
 mod tests {
     use super::{
-        as_str, as_ts_seconds, extract_access_token, lazy_renew_skippable, merge_auth_entry,
-        AuthMerge, WorkBuddyAccount, WbPool,
+        as_str, as_ts_seconds, extract_access_token, is_intl_credential, lazy_renew_skippable,
+        merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool,
     };
     // auth_key_names 仅测试直用（非测试代码已改经 extract_access_token 间接引用）
     use super::super::common::auth_key_names;
@@ -936,6 +976,28 @@ mod tests {
             access_token_expires_at: exp,
             refresh_token_expires_at: None,
         }
+    }
+
+    fn jwt_with_iss(iss: &str) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"u-1","iss":"{iss}"}}"#).as_bytes());
+        format!("aaa.{payload}.bbb")
+    }
+
+    /// §4.7 国际凭证判定：domain 真源命中 / JWT iss 兜底命中 / CN 形态放行
+    #[test]
+    fn intl_credential_detection() {
+        // domain 真源（is_global_region 唯一判定口径）
+        assert!(is_intl_credential(Some("www.workbuddy.ai"), None));
+        assert!(is_intl_credential(Some("ap-sg.workbuddy.ai"), None));
+        // JWT iss 兜底（auth 文件无 domain 场景）
+        assert!(is_intl_credential(None, Some(&jwt_with_iss("https://sso.workbuddy.ai/realms/wb"))));
+        // CN 形态放行（fail-open：不误伤国内导入）
+        assert!(!is_intl_credential(Some("copilot.tencent.com"), None));
+        assert!(!is_intl_credential(None, Some(&jwt_with_iss("https://copilot.tencent.com"))));
+        assert!(!is_intl_credential(None, Some("not-a-jwt")));
+        assert!(!is_intl_credential(None, None));
     }
 
     /// 重复导入同 token：池大小不变、id 不变、字段以新值覆盖

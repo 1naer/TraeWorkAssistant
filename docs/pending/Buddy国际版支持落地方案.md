@@ -3,7 +3,7 @@
 > - **日期**：2026-10-15
 > - **状态**：待评审（pending）
 > - **关联**：`docs/tech-framework.md` §5.2 区域路由 / `docs/archived/WorkBuddy产品设计蓝本.md` F-36 / `docs/completed/Qoder平台支持设计方案.md`（国际版决策先例）/ backlog F-71（Trae SG，同族远期项）
-> - **结论先行**：国际版走**独立池 `buddy-ai`**，与国内 `wb` 池账号、凭证、调度、指纹、记账、UI 六面完全隔离；对话内核（SSE/聚合/payload）参数化复用不复制代码。当前代码已具备约 40% 基础（F-36 双区路由），缺口集中在**账号入口与运营面**。~~开工前必须先过 §5 的 Gate 探测~~ → **Gate 阻塞层已全部清零（2026-10-15 真实国际账号实测：R-1 全链路 / R-2a / R-6 / R-9 一次登录收口，R-4 打卡全链 3 秒跑通；R-9 实锤两域同一账号体系）**。剩余仅为 §8-1 身份基座拍板与 R-7/R-8 放量观察。
+> - **结论先行**：国际版走**独立池 `buddy-ai`**，与国内 `wb` 池账号、凭证、调度、指纹、记账、UI 六面完全隔离；对话内核（SSE/聚合/payload）参数化复用不复制代码。当前代码已具备约 40% 基础（F-36 双区路由），缺口集中在**账号入口与运营面**。~~开工前必须先过 §5 的 Gate 探测~~ → **Gate 阻塞层已全部清零（2026-10-15 真实国际账号实测：R-1 全链路 / R-2a / R-6 / R-9 一次登录收口，R-4 打卡全链 3 秒跑通；R-9 实锤两域同一账号体系）**。剩余仅为 R-7/R-8 放量观察；**2026-10-15 代码审查核对：阶段 1/2/3 主体已在代码落地**（§2.2/§6 已逐项标注），同日收口三处残余——CN 手动续期端点收敛、wb_common 过时注释修正、CN 池双导入入口拒绝国际凭证（`is_intl_credential` + 单测）。
 
 ---
 
@@ -25,7 +25,7 @@
 | `www.codebuddy.cn` | 国内门户 + plugin auth（token refresh）+ billing |
 | `www.workbuddy.cn` | 国内 WorkBuddy 工作台站（套餐/活动页数据源之一） |
 
-> ⚠️ 注意区分 `workbuddy.cn`（国内）与 `workbuddy.ai`（国际）——现有 [credits.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/commands/workbuddy/credits.rs) 中 CN 分支实际混用 `codebuddy.cn` 与 `workbuddy.cn` 两个域，方案落码时一并收敛为 `region_billing_base()` 单源（见 §4.5）。
+> ⚠️ 注意区分 `workbuddy.cn`（国内）与 `workbuddy.ai`（国际）——现有 [credits.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/commands/workbuddy/credits.rs) 中 CN 分支实际混用 `codebuddy.cn` 与 `workbuddy.cn` 两个域，方案落码时一并收敛为 `region_billing_base()` 单源（见 §4.5）。✅ 已收敛：`region_activity_base`/`region_billing_base` 单源（wb_common.rs:591/:603），credits.rs 散点已全部接线。
 
 ### 🎯 1.2 目标
 
@@ -56,17 +56,19 @@
 
 ### ⚠️ 2.2 缺口清单（本方案工作量主体）
 
-| # | 缺口 | 位置 | 现状 |
-|---|---|---|---|
-| G-1 | **登录入口** | [oauth.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/commands/workbuddy/oauth.rs) `oauth_flow()` | `BASE=copilot.tencent.com`、`WEB_ORIGIN=www.codebuddy.cn` 硬编码，国际账号无法在应用内登录，只能靠手工导入凭证 |
-| G-2 | **token 刷新分区** | [accounts.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/commands/workbuddy/accounts.rs) L590、[wb_upstream.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/wb_upstream.rs) `WB_REFRESH_URL`、[wb_common.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/tasks/wb_common.rs) `REFRESH_URL` | 三处硬编码 `www.codebuddy.cn/v2/plugin/auth/token/refresh`，注释声称「不随区域」但**未对国际账号实测**（R-2） |
-| G-3 | **签到/成长/活动** | [wb_checkin.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/tasks/wb_checkin.rs) `urls_for()` | 主/备域名双探测仅覆盖国内形态，国际活动接口与响应结构未知（R-4） |
-| G-4 | **模型目录与倍率** | [wb_catalog.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/wb_catalog.rs)、模型倍率展示 | 国际版定价体系独立，倍率需静态配置；Global 专属模型清单未知（R-5） |
-| G-5 | **指纹清洗分区** | `wb_template_map.json` + `default_template_map()` | 清洗规则面向国内身份句（中文/国产 CLI 句式），国际 CLI 身份句（英文）无覆盖 |
-| G-6 | **池隔离** | [pool.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/pool.rs)、[dispatch.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/dispatch.rs) | 国际账号与国内账号**混居同一 `wb` 池**（仅布尔区分），调度策略 `wb_strategy`、粘性、冷却全局共享——「交织」的根源 |
-| G-7 | **记账口径** | [usage.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/usage.rs) `UsageBucket::Wb => "wb"` | 无独立 bucket，国际用量与国内混计 |
-| G-8 | **前端** | `src/pages/buddy/*`、[PoolHealthBadges.tsx](file:///d:/code/AIWorkAssistant_main/src/components/api/PoolHealthBadges.tsx) | 无区域列/分区 UI；签到配置、积分同步任务配置均为单区 |
-| G-9 | **UA/客户端指纹** | [wb_upstream.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/wb_upstream.rs) `WB_UA`/`WB_CLI_VERSION` | 固定国内 CLI `2.63.2`，国际 CLI 版本体系不同（R-3） |
+> **2026-10-15 代码审查回填**：下表缺口主体已落地，逐项现状以「落地状态」列为准。
+
+| # | 缺口 | 位置 | 现状 | 落地状态（2026-10-15 核对） |
+|---|---|---|---|---|
+| G-1 | **登录入口** | [oauth.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/commands/workbuddy/oauth.rs) `oauth_flow()` | ~~`BASE=copilot.tencent.com`、`WEB_ORIGIN=www.codebuddy.cn` 硬编码~~ | ✅ 已实现：`oauth_login_async(ep: &WbRegionEndpoints)` 区域参数化 + `buddy_ai_oauth_login`（`REGION_GLOBAL` + `PoolSink::BuddyAi`），Intl OAuth 可用 |
+| G-2 | **token 刷新分区** | accounts.rs L590、wb_upstream `WB_REFRESH_URL`、wb_common `REFRESH_URL` | ~~三处硬编码~~ | ✅ 已收口：网关侧 `refresh_access_token_for(intl)` 双池双端点（wb_upstream.rs:583）；CN 手动续期改经 `region_refresh_url(&domain)`（accounts.rs）；`REFRESH_URL` 仅作 CN 常量保留 |
+| G-3 | **签到/成长/活动** | [wb_checkin.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/tasks/wb_checkin.rs) `urls_for()` | ~~国际活动接口未知~~ | ✅ 已实现：`tasks/buddy_ai_checkin.rs`（ACP 每日活跃打卡 + `fetch_total_dosage` + 启动补跑），调度任务 `buddy-ai-checkin`（09:20，开关默认关） |
+| G-4 | **模型目录与倍率** | [wb_catalog.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/wb_catalog.rs) | ~~Global 清单未知~~ | ✅ 目录已实现：`builtin_buddy_ai()` 内置 Global 目录（SQLite kv 缓存）；⏳ 倍率静态配置与帮助页 Intl 档展示待补 |
+| G-5 | **指纹清洗分区** | `wb_template_map` + `default_template_map()` | ~~国际身份句无覆盖~~ | ✅ 已实现：`wb_route.rs:150` `template_map_key()` 分区键 `buddy_ai_template_map`；内置英文身份句条目随放量观察补齐 |
+| G-6 | **池隔离** | [pool.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/pool.rs)、dispatch.rs | ~~混居同一 wb 池~~ | ✅ 已实现：`state.buddy_ai_pool` 独立池 + `buddy_ai_pool_lock` + 一次性迁移 `migrate_wb_global_accounts`（幂等 marker + 备份）；导入侧 `is_intl_credential` 拒绝国际凭证入 CN 池（双重保险） |
+| G-7 | **记账口径** | [usage.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/usage.rs) | ~~无独立 bucket~~ | ✅ 已实现：`UsageBucket::BuddyAi => "buddy-ai"`（usage.rs:499） |
+| G-8 | **前端** | `src/pages/buddy/*`、PoolHealthBadges.tsx | ~~无区域列/分区 UI~~ | ✅ 已实现：`src/pages/buddyai/BuddyAiHome.tsx` 独立页 + 四页分区；PoolHealthBadges 组件池无关（props 驱动），healthz 后端已四池 selectable 上报，无需改造 |
+| G-9 | **UA/客户端指纹** | wb_upstream `WB_UA`/`WB_CLI_VERSION` | ~~固定国内 CLI 2.63.2~~ | ✅ 已实现：`REGION_CN.ua = CLI/2.63.2...`、`REGION_GLOBAL.ua = WorkBuddy/5.5.2...` 双身份常量分立（wb_common.rs:657-685） |
 
 ### 🧬 2.3 域名族谱
 
@@ -139,12 +141,12 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 
 | 维度 | CN（现状，不动） | Intl（新增，标识定稿 `buddy-ai`） |
 |---|---|---|
-| 产品标识 | **buddy**（UI 显示名；技术层池 id 保持 `wb` 不改——不交织硬约束，改名会全库波及） | **buddy-ai**（池 id / app_id / bucket / 前端档位全链统一） |
-| 池 id / app_id | `wb` | `buddy-ai` |
-| 池存储 | `wb` 池文件 / `wb_accounts` 表 | `buddy-ai` 池文件（store 库同表加 pool 维度或独立表，落码时按 store 现状择一） |
-| token store 键空间 | `tokens.<account_id>` | `tokens_buddy_ai.<account_id>`（同文件独立命名空间，避免双文件迁移成本） |
-| 用量 bucket | `UsageBucket::Wb => "wb"` | `UsageBucket::BuddyAi => "buddy-ai"` |
-| 粘性绑定键 | wb_sticky 现有前缀 | 独立前缀 `ba:`（落码时对齐 [wb_sticky.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/wb_sticky.rs) 现状） |
+| 产品标识 | **buddy**（UI 显示名；技术层内部命名 `wb_*` 保留不改——不交织硬约束，改名会全库波及；对外池标识统一 `buddy`，dispatch v1.2 命名约定 `TargetPool::Buddy`，`wb` 仅存内部字段名 `wb_pool`/`wb_enabled` 与账号 id 前缀 `wb-`） | **buddy-ai**（池 id / app_id / bucket / 前端档位全链统一，代码 `TargetPool::BuddyAi => "buddy-ai"`） |
+| 池 id / app_id | 对外 `buddy` / 内部 `wb_*` | `buddy-ai` |
+| 池存储 | `wb` 池（store 库 `wb_accounts` 表） | `buddy_ai_accounts` 独立表（store 库 SQLite，已落地） |
+| token store 键空间 | `wb_tokens` 表 + vault 命名空间 | **`buddy_ai_tokens` 独立表 + vault 命名空间 `buddy-ai`**（§8-5 定稿：敏感字段入 stronghold vault、DB 一律占位；`wb_common.rs` `BUDDY_AI_TOKEN_TABLE`/`BUDDY_AI_VAULT_NS`） |
+| 用量 bucket | `UsageBucket::Wb => "wb"` | `UsageBucket::BuddyAi => "buddy-ai"`（已落地） |
+| 粘性绑定键 | wb_sticky 现有前缀（`q:`/`t:`） | 前缀 **`g:`**（与 §4.2 一致；`wb_sticky.rs` 命名空间 `["q:", "t:", "g:"]`，已落地） |
 | 清洗模板 KV | `wb_template_map` | `buddy_ai_template_map`（独立热更新键，UI 独立入口） |
 | 调度策略键 | `wb_strategy` | `buddy_ai_strategy` |
 | 签到间隔 | `wb_checkin_gap_secs` | `buddy_ai_checkin_gap_secs`（`Option<u64>` 语义对齐） |
@@ -250,7 +252,7 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 | [BuddyAccounts.tsx](file:///d:/code/AIWorkAssistant_main/src/pages/buddy/BuddyAccounts.tsx) | 顶部区域 Tab（国内 / 国际）分列账号；账号卡加区域徽标；国际区登录按钮状态随 R-1 |
 | [BuddySettings.tsx](file:///d:/code/AIWorkAssistant_main/src/pages/buddy/BuddySettings.tsx) | 任务配置按区分组；Intl 签到/成长开关在 R-4 结论前不渲染 |
 | [BuddyApiService.tsx](file:///d:/code/AIWorkAssistant_main/src/pages/buddy/BuddyApiService.tsx) | 模型档位支持 `buddy-ai`（默认关）；国际区资源开关独立 |
-| [PoolHealthBadges.tsx](file:///d:/code/AIWorkAssistant_main/src/components/api/PoolHealthBadges.tsx) | 三池共用组件扩为四池（disabled/cooling/hard_credit/零积分/积分过期全挡「就绪」徽标口径不变） |
+| [PoolHealthBadges.tsx](file:///d:/code/AIWorkAssistant_main/src/components/api/PoolHealthBadges.tsx) | ✅ 无需改造：组件池无关（徽标由 `PoolStatus` props 驱动），后端 healthz 已四池 selectable 上报（`buddy_ai_available`，routes.rs）；disabled/cooling/hard_credit/零积分/积分过期全挡「就绪」徽标口径不变 |
 | BuddyCheckin.tsx | 国际区按 R-4 结论决定渲染签到页或仅积分页 |
 | 帮助页（模型倍率） | 加 `buddy-ai` 档倍率列 |
 
@@ -280,7 +282,7 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 |---|---|---|---|
 | R-1 | 国际版登录端点 | ✅✅ **全链路实测通过**（2026-10-15）：state（匿名四连头，code 0 → `data.state`+`data.authUrl`）→ 浏览器授权 → token 轮询 `11217`→code 0（`expiresIn≈365天`，`scope=openid profile offline_access email`，Keycloak 风格）。**authUrl 格式**：`{base}/login/?platform=workbuddy-ai&state=<uuid>&version=<客户端版本>`——官方桌面端实证带 `version=5.7.6`（⚠️ 比 agent2api 基准 5.5.2 新，选桌面端身份时 UA/版本应跟进 5.7.6）；我方探测不带 version 亦可通过（可选参数，落码对齐官方带上）；授权完成页弹 **deep link 唤起桌面客户端**，plugin 通道点取消即可｜⚠️ `/v2/plugin/auth/account`（单数）国际域 **404 不存在**，账号标识从 billing `Accounts[].AccountId/Uin` 取 | 无（§3.3 已更新） |
 | R-2 | 国际 refresh 端点 | ✅✅ **R-2a 实测收口**：`www.workbuddy.ai/v2/plugin/auth/token/refresh` code 0；`X-Auth-Refresh-Source` 取 `plugin` 与 `workbuddy` **均接受**（不做强校验）；**refreshToken 每次轮换** | 落码以响应新 rt 回写为准（对齐国内 refresh 逻辑） |
-| R-3 | 国际身份指纹 | ✅ **已解决**：两套候选（桌面端 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` / CLI `CLI/2.117.2 CodeBuddy/2.117.2`），均可走 `workbuddy.ai`（§9 附录 A）；实测桌面端身份头集 chat 200 通过 | 决策点 §8-1 选定身份基座后固化进 `WbRegionEndpoints` |
+| R-3 | 国际身份指纹 | ✅ **已解决**：两套候选（桌面端 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` / CLI `CLI/2.117.2 CodeBuddy/2.117.2`），均可走 `workbuddy.ai`（§9 附录 A）；实测桌面端身份头集 chat 200 通过 | ✅ 已拍板桌面端身份并落地 `REGION_GLOBAL`（UA 5.5.2 + `client_version=5.7.6`，wb_common.rs:672-685）；UA 是否跟进官方 5.7.6 列 R-7 同级观察项 |
 | R-4 | 签到/成长体系存在性 | ✅✅ **拍板要做 + 网页会话全链实测通过**（2026-10-15）：建会话→session→ACP 四连（全 202/200）→**completed 仅 3 秒**；沙箱为 e2b（`*.ap-singapore.sandbox.cloudstudio.club`，`acpBackend=sandbox_gateway`）；免费模型 `set_model` 生效实证（TotalDosage 350 前后不变） | 无（阶段 3 按 §4.5 补篇落码） |
 | R-5 | 模型目录与 Global 专属模型 | ✅ **已解决**：来源 `GET /v3/config` `agents[cli].models`；UA 带 CLI 段 → 51 模型全量，缺 → 37 旧版；Intl 17 个 / CN 14 个清单已拿到（§9 附录 A） | 目录拉取接入 + 同名模型跨区不混轮（两项目一致决策，与我方不交织原则同构） |
 | R-6 | billing 字段同构性 | ✅✅ **实测同构**：`data.Response.Data.{TotalCount, TotalDosage, Accounts[{AccountId, Uin, AppId, ProductCode:"p_tcaca", Status, ExpiredTime}]}`；⚠️ 无 `credits.remain`（该字段属 `get-enterprise-user-usage`）；TotalDosage=350 即总积分口径 | wb_credits 解析链对齐 TotalDosage/Accounts 字段 |
@@ -301,6 +303,12 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 
 **回滚设计**：池骨架与迁移均有版本号置位 + 备份文件，回滚 = 还原备份 + 版本号回退；dispatch `buddy-ai` 档默认关，网关行为回滚零影响；CN 侧唯一改动（域名收敛）独立 commit，可单独 revert。
 
+> **2026-10-15 代码审查落地核对**：
+> - **阶段 1**（池骨架）✅ 主体已落地：`WbRegionEndpoints` 两实例、`buddy-ai` 池注册（`state.buddy_ai_pool`/`buddy_ai_pool_lock`）、`buddy_ai_tokens` 表 + vault ns、Intl OAuth（`buddy_ai_oauth_login`）、手工导入区域校验、存量混居迁移 `migrate_wb_global_accounts`（幂等 marker + 备份）、healthz 四池 selectable。
+> - **阶段 2**（网关转发）✅ 主体已落地：双池取号（`WbView::wb/intl`）、dispatch `buddy-ai` 档（默认关 + Key 绑定兜底序列）、粘性 `g:` 前缀、11128/sent_any/-9901/CAS 护栏继承、`UsageBucket::BuddyAi` 记账、`buddy_ai_template_map` 分区清洗。
+> - **阶段 3**（运营面）✅ 大部分已落地：`buddy_ai_checkin` 打卡任务（含启动补跑）、`buddy_ai_credits_fetch` 积分同步、`builtin_buddy_ai` 目录、前端 `BuddyAiHome.tsx` 分区页；⏳ 待补：模型倍率 Intl 静态配置 + 帮助页档位列。
+> - 同日收口残余：CN 手动续期端点经 `region_refresh_url` 分区（accounts.rs）、wb_common 过时注释修正、CN 池双导入入口（auth 文件 / 导出文件）经 `is_intl_credential` 拒绝国际凭证 + 单测。
+
 ---
 
 ## ⚠️ 7. 风险与对策
@@ -319,11 +327,11 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 
 > 分层：2 已拍板（2026-10-15：每日活跃打卡**要做**，实现口径见 §4.5 补篇）；1 直接影响阶段 0 产出与阶段 2 接线，**优先拍板**；3-6 属实现选型，可在对应阶段开工前定。
 
-1. **身份基座选型**（R-3 残余）：WorkBuddy 桌面端身份（§9 附录 A 推荐：模型目录最全 51 个、两外部项目长期实证）vs CodeBuddy CLI 身份（降级候选）——选定后固化进 `WbRegionEndpoints`；现国内 CLI 身份（`SaaS` + `platform=CLI`）**不可平移**到国际区。
+1. ~~**身份基座选型**（R-3 残余）~~ → **已拍板并落地（2026-10-15）**：WorkBuddy 桌面端身份（§9 附录 A 推荐项：模型目录最全 51 个、两外部项目长期实证），`REGION_GLOBAL.ua = "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1"` + `client_version = "5.7.6"`（wb_common.rs:672-685）；UA 是否跟进官方 5.7.6 列 R-7 同级观察项。国内 CLI 身份（`SaaS` + `platform=CLI`）不可平移国际区，`REGION_CN` 保持不动。
 2. ~~**R-4 每日活跃打卡做不做**~~ ✅ **已拍板（2026-10-15）：要做**。国际版机制是「网页会话 + 沙箱把一轮对话真正跑完」（ACP over HTTP+SSE），实现成本远高于国内 daily-checkin——阶段 3 确定为「每日活跃打卡 Intl 化 + 积分同步」，实现口径侦察结论回填 §4.5 补篇。
 3. ~~**池 id 命名**~~ → **已定稿 `buddy-ai`**（2026-10-15 用户拍板；国内产品标识 buddy / 技术层池 id `wb` 不动，国际版池 id / app_id / bucket / 前端档位统一 `buddy-ai`，对照表见 §3.4/§3.5）。
 4. ~~**Intl 登录是否首版交付**~~ → **建议并入阶段 1**（2026-10-15 R-1 全链路实测通过，登录流已无技术不确定性；OAuth 三件套 + authUrl 流转 + rt 轮换口径全部实锤，见 §5 R-1/R-2）。
-5. **token store 单文件双命名空间 vs 独立文件**：§3.4 推荐前者（省一次迁移机制），若 store 库表结构更宜分表则从其约定。
+5. ~~**token store 单文件双命名空间 vs 独立文件**~~ → **已定稿（2026-10-15）**：独立 SQLite 表 `buddy_ai_tokens` + stronghold vault 命名空间 `buddy-ai`（敏感字段不入 DB 明文；`wb_common.rs` `BUDDY_AI_TOKEN_TABLE`/`BUDDY_AI_VAULT_NS`），按「store 库表结构更宜分表则从其约定」条款落地。
 6. **是否同步立项 F-71（Trae SG）**：本方案的「区域端点结构体 + 独立池」骨架可直接被 F-71 复用，若同期立项可共享阶段 0 侦察产出。
 
 ---

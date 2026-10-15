@@ -575,8 +575,10 @@ pub fn get_json(
 }
 
 // ── 区域路由（T4.5/F-36，§5.2）──────────────────────────────────────────────
-// CN：billing/积分 + 活动接口走 www.codebuddy.cn；Global（domain 含 .workbuddy.ai）：
-// 全走 www.workbuddy.ai。plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+// CN：billing/积分走 www.codebuddy.cn、活动接口走 www.workbuddy.cn；
+// Global（domain 含 .workbuddy.ai）全走 www.workbuddy.ai。
+// token refresh 随区域切换（R-2a 实测收口：Intl=workbuddy.ai /v2/plugin/auth/token/refresh
+// code 0，rt 每次轮换）——见下方 region_refresh_url；REFRESH_URL 仅 CN 侧消费。
 
 pub const BILLING_BASE_CN: &str = "https://www.codebuddy.cn";
 pub const BILLING_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
