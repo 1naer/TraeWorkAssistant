@@ -47,10 +47,17 @@ export default function BuddyAiOverview() {
     setRefreshing(true);
     try {
       const [accs, recs, cat, pf] = await Promise.all([
-        api.buddyai.accountsList().catch(() => [] as BuddyAiAccountView[]),
+        api.buddyai.accountsList().catch((e) => {
+          pushToast('error', `账号列表加载失败：${String(e).slice(0, 120)}`);
+          return [] as BuddyAiAccountView[];
+        }),
         api.buddyai.checkinResults(30).catch(() => [] as WbCheckinRecord[]),
         api.apiServer.buddyAiCatalogList().catch(() => [] as WbModelInfo[]),
-        api.apiServer.poolList().catch(() => null),
+        api.apiServer.poolList().catch((e) => {
+          // FM-1：加载失败与「未开启」必须可区分（原静默吞掉显示假态）
+          pushToast('error', `池配置加载失败：${String(e).slice(0, 120)}`);
+          return null;
+        }),
       ]);
       setAccounts(accs);
       setRecords(recs);

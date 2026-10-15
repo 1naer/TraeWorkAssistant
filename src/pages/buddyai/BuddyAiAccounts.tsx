@@ -78,6 +78,12 @@ export default function BuddyAiAccounts() {
       ]);
       setAccounts(accs);
       setGroups(gs);
+      // FH-4 配套：selected 裁剪到现存账号（他端增删后全选框判定不失真）
+      setSelected((prev) => {
+        const ids = new Set(accs.map((a) => a.id));
+        const next = new Set([...prev].filter((id) => ids.has(id)));
+        return next.size === prev.size ? prev : next;
+      });
     } catch (err) {
       pushToast('error', `账号列表读取失败：${String(err).slice(0, 120)}`);
     } finally {
@@ -96,9 +102,11 @@ export default function BuddyAiAccounts() {
     return m;
   }, [groups]);
 
-  // OAuth 弹框事件契约：事件前缀 buddy-ai-oauth-*（310s 看门狗兜底事件丢失）
+  // OAuth 弹框事件契约：事件前缀 buddy-ai-oauth-*（310s 看门狗兜底事件丢失）。
+  // FL-6 审查修复：监听只在弹框打开时注册一次（原依赖含 oauthBusy，done 置 false
+  // 会触发 cleanup+重挂监听/重启 watchdog——无泄漏但属无谓重建）
   useEffect(() => {
-    if (!oauthOpen && !oauthBusy) return;
+    if (!oauthOpen) return;
     let watchdog: ReturnType<typeof setTimeout> | undefined;
     const unProgress = listen<WbOauthProgress>('buddy-ai-oauth-progress', (e) => {
       setOauthStage(e.payload.stage ?? '');
@@ -126,7 +134,7 @@ export default function BuddyAiAccounts() {
       if (watchdog) clearTimeout(watchdog);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [oauthOpen, oauthBusy]);
+  }, [oauthOpen]);
 
   const startOauth = async () => {
     if (oauthBusy) return;
@@ -236,6 +244,8 @@ export default function BuddyAiAccounts() {
     setExportBusy(true);
     try {
       const payload = await api.buddyai.accountsExport(exportWithCreds);
+      // FL-5：导出计数取自导出载荷（页面快照可能已过期）
+      const exportedCount = Array.isArray(payload.accounts) ? payload.accounts.length : 0;
       const filePath = await save({
         defaultPath: `buddy-ai-accounts-${new Date().toISOString().slice(0, 10)}.json`,
         filters: [{ name: 'JSON', extensions: ['json'] }],
@@ -245,7 +255,7 @@ export default function BuddyAiAccounts() {
         return;
       }
       await api.misc.writeTextFile(filePath, JSON.stringify(payload, null, 2));
-      pushToast('success', `已导出 ${accounts?.length ?? 0} 个账号到 ${filePath}${exportWithCreds ? '（含凭证明文，请妥善保管）' : ''}`);
+      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${exportWithCreds ? '（含凭证明文，请妥善保管）' : ''}`);
       setExportOpen(false);
     } catch (err) {
       pushToast('error', `导出失败：${String(err).slice(0, 160)}`);
@@ -261,14 +271,33 @@ export default function BuddyAiAccounts() {
       if (confirmTarget.kind === 'remove-account') {
         await withMinDelay(api.buddyai.accountRemove(confirmTarget.account.id), 800);
         pushToast('info', `已移除 ${confirmTarget.account.nickname || confirmTarget.account.id}`);
+        setConfirmTarget(null);
       } else {
+        // FH-4 审查修复：批量移除逐项容错——失败项收集继续，成功项即时从 selected
+        // 剔除（原实现中途失败即中断且 selected 残留已删 id，重试必撞「账号不存在」，
+        // 排在失败项之后的账号永远删不掉）
+        const failed: string[] = [];
+        let removed = 0;
         for (const id of confirmTarget.ids) {
-          await api.buddyai.accountRemove(id);
+          try {
+            await api.buddyai.accountRemove(id);
+            removed += 1;
+            setSelected((prev) => {
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+          } catch {
+            failed.push(id);
+          }
         }
-        pushToast('info', `已批量移除 ${confirmTarget.ids.length} 个账号`);
+        if (failed.length === 0) {
+          pushToast('info', `已批量移除 ${removed} 个账号`);
+          setConfirmTarget(null);
+        } else {
+          pushToast('error', `已移除 ${removed} 个，${failed.length} 个失败（${failed.slice(0, 3).join(', ')}${failed.length > 3 ? '…' : ''}），弹框保留可重试`);
+        }
       }
-      setSelected(new Set());
-      setConfirmTarget(null);
       await refresh();
     } catch (err) {
       pushToast('error', `移除失败：${String(err).slice(0, 120)}`);

@@ -277,22 +277,8 @@ struct ModelSources {
 
 impl ModelSources {
     /// 是否多源（≥2 个源存在，忽略开关状态）：跨池回退的前提。
-    /// 命名沿用 is_dual（历史上只有双源）；Qoder 加入后语义泛化为「多源」
-    fn is_dual(&self) -> bool {
-        let mut n = 0;
-        if self.buddy.is_some() {
-            n += 1;
-        }
-        if self.trae {
-            n += 1;
-        }
-        if self.qoder.is_some() {
-            n += 1;
-        }
-        n >= 2
-    }
-
-    /// 可用源计数（感知开关状态）：智能调度重排门槛用
+    /// 可用源计数（感知开关状态）：智能调度重排与回退闸门用
+    ///（BM-3：原 is_dual 家族计数已由本方法取代——Buddy/BuddyAi 独立失败域各自计数）
     fn available_count(
         &self,
         trae_enabled: bool,
@@ -716,11 +702,17 @@ pub fn resolve_target(
             }
             Err(reason) => {
                 // 首选池不可用：双源 + fallback 开 + 后续还有可用源 → 按序回退；
-                // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）
+                // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）。
+                // BM-3 审查修复：门控从 is_dual（家族计数，Buddy/BuddyAi 同族不叠加）
+                // 改为可用源计数 ≥2——同目录模型的 buddy/buddy-ai 是两个独立失败域
+                //（§3.1），姊妹池回退应放行；available_count 只数可用源，语义更精确
+                //（旧 is_dual 把已停用池也计入家族数）
                 let has_next = order[i + 1..]
                     .iter()
                     .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled));
-                let can_fallback = policy.fallback && sources.is_dual() && has_next;
+                let can_fallback = policy.fallback
+                    && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
+                    && has_next;
                 if !can_fallback {
                     return Err(match (pool, reason) {
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {

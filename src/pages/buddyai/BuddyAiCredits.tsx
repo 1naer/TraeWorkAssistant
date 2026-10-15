@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, Coins } from 'lucide-react';
 import {
   CartesianGrid,
@@ -151,19 +151,26 @@ export default function BuddyAiCredits() {
       ),
     [list],
   );
-  // 请求明细拉取（P9：官网分页接口）
+  // 请求明细拉取（P9：官网分页接口）。
+  // FH-3 审查修复：递增序号守卫——慢响应后到会覆盖新筛选条件的结果（张冠李戴）
+  const usageSeq = useRef(0);
   const loadUsage = useCallback(
     async (acctId: string, days: number, page: number) => {
       if (!acctId) return;
+      const seq = ++usageSeq.current;
       setUsageLoading(true);
       try {
         const r = await api.buddyai.requestUsage(acctId, days, page, 20);
+        if (seq !== usageSeq.current) return; // 过期响应丢弃
         setUsageData(r);
+        // FM-2：以服务端夹取后的页码为准回同步（筛选/翻页错位自愈）
+        setUsagePage(r.page);
       } catch (err) {
+        if (seq !== usageSeq.current) return;
         pushToast('error', `请求流水查询失败：${String(err).slice(0, 160)}`);
         setUsageData(null);
       } finally {
-        setUsageLoading(false);
+        if (seq === usageSeq.current) setUsageLoading(false);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -441,6 +448,8 @@ export default function BuddyAiCredits() {
             onChange={(e) => {
               setUsageDays(Number(e.target.value));
               setUsagePage(1);
+              // FM-2：筛选条件变更清空旧窗口数据（旧 total/旧行不得滞留展示）
+              setUsageData(null);
             }}
           >
             <option value={7}>近 7 天</option>
@@ -477,8 +486,8 @@ export default function BuddyAiCredits() {
                   </tr>
                 </thead>
                 <tbody>
-                  {usageData.rows.map((r) => (
-                    <tr key={r.requestId} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
+                  {usageData.rows.map((r, i) => (
+                    <tr key={`${r.requestId}-${i}`} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
                       <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">{r.requestTime}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{r.model}</td>
                       <td className="py-2 pr-3 text-xs text-slate-500">{r.client}</td>

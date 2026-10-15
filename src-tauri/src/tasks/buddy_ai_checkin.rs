@@ -172,36 +172,6 @@ fn dig_f64(v: &Value, key: &str) -> Option<f64> {
     x.as_f64().or_else(|| x.as_str()?.parse().ok())
 }
 
-/// 全树收集同名标量（限深 8；Accounts[] 多条 ExpiredTime 用）
-fn dig_all(v: &Value, key: &str) -> Vec<Value> {
-    let mut out = Vec::new();
-    fn walk(v: &Value, key: &str, depth: u32, out: &mut Vec<Value>) {
-        if depth > 8 {
-            return;
-        }
-        match v {
-            Value::Object(m) => {
-                if let Some(x) = m.get(key) {
-                    if !x.is_null() && !x.is_object() && !x.is_array() {
-                        out.push(x.clone());
-                    }
-                }
-                for x in m.values() {
-                    walk(x, key, depth + 1, out);
-                }
-            }
-            Value::Array(a) => {
-                for x in a {
-                    walk(x, key, depth + 1, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    walk(v, key, 0, &mut out);
-    out
-}
-
 // ── ACP 六步链 ──────────────────────────────────────────────────────────────
 
 /// 网页腿公共头（§4.5：Bearer 账号 token + X-User-Id + Chrome UA + Origin/Referer，
@@ -276,7 +246,11 @@ fn process_account(
     let base = "https://www.workbuddy.ai";
     let fail = |m: String| result_ev(acct_id, nickname, "fail", &m);
 
-    // 幂等戳：token rec `last_daily_chat`（本地日期；成功才落盘）
+    // 幂等戳：token rec `last_daily_chat`（本地日期；成功才落盘）。
+    // 读段持每账号刷新锁：打卡与网关 401 自愈/手动续期共享一把锁（R-2a rt 轮换
+    // 一次一换，读-用-写跨 120s+ 六步链窗口，无锁会把并发轮换的新凭证读旧）
+    let refresh_lock = crate::tasks::wb_common::refresh_lock_for(acct_id);
+    let _read_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
     let store = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);
     let rec = store
         .get("tokens")
@@ -287,6 +261,8 @@ fn process_account(
     if last == today_stamp() {
         return result_ev(acct_id, nickname, "already", "今日已完成活跃打卡");
     }
+    // 锁释放（六步链执行期不持锁——避免阻塞并发的凭证续期；写段见下方二次加锁）
+    drop(_read_guard);
 
     // ⑥ 前置：打卡前积分快照（失败不阻塞打卡——到账校验是加分项不是门槛）
     let before = fetch_dosage_info(agent, base, token, uid);
@@ -342,9 +318,15 @@ fn process_account(
         Err(e) => return fail(format!("取沙箱失败：{e}")),
     };
 
-    // ③ ACP 通道：GET link（SSE）→ 响应头 Acp-Connection-Id
+    // ③ ACP 通道：GET link（SSE）→ 响应头 Acp-Connection-Id。
+    // BL-3 审查修复：裸 ureq::get 默认无超时——沙箱端点挂起会永久阻塞打卡线程
+    //（轮次守卫不泄漏但当日后续轮次恒 skipped_busy），改用带 30s 超时的 agent
+    let acp_agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
     let conn_id = with_backoff(|| {
-        let resp = ureq::get(&link)
+        let resp = acp_agent.get(&link)
             .set("Accept", "text/event-stream")
             .set("Authorization", &format!("Bearer {sandbox_token}"))
             .set("User-Agent", "Mozilla/5.0")
@@ -391,7 +373,7 @@ fn process_account(
     for (rid, method, params) in steps {
         let payload = rpc(rid, method, params);
         let res = with_backoff(|| {
-            let resp = ureq::post(&link)
+            let resp = acp_agent.post(&link)
                 .set("Acp-Connection-Id", &conn_id)
                 .set("Authorization", &format!("Bearer {sandbox_token}"))
                 .set("Content-Type", "application/json")
@@ -443,9 +425,17 @@ fn process_account(
         (Some(b), Some(a)) if a.total > b.total => Some(a.total - b.total),
         _ => None,
     };
-    // 幂等戳：token rec 增量更新（敏感字段经 secure upsert 保持占位口径——
-    // upsert 会对敏感字段重新 vault 回填/占位，last_daily_chat 明文字段直存）
-    let mut new_rec = rec.clone();
+    // 幂等戳落盘（BH-1 审查修复）：持刷新锁 + 锁内重读最新 rec 合并写回——
+    // 六步链窗口内并发续期（网关 401 自愈/手动续期）已轮换 rt 并合并落库，
+    // 若用六步链前的旧 rec 整行 REPLACE 会把新凭证抹回旧值（rt 已作废 → 账号须重登）
+    let write_lock = crate::tasks::wb_common::refresh_lock_for(acct_id);
+    let _write_guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let latest = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);
+    let mut new_rec = latest
+        .get("tokens")
+        .and_then(|t| t.get(acct_id))
+        .cloned()
+        .unwrap_or_else(|| rec.clone());
     new_rec["last_daily_chat"] = json!(today_stamp());
     if let Err(e) = crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, acct_id, &new_rec) {
         return fail(format!("打卡幂等戳落盘失败（记为未完成防假打卡）：{e}"));
@@ -585,14 +575,45 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        // 本轮涉及账号的当日旧行移除（最终态覆盖）
+        // 本轮涉及账号的当日旧行移除（最终态覆盖）。
+        // BM-4 审查修复：already 是 no-op 非最终态——当日已有 success（含 reward）
+        // 行时，重跑产生的 already 事件不得覆盖（否则调度成功后任何一次手动重跑
+        // 都会把当日奖励行抹成空 already，趋势/日历丢数据）。仅 fail/success 覆盖
+        let uid_of = |r: &Value| r.get("user_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let ev_uid = |e: &Value| e.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let success_today: std::collections::HashSet<String> = merged
+            .iter()
+            .filter(|r| {
+                r.get("date").and_then(Value::as_str) == Some(date.as_str())
+                    && r.get("status").and_then(Value::as_str) == Some("success")
+            })
+            .map(uid_of)
+            .collect();
+        let replace_uids: std::collections::HashSet<String> = events
+            .iter()
+            .filter(|e| e.get("status").and_then(Value::as_str) != Some("already"))
+            .map(ev_uid)
+            .collect();
+        let already_only_uids: std::collections::HashSet<String> = events
+            .iter()
+            .filter(|e| {
+                e.get("status").and_then(Value::as_str) == Some("already")
+                    && !success_today.contains(&ev_uid(e))
+            })
+            .map(ev_uid)
+            .collect();
         merged.retain(|r| {
-            !(r.get("date").and_then(Value::as_str) == Some(date.as_str())
-                && events
-                    .iter()
-                    .any(|e| e.get("id").and_then(Value::as_str) == r.get("user_id").and_then(Value::as_str)))
+            let today_row = r.get("date").and_then(Value::as_str) == Some(date.as_str());
+            let uid = uid_of(r);
+            !(today_row && (replace_uids.contains(&uid) || already_only_uids.contains(&uid)))
         });
         for e in &events {
+            // 当日已有成功行的账号：already 事件跳过不落（保留 success+reward 行）
+            if e.get("status").and_then(Value::as_str) == Some("already")
+                && success_today.contains(&ev_uid(e))
+            {
+                continue;
+            }
             merged.push(json!({
                 "date": date,
                 "time": time,
@@ -641,6 +662,36 @@ mod tests {
         assert_eq!(s.len(), 10);
         assert_eq!(s.as_bytes()[4], b'-');
         assert_eq!(s.as_bytes()[7], b'-');
+    }
+
+    /// 全树收集同名标量（限深 8；BL-6：仅测试消费，从生产代码移入）
+    fn dig_all(v: &Value, key: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        fn walk(v: &Value, key: &str, depth: u32, out: &mut Vec<Value>) {
+            if depth > 8 {
+                return;
+            }
+            match v {
+                Value::Object(m) => {
+                    if let Some(x) = m.get(key) {
+                        if !x.is_null() && !x.is_object() && !x.is_array() {
+                            out.push(x.clone());
+                        }
+                    }
+                    for x in m.values() {
+                        walk(x, key, depth + 1, out);
+                    }
+                }
+                Value::Array(a) => {
+                    for x in a {
+                        walk(x, key, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(v, key, 0, &mut out);
+        out
     }
 
     /// TotalDosage 解析：R-6 嵌套形态 data.Response.Data + 毫秒 ExpiredTime 归一

@@ -64,13 +64,21 @@ export default function BuddyAiCheckin() {
   }, [settings]);
 
   const saveConfig = async (patch: { enabled?: boolean } = {}) => {
+    // FM-3 审查修复：时刻合法性校验——后端用字符串比较判定「已过时刻」，
+    // 非法值（9:30 缺零填充 / 任意文本）会让比较恒真，任务每天启动即补跑
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(hhmm.trim())) {
+      pushToast('error', '打卡时刻格式无效（需 HH:MM，如 09:20），已还原');
+      await refreshSettings();
+      return;
+    }
     setSaving(true);
     try {
+      const nextGap = Number.isFinite(gap) ? Math.min(Math.max(Math.round(gap), 0), 600) : 0;
       await withMinDelay(
         api.misc.settingsSet({
           buddy_ai_checkin_enabled: patch.enabled ?? enabled,
           buddy_ai_checkin_hhmm: hhmm.trim() || '09:20',
-          buddy_ai_checkin_gap_secs: gap,
+          buddy_ai_checkin_gap_secs: nextGap,
         }),
         400,
       );
@@ -79,7 +87,10 @@ export default function BuddyAiCheckin() {
         ? (patch.enabled ? '已开启每日活跃打卡（按调度时刻自动执行）' : '已关闭每日活跃打卡')
         : '打卡配置已保存');
     } catch (err) {
-      pushToast('error', `保存失败：${String(err).slice(0, 120)}`);
+      // FH-1 审查修复：保存失败回滚本地态（refreshSettings 触发回填 effect，
+      // 把 enabled/hhmm/gap 拉回后端真实值）——否则 UI 显示已开启而调度器仍关闭
+      await refreshSettings().catch(() => {});
+      pushToast('error', `保存失败（已还原显示）：${String(err).slice(0, 120)}`);
     } finally {
       setSaving(false);
     }
@@ -106,8 +117,13 @@ export default function BuddyAiCheckin() {
       } else if (parsed.type === 'done') {
         setLines((prev) => [
           ...prev,
-          `整轮完成：成功 ${parsed.ok} / 已完成 ${parsed.already} / 失败 ${parsed.failed}`,
+          `整轮完成：成功 ${parsed.ok} / 已完成 ${parsed.already} / 失败 ${parsed.failed}` +
+            // FH-2 配套：初始化失败等异常路径的 done 带失败原因，必须可见
+            (parsed.message ? ` — ${parsed.message}` : ''),
         ]);
+        if (Number(parsed.failed) > 0) {
+          pushToast('error', `打卡存在失败（${parsed.failed} 个账号），详见执行进度`);
+        }
         void load();
       } else if (parsed.index) {
         setLines((prev) => [...prev, `#${parsed.index} ${parsed.name ?? ''}：${parsed.status ?? ''} — ${parsed.message ?? ''}`]);
@@ -312,8 +328,10 @@ export default function BuddyAiCheckin() {
             {calCells.map((c, i) => {
               if (!c) return <div key={`e${i}`} />;
               const st = dayStat.get(c.date);
+              // FM-4 审查修复：有失败优先标玫瑰（原实现「1 成功 + 2 失败」显示绿色
+              // 与图例矛盾）；全无失败且有成功=翡翠；仅跳过/已完成=琥珀
               const cls = st
-                ? st.f > 0 && st.s === 0
+                ? st.f > 0
                   ? 'bg-rose-500/15 text-rose-500'
                   : st.s > 0
                     ? 'bg-emerald-500/15 text-emerald-500'

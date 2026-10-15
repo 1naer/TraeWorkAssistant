@@ -25,7 +25,26 @@ use super::oauth::{oauth_login_async, PoolSink};
 
 pub(super) fn load_buddy_pool(state: &AppState) -> WbPool {
     let v = crate::store::docs::buddy_ai_pool_load(&crate::store::db(&state.data_dir));
-    serde_json::from_value(v).unwrap_or_default()
+    // BM-2 审查修复：逐行反序列化跳过坏行——整池 from_value 失败 → 空池 → 后续
+    // save 整表替换会把全部账号清空（读失败被写放大为数据丢失）。坏行记日志留证
+    match serde_json::from_value::<WbPool>(v.clone()) {
+        Ok(p) => p,
+        Err(_) => {
+            let mut accounts = Vec::new();
+            if let Some(arr) = v.get("accounts").and_then(Value::as_array) {
+                for (i, row) in arr.iter().enumerate() {
+                    match serde_json::from_value::<WorkBuddyAccount>(row.clone()) {
+                        Ok(a) => accounts.push(a),
+                        Err(e) => fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("buddy-ai: 池行损坏已跳过（index {i}）: {e}"),
+                        ),
+                    }
+                }
+            }
+            WbPool { accounts }
+        }
+    }
 }
 
 /// buddy-ai 池账号花名册（跨模块 tasks/buddy_ai_checkin 消费；WbPool 字段
@@ -89,7 +108,12 @@ pub(crate) fn buddy_ai_credits_snapshot_save(state: &AppState, pool: &WbPool) {
             })
         })
         .collect();
-    let total: f64 = pool.accounts.iter().filter_map(|a| a.credits_balance).sum();
+    let total: f64 = pool
+        .accounts
+        .iter()
+        .filter(|a| !a.disabled) // BL-7：停用账号不计入趋势口径（与花名册/网关池一致）
+        .filter_map(|a| a.credits_balance)
+        .sum();
     let snap = json!({
         "date": today,
         "ts": chrono::Utc::now().timestamp(),
@@ -239,12 +263,37 @@ pub fn buddy_ai_account_import_creds(
         save_buddy_pool(&state, &pool)?;
         target_id
     };
-    let creds = json!({
+    // BL-2 审查修复：同 id 重导合并式写回——upsert 是整行 REPLACE，从零构造会：
+    // ① rt 缺省时 DB 占位置空但 vault 旧 rt 仍在（secure 回填复活，与「无则不可
+    // 续期」语义矛盾）；② 抹掉 last_daily_chat/uid（当日打卡被重跑）。改为在旧
+    // rec 上合并：新值优先、缺省回落旧值、幂等戳恒保留
+    let existing = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
+        .get("tokens")
+        .and_then(|t| t.get(&target_id))
+        .cloned()
+        .unwrap_or_default();
+    let new_rt = refresh_token.as_deref().filter(|t| !t.trim().is_empty());
+    let old_rt = existing.get("refresh_token").and_then(Value::as_str);
+    let mut creds = json!({
         "access_token": token,
-        "refresh_token": refresh_token.as_deref().filter(|t| !t.trim().is_empty()),
+        "refresh_token": new_rt.map(Value::from).unwrap_or_else(|| json!(old_rt.unwrap_or(""))),
         "expires_at_ms": exp_s.map(|s| s * 1000),
         "domain": domain,
     });
+    if let Some(obj) = creds.as_object_mut() {
+        // uid：导入提供优先，否则回落旧值
+        obj.insert(
+            "uid".into(),
+            json!(if uid.is_empty() {
+                existing.get("uid").and_then(Value::as_str).unwrap_or("")
+            } else {
+                uid.as_str()
+            }),
+        );
+        if let Some(ldc) = existing.get("last_daily_chat") {
+            obj.insert("last_daily_chat".into(), ldc.clone());
+        }
+    }
     crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &target_id, &creds)?;
     fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 手工导入国际账号 {target_id}"));
     Ok(json!({ "id": target_id, "domain": domain }))
@@ -469,7 +518,10 @@ pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
     std::thread::spawn(move || {
         let _round = _round; // 显式移动进闭包，Drop 自动复位 BUSY（含 panic 展开）
         let st = AppState::new();
-        let payload = match st {
+        // FH-2 审查修复：Err（AppState 初始化失败）分支此前只发 exit，done 载荷
+        // 从未 emit → 前端 running 复位、进度空白、零失败反馈。正常路径的 done 由
+        // run_checkin_round 末尾回调发出（不在此重复 emit），此处仅 Err 分支补发
+        let err_done = match st {
             Ok(st) => {
                 let mut events: Vec<Value> = Vec::new();
                 let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, &mut |ev| {
@@ -491,12 +543,14 @@ pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
                             .join("; "),
                     ),
                 );
-                done
+                None
             }
-            Err(e) => json!({ "type": "done", "ok": 0, "already": 0, "failed": 1, "message": e }),
+            Err(e) => Some(json!({ "type": "done", "ok": 0, "already": 0, "failed": 1, "message": e })),
         };
+        if let Some(done) = err_done {
+            let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(&done).unwrap_or_default());
+        }
         let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(&json!({"type":"exit"})).unwrap_or_default());
-        let _ = payload;
     });
     Ok(())
 }
@@ -611,8 +665,10 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
                 "refresh_token_expires_at": a.refresh_token_expires_at,
                 "auth_saved_at": a.auth_saved_at,
                 "needs_relogin": a.needs_relogin, "relogin_reason": a.relogin_reason,
+                "disabled": a.disabled,
                 "credits_balance": a.credits_balance, "credits_expire_at": a.credits_expire_at,
                 "credits_fetched_at": a.credits_fetched_at,
+                "credits_packages": a.credits_packages,
                 "has_credential": rec.get("access_token").and_then(Value::as_str).map(|t| !t.is_empty()).unwrap_or(false),
                 "domain": rec.get("domain").and_then(Value::as_str).unwrap_or("www.workbuddy.ai"),
             })
@@ -759,14 +815,18 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
         }
     }
     // wb 侧后写（池整存 + 混居 token 行删除；vault 旧条目留存不删——加密数据无害，
-    // 避免迁移中断后 wb 侧凭证丢失不可回滚）。wb_pool_lock 已在函数顶部持有
+    // 避免迁移中断后 wb 侧凭证丢失不可回滚）。wb_pool_lock 已在函数顶部持有。
+    // BM-1 审查修复：标记先于 token 行删除置位——③删行与④置位间中断时，重试会因
+    // wb token 行已删（domain 丢失 → 非 global 判定）把已迁账号误归留守 wb 池，
+    // 产生「wb 池无凭证幽灵账号 + buddy-ai 池重复」且迁移永久放弃。先置位后删行：
+    // 中断残留的 wb token 行无人消费（wb 池行已移除），无害可清
     {
         save_pool(state, &wb_pool)?;
+        db.kv_set_raw(MIGRATION_MARKER, &chrono::Utc::now().to_rfc3339())?;
         for id in moved_tokens.keys() {
             crate::store::docs::token_store_remove(&db, "wb_tokens", id)?;
         }
     }
-    db.kv_set_raw(MIGRATION_MARKER, &chrono::Utc::now().to_rfc3339())?;
     let names: Vec<String> = moved_accounts.iter().map(|a| a.id.clone()).collect();
     fs_utils::app_log(
         &state.data_dir,
@@ -880,7 +940,13 @@ pub fn buddy_ai_request_usage(
         "pageSize": page_size,
     });
     let agent = crate::tasks::http_agent(30);
-    let send = |url: String| -> Result<Value, String> {
+    // BL-1 审查修复：按状态码判定路径回退（原实现对错误字符串 contains("404")
+    // 匹配——依赖 ureq Display 格式，网络错误消息偶含 "404" 会误触发重试）
+    enum UsageErr {
+        Status(u16),
+        Msg(String),
+    }
+    let send = |url: String| -> Result<Value, UsageErr> {
         let resp = agent
             .post(&url)
             .set("Authorization", &format!("Bearer {token}"))
@@ -888,16 +954,23 @@ pub fn buddy_ai_request_usage(
             .set("X-Client-Platform", "web")
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())
-            .map_err(|e| format!("请求流水查询失败: {e}"))?;
+            .map_err(|e| match e {
+                ureq::Error::Status(code, _) => UsageErr::Status(code),
+                other => UsageErr::Msg(other.to_string()),
+            })?;
         resp.into_json()
-            .map_err(|e| format!("请求流水响应解析失败: {e}"))
+            .map_err(|e| UsageErr::Msg(format!("请求流水响应解析失败: {e}")))
     };
     let v = match send(format!("{base}/v2/billing/meter/get-user-request-usage")) {
         Ok(v) => v,
-        Err(e) if e.contains("404") || e.contains("Not Found") => {
-            send(format!("{base}/billing/meter/get-user-request-usage"))?
-        }
-        Err(e) => return Err(e),
+        // 404 = /v2 前缀不存在 → 回退裸路径（官网网页走裸路径）
+        Err(UsageErr::Status(404)) => send(format!("{base}/billing/meter/get-user-request-usage"))
+            .map_err(|e| match e {
+                UsageErr::Status(code) => format!("请求流水查询失败（HTTP {code}）"),
+                UsageErr::Msg(m) => m,
+            })?,
+        Err(UsageErr::Status(code)) => return Err(format!("请求流水查询失败（HTTP {code}）")),
+        Err(UsageErr::Msg(m)) => return Err(m),
     };
     if v.get("code").and_then(Value::as_i64) != Some(0) {
         return Err(format!(

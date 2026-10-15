@@ -35,8 +35,16 @@ export default function BuddyAiApiService() {
     setLoading(true);
     try {
       const [pf, accs, cat] = await Promise.all([
-        api.apiServer.poolList().catch(() => null),
-        api.buddyai.accountsList().catch(() => [] as BuddyAiAccountView[]),
+        api.apiServer.poolList().catch((e) => {
+          // FM-1 审查修复：池配置加载失败必须可见（原静默吞掉 → 横幅显示「未启用」
+          // 假态，点一键开启又报池未加载，用户无从分辨）
+          pushToast('error', `池配置加载失败：${String(e).slice(0, 120)}`);
+          return null;
+        }),
+        api.buddyai.accountsList().catch((e) => {
+          pushToast('error', `账号列表加载失败：${String(e).slice(0, 120)}`);
+          return [] as BuddyAiAccountView[];
+        }),
         api.apiServer.buddyAiCatalogList().catch(() => [] as WbModelInfo[]),
       ]);
       setPool(pf);
@@ -52,6 +60,7 @@ export default function BuddyAiApiService() {
     } finally {
       setLoading(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
