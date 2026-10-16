@@ -1290,15 +1290,6 @@ pub fn doubao_renew_run(
     Ok(v)
 }
 
-/// 把计划任务的长命令写入数据目录的 .cmd 启动器，返回启动器路径。
-/// 背景（实测 2026-09-09）：schtasks /TR 参数上限 **261 字符**，dev 构建的
-/// python/脚本绝对路径拼出的命令达 273 字符 → schtasks 报参数错误，注册失败，
-/// 而错误 toast 仅显示 4 秒，被用户感知为「点击注册没有反应」。改用启动器后
-/// /TR 只需 ~74 字符。
-/// （审查 P2 修复：实现提升为 misc.rs 公共函数，签到任务与豆包任务共用同一方案，
-/// 消除 misc.rs build_task_tr 拼长命令再次超限的回归）
-use crate::commands::misc::write_task_launcher;
-
 /// 从 schtasks /FO LIST 输出提取首个 HH:MM（等价正则 \d{2}:\d{2}；
 /// 仓库未引入 regex crate，手写字符扫描。旧实现按 ": " 切片在本地化输出
 /// "Start Time: 08:30:00" / 中文行混排时可能截到错误字段）。
@@ -1342,14 +1333,10 @@ pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Resul
     // 审查修复（命令注入）：原 contains(':')/len 弱校验可被 "12:3&calc" 绕过，改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-    let data_dir = state.data_dir.to_string_lossy();
-    // 命令写入 .cmd 启动器（/TR 261 字符上限，详见 write_task_launcher）；KeepAlive 无需 UserId。
-    // 规则 R3：set "VAR=..." 与 "{exe}" 双引号形态使值中空格/中文/& 均安全
-    let tr = write_task_launcher(
-        &state,
-        "doubao_renew",
-        format!("set \"AIWORKDATA_DIR={data_dir}\"\r\n\"{}\" --task-run doubao-keepalive", exe.to_string_lossy()),
-    )?;
+    // issue #112：/TR 直调主 exe——release 主程序 GUI 子系统不分配控制台，触发不弹黑框；
+    // 旧 .cmd 启动器方案（/TR 261 字符上限 + cmd 黑框）随 python 运行时移除一并退役。
+    // CLI 任务模式分支在 Tauri Builder 之前，不启动 GUI、不受单实例插件影响
+    let tr = format!("\"{}\" --task-run doubao-keepalive", exe.to_string_lossy());
     let (ok, _stdout, stderr) = crate::commands::misc::run_schtasks(&[
         "/Create",
         "/TN",
@@ -1365,33 +1352,13 @@ pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Resul
     if !ok {
         return Err(schtasks_create_failure(&state, "豆包续期", &stderr));
     }
-    fs_utils::app_log(&state.data_dir, &format!("豆包续期定时任务已注册: {time}（启动器 {tr}）"));
+    fs_utils::app_log(&state.data_dir, &format!("豆包续期定时任务已注册: {time}（直调主 exe）"));
     Ok(())
 }
 
-/// 已注册机器的一次性迁移（PS 7.2）：旧 KeepAlive 启动器引用 PS 桥 → 原地改写为
-/// `--task-run doubao-keepalive`。schtasks 条目指向启动器文件路径——改写文件内容即
-/// 完成迁移，无需 schtasks 操作。幂等：内容不含 trae-switch-bridge.ps1 即跳过；
-/// 失败静默（app_log 留痕，下次启动重试）。main.rs 启动期调用（try_migrate_legacy_task 之后）。
-pub fn try_migrate_keepalive_launcher(state: &AppState) -> Option<String> {
-    let launcher = state.data_dir.join("task_doubao_renew.cmd");
-    let Ok(content) = std::fs::read_to_string(&launcher) else { return None };
-    if !content.contains("trae-switch-bridge.ps1") {
-        return None;
-    }
-    let exe = std::env::current_exe().ok()?;
-    let body = format!(
-        "@echo off\r\nset \"AIWORKDATA_DIR={dir}\"\r\n\"{exe}\" --task-run doubao-keepalive\r\n",
-        dir = state.data_dir.to_string_lossy(),
-        exe = exe.to_string_lossy()
-    );
-    if std::fs::write(&launcher, body).is_err() {
-        return None;
-    }
-    let note = "计划任务迁移：豆包续期 KeepAlive 已切换为内置 Rust 实现（--task-run doubao-keepalive）".to_string();
-    fs_utils::app_log(&state.data_dir, &note);
-    Some(note)
-}
+// 已注册机器的一次性迁移（PS 7.2）已被 misc::try_migrate_cmd_wrapped_tasks 取代
+// （issue #112：旧 .cmd 启动器 / cmd 包裹 /TR 统一重建为主 exe 直调，PS 桥时代的
+// trae-switch-bridge.ps1 启动器同样被该迁移覆盖）。
 
 /// 查询豆包续期计划任务状态（存在与否 + 触发时间）
 #[tauri::command(async)]
@@ -1430,18 +1397,8 @@ pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Resul
     // 审查修复（命令注入）：同上，弱校验改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-    let data_dir = state.data_dir.to_string_lossy();
-    // 命令写入 .cmd 启动器：/TR 261 字符上限，dev 构建绝对路径拼出的命令 273 字符必然超限
-    // （详见 write_task_launcher；实测报参数错误 → toast 4s 即逝 → 用户感知"点击注册没有反应"）
-    // CLI 任务模式分支在 Tauri Builder 之前，不启动 GUI、不受单实例插件影响
-    let tr = write_task_launcher(
-        &state,
-        "doubao_quota",
-        format!(
-            "set \"AIWORKDATA_DIR={data_dir}\"\r\n\"{}\" --task-run doubao-quota",
-            exe.to_string_lossy()
-        ),
-    )?;
+    // issue #112：/TR 直调主 exe（同 doubao_renew_task_register），不再走 .cmd 启动器
+    let tr = format!("\"{}\" --task-run doubao-quota", exe.to_string_lossy());
     let (ok, _stdout, stderr) = crate::commands::misc::run_schtasks(&[
         "/Create",
         "/TN",
@@ -1457,7 +1414,7 @@ pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Resul
     if !ok {
         return Err(schtasks_create_failure(&state, "额度巡检", &stderr));
     }
-    fs_utils::app_log(&state.data_dir, &format!("豆包额度巡检定时任务已注册: {time}（启动器 {tr}）"));
+    fs_utils::app_log(&state.data_dir, &format!("豆包额度巡检定时任务已注册: {time}（直调主 exe）"));
     Ok(())
 }
 

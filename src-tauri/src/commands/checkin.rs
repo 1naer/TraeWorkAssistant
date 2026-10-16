@@ -362,7 +362,7 @@ fn run_checkin_worker(
         .map(|u| (u.clone(), "fail"))
         .collect();
     let outcome = execute_round(app, state, &accounts, retry, &log_path);
-    // 跨轮失败类型登记（重试轮覆盖旧值），供重试筛选排除 SessionDead 等永久失效账号
+    // 跨轮失败类型登记（重试轮覆盖旧值），供重试筛选排除 SessionDead/DeviceSigned 等当日不可恢复账号
     let mut round_error_types: std::collections::HashMap<String, String> = outcome.error_types;
     for (uid, st) in outcome.statuses {
         final_status.insert(uid, st);
@@ -374,8 +374,14 @@ fn run_checkin_worker(
         let mut failed_uids: Vec<String> = final_status
             .iter()
             .filter(|(_, st)| **st == "fail")
-            // SessionDead（JWT 被服务端吊销）为永久失效：重试必然再次 401，跳过以免白等
-            .filter(|(uid, _)| round_error_types.get(*uid).map(|e| e.as_str()) != Some("SessionDead"))
+            .filter(|(uid, _)| {
+                match round_error_types.get(*uid).map(|e| e.as_str()) {
+                    // SessionDead=JWT 被服务端吊销（永久）；DeviceSigned=服务端按设备
+                    // 当日去重（issue #110，次日 0 点自动解除）——重试必然同样失败，跳过以免白等
+                    Some("SessionDead") | Some("DeviceSigned") => false,
+                    _ => true,
+                }
+            })
             .map(|(uid, _)| uid.clone())
             .collect();
         if failed_uids.is_empty() {
@@ -468,4 +474,124 @@ pub fn checkin_trends(
     days: Option<u32>,
 ) -> Vec<crate::checkin_results::TrendPoint> {
     crate::checkin_results::query_recent(&state.data_dir, days.unwrap_or(30))
+}
+
+// ── 签到前设备冲突预警（issue #110）────────────────────────────────────────
+//
+// 服务端签到 claim 按 x-device-id 每日去重：同一设备凭证绑定的多个账号，
+// 仅先签到的账号能领到积分，其余被拒（「当前设备今日已经签到」）。签到页
+// 加载时据此提前提示，把矛盾从「签到失败后困惑」前置到「签到前知情」。
+
+#[derive(serde::Serialize)]
+pub struct DeviceConflictAccount {
+    pub user_id: String,
+    pub name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct DeviceConflictGroup {
+    pub device_id: String,
+    pub accounts: Vec<DeviceConflictAccount>,
+}
+
+/// 分组核心（纯函数供单测）：uid→device_id 条目 + uid→名称解析 → 冲突组。
+/// 空 device_id 跳过（伪设备派生按 uid 唯一，不会成组；成组仅来自 OAuth
+/// 登录回写/代理捕获的共享凭证）；仅保留 ≥2 账号的组，按 device_id 升序稳定输出。
+fn group_device_conflicts(
+    entries: &[(&str, &str)],
+    name_of: &dyn Fn(&str) -> String,
+) -> Vec<DeviceConflictGroup> {
+    let mut by_device: std::collections::BTreeMap<&str, Vec<DeviceConflictAccount>> =
+        Default::default();
+    for (uid, dev) in entries {
+        if dev.is_empty() {
+            continue;
+        }
+        by_device
+            .entry(dev)
+            .or_default()
+            .push(DeviceConflictAccount { user_id: (*uid).to_string(), name: name_of(uid) });
+    }
+    by_device
+        .into_iter()
+        .filter(|(_, accs)| accs.len() >= 2)
+        .map(|(dev, accs)| DeviceConflictGroup {
+            device_id: (*dev).to_string(),
+            accounts: accs,
+        })
+        .collect()
+}
+
+/// 检测 device_map 中共享同一设备凭证的账号组（仅返回 ≥2 账号的组）。
+/// 签到页加载时调用，用于「设备冲突」前置预警；前端按当前签到范围过滤后展示。
+#[tauri::command]
+pub fn checkin_device_conflicts(state: State<AppState>) -> Vec<DeviceConflictGroup> {
+    let map = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
+    let accounts = crate::vault::load_accounts(state.inner());
+    let name_of = |uid: &str| -> String {
+        accounts
+            .accounts
+            .iter()
+            .find(|a| a.user_id.as_deref() == Some(uid))
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| uid.to_string())
+    };
+    let entries: Vec<(&str, &str)> = map
+        .iter()
+        .map(|(uid, e)| (uid.as_str(), e.device_id.as_str()))
+        .collect();
+    group_device_conflicts(&entries, &name_of)
+}
+
+#[cfg(test)]
+mod device_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn group_device_conflicts_共享设备成组_派生与空值不成组() {
+        let name_of = |uid: &str| -> String { format!("名{uid}") };
+        // A/B 共享 dev-1 → 一组；C 独占 dev-2 不成组；D 空 device_id 跳过
+        let entries = vec![
+            ("uidA", "dev-1"),
+            ("uidB", "dev-1"),
+            ("uidC", "dev-2"),
+            ("uidD", ""),
+        ];
+        let groups = group_device_conflicts(&entries, &name_of);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].device_id, "dev-1");
+        assert_eq!(
+            groups[0]
+                .accounts
+                .iter()
+                .map(|a| (a.user_id.as_str(), a.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("uidA", "名uidA"), ("uidB", "名uidB")]
+        );
+    }
+
+    #[test]
+    fn group_device_conflicts_多组按device_id升序稳定输出() {
+        let name_of = |uid: &str| -> String { uid.to_string() };
+        let entries = vec![
+            ("uidB", "dev-2"),
+            ("uidA", "dev-2"),
+            ("uidC", "dev-1"),
+            ("uidD", "dev-1"),
+            ("uidE", "dev-1"),
+        ];
+        let groups = group_device_conflicts(&entries, &name_of);
+        let devs: Vec<&str> = groups.iter().map(|g| g.device_id.as_str()).collect();
+        assert_eq!(devs, vec!["dev-1", "dev-2"]);
+        assert_eq!(groups[0].accounts.len(), 3);
+        assert_eq!(groups[1].accounts.len(), 2);
+    }
+
+    #[test]
+    fn group_device_conflicts_无冲突返回空() {
+        let name_of = |uid: &str| -> String { uid.to_string() };
+        let entries = vec![("uidA", "dev-1"), ("uidB", "dev-2")];
+        assert!(group_device_conflicts(&entries, &name_of).is_empty());
+        assert!(group_device_conflicts(&[], &name_of).is_empty());
+    }
 }

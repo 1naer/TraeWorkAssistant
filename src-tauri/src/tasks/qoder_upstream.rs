@@ -161,7 +161,7 @@ fn vendor_of(id: &str) -> Option<&'static str> {
 /// 倍率取**正常价**：断网/未登录才用这张表，折扣由远程刷新如实带回。
 fn fallback(region: QoderRegion) -> Vec<Value> {
     let global: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
-        ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.1"),
+        ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.08"),
         ("Qwen3.8-Max", "qmodel_38max", true, true, &["low", "medium", "xhigh"], true, true, "0.5"),
         // 产品决策下线的模型（Auto/Ultimate/Performance/Efficient/Sonus/Cantus）
         // 不进兜底表——远程清单带回也会被 `REMOVED_MODEL_IDS` 过滤（parse_catalog）
@@ -181,7 +181,9 @@ fn fallback(region: QoderRegion) -> Vec<Value> {
     // CN 表对齐 2026-10-01 model/list 全量实抓（temp/qoder_model_list_full.json，
     // 67856B 真签名直通）——倍率/名称/efforts/is_vl 全按上游实抓值：
     // GLM-5.3 0.6→0.8、Kimi-K3 0.8→1.4、Kimi-K2.8 0.3→0.8、dmodel 0.8→0.5、
-    // dfmodel 0.2→0.1、qfmodel 0.1→0.0（免费）；MiniMax-M3 实为
+    // qfmodel 0.1→0.0（2026-10 初活动免费）→0.08（2026-10-16 远程实抓，
+    // App 端同值）：免费判定 entry_is_free 读运行期目录自动跟随，兜底表
+    // 仅断网/未同步降级用；MiniMax-M3 实为
     // MiniMax-M2.7；补 Qwen3.7-Flash(q37fmodel)/GLM-5.2(gm51model)。
     // Auto(auto 1→0.5) 已按产品决策下线（见 REMOVED_MODEL_IDS）。
     // thinking 档位白名单：Qwen3.8 [xhigh,low,medium]、GLM-5.3 系 [high,low,max]、
@@ -189,7 +191,7 @@ fn fallback(region: QoderRegion) -> Vec<Value> {
     // efforts 空 = 不支持档位；MiniMax-M2.7 无 thinking_config。
     let cn: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
         ("Qwen3.8-Max", "qmodel_38max", true, true, &["xhigh", "low", "medium"], true, false, "0.5"),
-        ("Qwen3.8-Flash", "qfmodel", true, true, &["xhigh", "low", "medium"], true, false, "0.0"),
+        ("Qwen3.8-Flash", "qfmodel", true, true, &["xhigh", "low", "medium"], true, false, "0.08"),
         ("Qwen3.7-Max", "qmodel_latest", true, false, &[], true, false, "0.5"),
         ("Qwen3.7-Plus", "qmodel", true, false, &[], true, false, "0.1"),
         ("Qwen3.7-Flash", "q37fmodel", true, false, &[], true, false, "0.1"),
@@ -271,6 +273,17 @@ pub fn credits_rate_of(credits: &str) -> Option<f64> {
         .trim();
     let inner = inner.strip_suffix("credits")?.trim();
     inner.parse::<f64>().ok()
+}
+
+/// 目录条目是否为免费档（倍率 0）：issue #111 零积分豁免的判定依据——
+/// 免费模型零消耗，积分维度过滤（零积分/保留阈值/积分过期）对其整体失义。
+/// credits 键缺失（上游没给倍率）按非免费处理（fail-closed，维持既有过滤口径）
+pub fn entry_is_free(entry: &Value) -> bool {
+    entry
+        .get("credits")
+        .and_then(Value::as_str)
+        .and_then(credits_rate_of)
+        .is_some_and(|rate| rate == 0.0)
 }
 
 /// 构造一条目录条目（聚合目录与请求构造共用同一形状）。
@@ -528,6 +541,48 @@ pub fn resolve(model_id: &str, region: QoderRegion) -> Option<Value> {
         }
     }
     None
+}
+
+/// Qwen3.8-Flash 免费活动模型 id（norm_model_id 归一比较，容忍命名漂移）
+pub const FLASH_FREE_MODEL: &str = "Qwen3.8-Flash";
+
+/// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，资源调度页开关）：
+/// 上游免费活动期 usage.billable=false 实际不扣分，但 model/list 目录价随
+/// 低峰折扣漂移（0.1/0.08），不反映免费——开关开启时把该模型条目倍率改写
+/// 为 0，使 entry_is_free 判真：取号豁免零积分过滤 + /v1/models 展示 0×。
+/// 只改调用方持有的条目副本，进程目录缓存不受影响；上游活动结束后关闭
+/// 开关即恢复官方同步倍率。
+pub fn apply_flash_free_override(entry: &mut Value, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+    if norm_model_id(id) == norm_model_id(FLASH_FREE_MODEL) {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert(
+                "credits".to_string(),
+                Value::String("x0.0 credits".to_string()),
+            );
+        }
+    }
+}
+
+/// [`resolve`] + 免费活动覆盖一步到位（取号豁免/预检口径统一走此入口）
+pub fn resolve_overridden(model_id: &str, region: QoderRegion, flash_free: bool) -> Option<Value> {
+    let mut entry = resolve(model_id, region)?;
+    apply_flash_free_override(&mut entry, flash_free);
+    Some(entry)
+}
+
+/// [`list`] + 免费活动覆盖一步到位（/v1/models 聚合与排序口径统一走此入口）
+pub fn list_overridden(flash_free: bool) -> Vec<Value> {
+    list()
+        .into_iter()
+        .map(|mut m| {
+            apply_flash_free_override(&mut m, flash_free);
+            m
+        })
+        .collect()
 }
 
 /// 在一个清单里按 id → name → upstreamKey 的顺序找（蓝本同序）
@@ -2301,6 +2356,83 @@ mod tests {
         assert!(key.contains("dfmodel") || key == "deepseek-flash", "实际命中 {key}");
     }
 
+    // ── issue #111：免费档判定（零积分豁免的判定依据） ──
+
+    /// 倍率 0 是合法免费值；credits 键缺失（上游没给倍率）按非免费 fail-closed
+    #[test]
+    fn entry_is_free_by_zero_rate() {
+        assert!(entry_is_free(&serde_json::json!({ "credits": "x0 credits" })));
+        assert!(entry_is_free(&serde_json::json!({ "credits": "x0.0 credits" })));
+        assert!(!entry_is_free(&serde_json::json!({ "credits": "x0.1 credits" })));
+        assert!(!entry_is_free(&serde_json::json!({ "credits": "" })));
+        assert!(!entry_is_free(&serde_json::json!({})));
+    }
+
+    /// 兜底目录实测：CN 区 Qwen3.8-Flash 现价 0.08 非免费（2026-10-16 远程
+    /// 实抓对齐，10 初的活动免费 0.0 已结束）；其余模型非免费
+    #[test]
+    fn fallback_catalog_free_model_detection() {
+        let flash = resolve("Qwen3.8-Flash", QoderRegion::Cn).expect("Qwen3.8-Flash 应在 CN 兜底表");
+        assert!(
+            !entry_is_free(&flash),
+            "Qwen3.8-Flash 活动免费已结束（0.08）不应判免费"
+        );
+        let max = resolve("Qwen3.8-Max", QoderRegion::Cn).expect("Qwen3.8-Max 应在 CN 兜底表");
+        assert!(!entry_is_free(&max), "Qwen3.8-Max 倍率 0.5 非免费");
+    }
+
+    /// 免费活动覆盖（issue #111）：开关开启时 Qwen3.8-Flash 条目倍率改写 0
+    /// → entry_is_free 判真；关闭时保持官方同步倍率；其余模型不受影响；
+    /// 命名漂移（连字符/大小写）经 norm_model_id 归一后同样命中
+    #[test]
+    fn flash_free_override_rewrites_credits_only_for_flash() {
+        // 开启：flash 条目改写 0（目录价 0.1 覆盖），豁免判定联动为真
+        let mut flash = resolve("Qwen3.8-Flash", QoderRegion::Cn).expect("flash 应在 CN 兜底表");
+        apply_flash_free_override(&mut flash, true);
+        assert_eq!(flash["credits"], "x0.0 credits", "开启时倍率应改写为 0");
+        assert!(entry_is_free(&flash), "改写后应判免费（取号豁免联动）");
+        assert_eq!(
+            flash["id"], "Qwen3.8-Flash",
+            "覆盖只改倍率，不动 id/其余字段"
+        );
+        // 关闭：保持官方同步倍率（上游活动结束后恢复计费口径）
+        let mut flash_off = resolve("Qwen3.8-Flash", QoderRegion::Cn).expect("flash 应在 CN 兜底表");
+        apply_flash_free_override(&mut flash_off, false);
+        assert!(
+            !entry_is_free(&flash_off),
+            "关闭时保持官方倍率不判免费"
+        );
+        // 命名漂移（空格/大小写变体，norm_model_id 归一保留小数点）与非 flash 模型不受影响
+        let mut drift = serde_json::json!({ "id": "Qwen 3.8 FLASH", "credits": "x0.1 credits" });
+        apply_flash_free_override(&mut drift, true);
+        assert_eq!(drift["credits"], "x0.0 credits", "归一后命名漂移同样命中");
+        let mut other = serde_json::json!({ "id": "Qwen3.8-Max", "credits": "x0.5 credits" });
+        apply_flash_free_override(&mut other, true);
+        assert_eq!(other["credits"], "x0.5 credits", "非 flash 模型不改写");
+        // 便捷组合：resolve_overridden 与 apply 语义一致
+        let combined = resolve_overridden("Qwen3.8-Flash", QoderRegion::Cn, true)
+            .expect("resolve_overridden 应命中");
+        assert!(entry_is_free(&combined));
+        assert!(
+            resolve_overridden("Qwen3.8-Flash", QoderRegion::Cn, false)
+                .map(|e| !entry_is_free(&e))
+                .unwrap_or(false),
+            "关闭时 resolve_overridden 保持非免费"
+        );
+        // list_overridden 全量覆盖：flash 改写、非 flash 保持
+        let listed = list_overridden(true);
+        let f = listed
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some("Qwen3.8-Flash"))
+            .expect("list 应含 flash");
+        assert_eq!(f["credits"], "x0.0 credits");
+        let mx = listed
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some("Qwen3.8-Max"))
+            .expect("list 应含 max");
+        assert_eq!(mx["credits"], "x0.5 credits");
+    }
+
     // ── 工具 ──
 
     /// 构造一帧上游信封行（body 为内层 JSON 字符串）
@@ -2821,7 +2953,7 @@ mod tests {
         let flash: Vec<&Value> = items.iter().filter(|m| m["id"] == "Qwen3.8-Flash").collect();
         assert_eq!(flash.len(), 1, "并集必须按 id 去重");
         assert_eq!(flash[0]["region"], "global", "去重时 global 优先");
-        assert_eq!(flash[0]["credits"], "x0.1 credits");
+        assert_eq!(flash[0]["credits"], "x0.08 credits");
         assert_eq!(flash[0]["config"]["key"], "qfmodel");
         assert_eq!(flash[0]["maxOutputTokens"], MAX_OUTPUT_TOKENS);
         assert_eq!(flash[0]["supportsToolCall"], true);

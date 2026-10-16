@@ -18,7 +18,7 @@
 //! - `oauth`：设备授权登录（浏览器授权 + 轮询导入；qoder-oauth-progress/done 事件）
 
 mod accounts;
-mod checkin;
+pub(crate) mod checkin;
 mod cli_status;
 mod common;
 mod credits;

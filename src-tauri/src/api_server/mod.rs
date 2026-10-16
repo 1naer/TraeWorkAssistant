@@ -87,6 +87,10 @@ pub struct ApiSharedState {
     /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
     /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
     pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
+    /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
+    /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
+    /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
+    pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// buddy-ai 显式会话粘性存储（§4.2：`g:` 前缀命名空间，与 wb/qoder/trae 互不串绑）
@@ -822,6 +826,7 @@ mod inflight_tests {
             trae_pool_sticky_ttl_secs: AtomicU64::new(0),
             wb_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
+            qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),

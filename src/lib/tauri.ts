@@ -14,6 +14,7 @@ import type {
   CheckinDone,
   CheckinOpts,
   CheckinTrendPoint,
+  DeviceConflictGroup,
   CodeBuddyEnvCheck,
   CreditRecord,
   CreditDetail,
@@ -278,6 +279,9 @@ export const api = {
     // T8：近 N 天签到结果趋势（Dashboard 堆叠图）
     trends: (days?: number) =>
       invoke<CheckinTrendPoint[]>('checkin_trends', { days: days ?? null }),
+    /** 设备冲突组（issue #110 签到前预警）：device_map 中共用同一凭证的账号组 */
+    deviceConflicts: () =>
+      invoke<DeviceConflictGroup[]>('checkin_device_conflicts', {}),
   },
   misc: {
     deviceReset: (userId: string) => invoke('device_reset', { userId }),
@@ -822,6 +826,8 @@ export const api = {
         qoderHedgeThresholdMs?: number;
         /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
         qoderStickyEnabled?: boolean;
+        /** Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；null/未传 = 保留原值 */
+        qoderFlashFreeRate?: boolean;
         /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
         /** Qoder 池分组筛选；null/未传 = 保留原值 */
@@ -880,6 +886,7 @@ export const api = {
         qoderEnabled: wbFlags?.qoderEnabled ?? null,
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
         qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
+        qoderFlashFreeRate: wbFlags?.qoderFlashFreeRate ?? null,
         qoderUids: wbFlags?.qoderUids ?? null,
         qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
         qoderStrategy: wbFlags?.qoderStrategy ?? null,

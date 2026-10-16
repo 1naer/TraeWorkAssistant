@@ -132,59 +132,37 @@ pub fn qoder_checkin_results(
 
 // ── 每日签到定时任务（schtasks 双轨；对照 wb_checkin_task_register）─────────
 // 【跨平台审查 2026-10-03】macOS 适配预留：本节为 Windows 专属调度兜底
-// （schtasks /Create /Query /Delete + cmd 启动器）。macOS 等价物 = launchd
+// （schtasks /Create /Query /Delete）。macOS 等价物 = launchd
 // LaunchAgent（~/Library/LaunchAgents/<label>.plist + launchctl load/unload），
 // 建议按「注册/查询/卸载」三命令同签名收敛：commands 层按 cfg 分平台调度到
 // schtasks 或 launchd 实现，任务名前缀常量跨平台共用（LaunchAgent label 用同值）；
-// build_qoder_task_tr 的 cmd /c 启动器为 Windows 特有，macOS plist 里直接
-// ProgramArguments 数组调用主 exe + --task-run 参数即可（环境变量用
-// EnvironmentVariables 键替代 AIWORKDATA_DIR set）。应用内 in-app 调度器
+// build_qoder_task_tr 直调主 exe 为 Windows 特有，macOS plist 里直接
+// ProgramArguments 数组调用主 exe + --task-run 参数即可（数据目录固定
+// %APPDATA%\AIWorkAssistant，无需环境变量注入）。应用内 in-app 调度器
 // （tasks/scheduler.rs）本身跨平台，关掉 schtasks 双轨不丢签到能力。
 // 检索标记：`macOS 适配预留`
 
-const QODER_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_QoderCheckin";
+pub(crate) const QODER_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_QoderCheckin";
 
-fn build_qoder_task_tr(state: &AppState, task: &str) -> Result<String, String> {
+/// 构造 Qoder 计划任务 /TR：主 exe 直调 CLI 任务模式（--task-run，见 tasks::run_cli_task）。
+/// issue #112：release 主 exe 为 GUI 子系统，直调不分配控制台 → 触发不弹黑框；
+/// 旧 `cmd /c set AIWORKDATA_DIR=…` 包裹已删（该变量全仓只写不读，且 cmd.exe
+/// 正是黑框根源）。与 misc::build_task_tr 同款形态。
+fn build_qoder_task_tr(task: &str) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-    let data_dir = state.data_dir.to_string_lossy().to_string();
-    Ok(format!(
-        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" --task-run {}",
-        data_dir,
-        exe.to_string_lossy(),
-        task
-    ))
+    Ok(format!("\"{}\" --task-run {task}", exe.to_string_lossy()))
 }
 
 fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     crate::commands::misc::run_schtasks(args)
 }
 
-/// 枚举当前用户可见的计划任务名（列序不跨机固定，扫描各行 TaskName 字段；
-/// 与 commands/workbuddy/checkin.rs::parse_task_names_from_csv 同款解析，独立副本避免跨域耦合）
-fn parse_task_names_from_csv(stdout: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        for field in line.split(',') {
-            let f = field.trim().trim_matches('"');
-            let Some(name) = f.strip_prefix('\\') else { continue };
-            let name = name.rsplit('\\').next().unwrap_or(name);
-            if !name.is_empty() {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
-}
-
 fn qoder_checkin_task_names() -> Vec<String> {
     let prefix = format!("{QODER_CHECKIN_TASK_PREFIX}_");
-    match run_schtasks(&["/Query", "/FO", "CSV", "/NH"]) {
-        Ok((_, stdout, _)) => parse_task_names_from_csv(&stdout)
-            .into_iter()
-            .filter(|n| n.starts_with(&prefix))
-            .collect(),
-        Err(_) => vec![],
-    }
+    crate::commands::misc::list_task_names()
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix))
+        .collect()
 }
 
 /// 删除单个计划任务：run_schtasks 三态归一为 Result（Ok(true)=成功；
@@ -208,7 +186,7 @@ pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -
     for t in &times {
         crate::commands::misc::validate_hhmm(t)?;
     }
-    let tr = build_qoder_task_tr(&state, "qoder-checkin")?;
+    let tr = build_qoder_task_tr("qoder-checkin")?;
     // 先建后删：/Create /F 直接覆盖同名旧任务，全部创建成功后再清理不在新集合内的
     // 旧任务——原实现先删后建，创建中途失败会导致旧调度已被删除（定时签到整体丢失）
     let mut new_names: Vec<String> = Vec::with_capacity(times.len());

@@ -162,6 +162,45 @@ pub fn humanize_device_limit(message: &str) -> String {
     )
 }
 
+/// 「设备当日已签」特征词判定（纯函数供单测）：仅作用于 claim 失败分支，
+/// 成功响应不含「今日已经签到」，误伤面极小；中英文特征词均覆盖
+fn is_device_signed_error(message: &str) -> bool {
+    message.contains("今日已经签到")
+        || message.contains("设备已签到")
+        || message.contains("already checked in")
+}
+
+/// 识别「设备今日已签到」类服务端业务拒绝并转译为可操作引导（issue #110）：
+/// 签到 claim 按设备（x-device-id）每日去重一次，同设备多账号时先签者消耗当日
+/// 额度，后签者被拒——status 预检按账号口径仍显示「未签」，用户易误判为工具 bug。
+/// 命中特征词时在原文后追加原因与解决路径，否则原样透传。
+pub fn humanize_device_signed(message: &str) -> String {
+    if !is_device_signed_error(message) {
+        return message.to_string();
+    }
+    format!(
+        "{message} —— 服务端按设备（而非账号）每日仅计一次签到，本机多个账号共用同一设备凭证时，先签到的账号消耗当日额度：对本账号重新执行一次 OAuth 登录可轮换到其他本机设备凭证（需本机装有多个 Trae 系客户端），或在另一台设备上签到"
+    )
+}
+
+/// 签到/状态错误文案统一转译入口：设备绑定上限（issue #76）+ 设备当日已签（issue #110）
+pub fn humanize_checkin_error(message: &str) -> String {
+    humanize_device_signed(&humanize_device_limit(message))
+}
+
+/// 「设备当日已签」冷却终点：明日 00:05（服务端按自然日去重，跨零点即解除；
+/// 留 5 分钟时钟偏移余量）。解析失败回退 12h（对齐 PlanLimit 口径），下限 10 分钟
+fn secs_until_next_checkin_reset() -> i64 {
+    let now = chrono::Local::now();
+    let next = (now.date_naive() + chrono::Duration::days(1))
+        .and_hms_opt(0, 5, 0)
+        .and_then(|n| chrono::Local.from_local_datetime(&n).single());
+    match next {
+        Some(t) => (t - now).num_seconds().max(600),
+        None => 43_200,
+    }
+}
+
 /// status 预检结果
 struct StatusOutcome {
     ok: bool,
@@ -218,7 +257,7 @@ fn status_check(
             ok: false,
             checked_in,
             credits,
-            message: if msg.is_empty() { format!("HTTP {status}") } else { humanize_device_limit(&msg) },
+            message: if msg.is_empty() { format!("HTTP {status}") } else { humanize_checkin_error(&msg) },
         };
     }
     StatusOutcome { ok: true, checked_in, credits, message: msg }
@@ -250,7 +289,7 @@ fn signin_request(
             let msg = data
                 .get("message")
                 .and_then(Value::as_str)
-                .map(humanize_device_limit)
+                .map(humanize_checkin_error)
                 .unwrap_or_else(|| format!("HTTP {status}"));
             (code == Some(0), msg, code, status, Some(data))
         }
@@ -665,7 +704,13 @@ pub fn run_round(
             total_ok += 1;
         } else {
             // 签到失败 → 分类错误并写入冷却（Unknown 不落盘不外发）
-            let (error_type, cooldown_secs) = classify_error(http_status, code);
+            let (mut error_type, mut cooldown_secs) = classify_error(http_status, code);
+            // 「设备当日已签」（issue #110）：当日去重不因重试解除，单列类型供重试轮
+            // 排除（对齐 SessionDead 口径）；冷却拨到明日 00:05，避免固定时长跨日误挡次日签到
+            if is_device_signed_error(&msg) {
+                error_type = "DeviceSigned";
+                cooldown_secs = secs_until_next_checkin_reset();
+            }
             if error_type != "Unknown" {
                 save_cooldown(state, &uid_str, error_type, cooldown_secs, &msg);
                 emit_error_type = Some(error_type);
@@ -824,6 +869,44 @@ mod tests {
         // 未命中 → 原样透传（不影响常规错误可见性）
         assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
         assert_eq!(humanize_device_limit(""), "");
+    }
+
+    /// issue #110：「设备当日已签」错误转译——命中特征词追加引导，其余原样透传
+    #[test]
+    fn humanize_device_signed_命中特征词追加引导() {
+        let server_msg = "当前设备今日已经签到，请明日再来哦~";
+        let out = humanize_device_signed(server_msg);
+        assert!(out.starts_with(server_msg));
+        assert!(out.contains("每日仅计一次签到"));
+        assert!(out.contains("OAuth 登录"));
+        // 简化/英文形态兜底
+        assert_ne!(humanize_device_signed("设备已签到"), "设备已签到");
+        assert_ne!(
+            humanize_device_signed("Device already checked in"),
+            "Device already checked in"
+        );
+        // 未命中 → 原样透传（不影响常规错误可见性；「已签到」单独出现不命中）
+        assert_eq!(humanize_device_signed("已签到"), "已签到");
+        assert_eq!(humanize_device_signed("签到成功，获得5积分"), "签到成功，获得5积分");
+        assert_eq!(humanize_device_signed(""), "");
+    }
+
+    #[test]
+    fn humanize_checkin_error_两级特征词串联() {
+        // 设备绑定上限（#76）与设备已签（#110）各自命中各自引导，互不干扰
+        let limit = humanize_checkin_error("该设备绑定的账户数量已达上限。");
+        assert!(limit.contains("设备绑定数已达服务端上限"));
+        let signed = humanize_checkin_error("当前设备今日已经签到，请明日再来哦~");
+        assert!(signed.contains("每日仅计一次签到"));
+        // 两者都不命中 → 原样透传
+        assert_eq!(humanize_checkin_error("HTTP 502"), "HTTP 502");
+    }
+
+    #[test]
+    fn secs_until_next_checkin_reset_落在次日零点附近() {
+        // 目标为明日 00:05：当前时刻任意，间隔 ∈ (300s, 86700s]，下限被 max(600) 夹住
+        let secs = secs_until_next_checkin_reset();
+        assert!((600..=86_700).contains(&secs), "secs={secs}");
     }
 
     #[test]

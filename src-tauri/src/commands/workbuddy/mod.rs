@@ -17,7 +17,7 @@
 mod accounts;
 mod buddy_ai;
 mod chatdata;
-mod checkin;
+pub(crate) mod checkin;
 mod cli;
 mod common;
 mod credits;

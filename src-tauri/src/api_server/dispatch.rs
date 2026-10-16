@@ -815,9 +815,15 @@ fn smart_pool_order(
         .qoder
         .as_ref()
         .and_then(|id| {
-            qoder_upstream::list()
-                .into_iter()
-                .find(|m| m.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            // 免费活动覆盖同口径：开关开启时 Qwen3.8-Flash 按 0 倍率参与排序
+            //（免费最优），否则排序键与取号豁免口径分叉
+            qoder_upstream::list_overridden(
+                state
+                    .qoder_flash_free_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .into_iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(id.as_str()))
         })
         .and_then(|m| {
             m.get("credits")
@@ -865,7 +871,7 @@ fn pool_health(
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
             }
-            if !state.wb_pool.has_selectable_in(allowed) {
+            if !state.wb_pool.has_selectable_in(allowed, false) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -877,13 +883,13 @@ fn pool_health(
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
             }
-            if !state.buddy_ai_pool.has_selectable_in(allowed) {
+            if !state.buddy_ai_pool.has_selectable_in(allowed, false) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
         }
         TargetPool::Trae => {
-            if !state.pool.has_selectable_in(allowed) {
+            if !state.pool.has_selectable_in(allowed, false) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -898,8 +904,26 @@ fn pool_health(
             {
                 return Err(FallbackReason::ModelCooldown);
             }
-            // 账号级健康预检
-            if !state.qoder_pool.has_selectable_in(allowed) {
+            // 账号级健康预检（issue #111：免费模型豁免积分维度过滤，口径对齐取号路径——
+            // 预检比取号严会让免费模型请求在预检即 NoHealthy，白改）
+            let qoder_free = sources
+                .qoder
+                .as_deref()
+                .map(|m| {
+                    // 免费活动覆盖与取号同口径（resolve_overridden），否则开关开启时
+                    // Qwen3.8-Flash 预检仍按 0.1 目录价判非免费，零积分池被误挡
+                    qoder_upstream::resolve_overridden(
+                        m,
+                        qoder_upstream::QoderRegion::Cn,
+                        state
+                            .qoder_flash_free_rate
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                    .map(|e| qoder_upstream::entry_is_free(&e))
+                    .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !state.qoder_pool.has_selectable_in(allowed, qoder_free) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -1080,6 +1104,7 @@ mod tests {
             trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             buddy_ai_model_cooldowns: std::sync::Mutex::new(HashMap::new()),

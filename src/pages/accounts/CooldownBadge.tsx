@@ -9,6 +9,7 @@ const COOLDOWN_LABELS: Record<string, string> = {
   Server: '服务端错误',
   Client: '客户端错误',
   BusinessError: '业务错误',
+  DeviceSigned: '设备已签',
 };
 
 /** SessionDead（JWT 被服务端吊销）的恢复指引：重登 → 保存登录态 → 续期捕获新凭证 */

@@ -7,7 +7,7 @@ import { daysFromTrendPoints, type CheckinCalendarDay } from '../components/chec
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { normZero } from '../lib/format';
-import type { AccountView } from '../types';
+import type { AccountView, DeviceConflictGroup } from '../types';
 
 function MiniJwtBadge({ hours }: { hours: number | null }) {
   if (hours === null) return <span className="text-xs text-slate-400"><HelpCircle size={11} className="inline" /> 未知</span>;
@@ -24,6 +24,7 @@ const COOLDOWN_LABELS: Record<string, string> = {
   Server: '服务端错误',
   Client: '客户端错误',
   BusinessError: '业务错误',
+  DeviceSigned: '设备已签',
 };
 
 function MiniCooldownBadge({ type, until }: { type: string; until: number | null }) {
@@ -96,6 +97,19 @@ export default function Checkin() {
       });
   }, [checkin.active]);
 
+  // 设备冲突预警（issue #110）：device_map 中共用同一设备凭证的账号组。
+  // 挂载时 + 每轮签到结束后拉取（重新 OAuth 登录轮换凭证后回到本页即可见最新分组）
+  const [deviceConflicts, setDeviceConflicts] = useState<DeviceConflictGroup[]>([]);
+  useEffect(() => {
+    if (checkin.active) return;
+    api.checkin
+      .deviceConflicts()
+      .then(setDeviceConflicts)
+      .catch(() => {
+        /* 冲突检测失败静默：不影响签到主流程 */
+      });
+  }, [checkin.active]);
+
   // 根据范围过滤出候选账号列表
   const candidateAccounts = useMemo(() => {
     if (scope === 'all') return accounts;
@@ -107,6 +121,14 @@ export default function Checkin() {
     if (scope === 'selected') return [...selected];
     return candidateAccounts.map((a) => a.user_id);
   }, [scope, selected, candidateAccounts]);
+
+  // 当前签到范围内命中设备冲突的组（组内账号与候选集交集 ≥2 才提示）
+  const scopeConflicts = useMemo(() => {
+    const ids = new Set(candidateIds);
+    return deviceConflicts
+      .map((g) => ({ ...g, accounts: g.accounts.filter((a) => ids.has(a.user_id)) }))
+      .filter((g) => g.accounts.length >= 2);
+  }, [deviceConflicts, candidateIds]);
 
   const toggle = (uid: string) => {
     setSelected((prev) => {
@@ -178,6 +200,24 @@ export default function Checkin() {
           <div className="mt-0.5 text-xs">每个账号每天只需签到一次，重复签到可能导致账号被官方禁封。建议开启「跳过今日已签」选项。</div>
         </div>
       </div>
+
+      {scopeConflicts.length > 0 && (
+        <div className="mb-5 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-700 dark:bg-amber-900/20">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-500" />
+          <div className="text-amber-700 dark:text-amber-300">
+            <div className="font-medium">
+              检测到 {scopeConflicts.length} 组账号共用同一设备凭证
+            </div>
+            <div className="mt-0.5 text-xs">
+              服务端按设备（而非账号）每日仅计一次签到——同组只有先签到的账号能领到积分，其余账号会提示「当前设备今日已经签到」：
+              {scopeConflicts.map((g) => (
+                <div key={g.device_id}>· {g.accounts.map((a) => a.name).join('、')}</div>
+              ))}
+              解决：对冲突账号重新执行一次 OAuth 登录（自动轮换到其他本机设备凭证，需本机装有多个 Trae 系客户端），或在另一台设备上为其签到。
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="card mb-5 p-4">
         <div className="grid gap-3 md:grid-cols-2">
