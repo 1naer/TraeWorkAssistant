@@ -294,6 +294,14 @@ export default function BuddyApiService() {
         600,
       );
       pushToast('success', '账号池选择、资源开关与调度参数已保存（服务运行中即时生效）');
+      // 保存后重新拉取池快照（审查残留项修复）：本页保存原样回传加载时的
+      // enabled_uids/strategy/groups，页面停留期间若他端（全局 API 管理弹窗等）
+      // 改动了池配置，旧快照回传会覆盖回去——保存成功后立即同步最新快照收窄窗口
+      try {
+        setPool(await api.apiServer.poolList());
+      } catch {
+        /* 快照同步失败不阻塞保存结果，下次刷新自愈 */
+      }
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -628,47 +636,8 @@ export default function BuddyApiService() {
                   </label>
                 ))}
 
-                {/* 国际版（buddy-ai）独立池开关（阶段 2）：显式开启制，独立失败域/粘性/记账 */}
-                <div className="mt-3 border-t border-slate-100 pt-3 dark:border-zinc-800">
-                  <div className="mb-1.5 flex items-center gap-1.5">
-                    <span className="text-xs font-medium text-slate-600 dark:text-zinc-300">国际版（buddy-ai）</span>
-                    {wbFlags.buddyAiEnabled ? (
-                      <Badge tone="green">国际档已开启</Badge>
-                    ) : (
-                      <Badge tone="amber">默认关闭</Badge>
-                    )}
-                  </div>
-                  {(
-                    [
-                      {
-                        key: 'buddyAiEnabled' as const,
-                        label: '启用 buddy-ai 国际档',
-                        desc: '开启后「buddy-ai」档参与调度（与国内 Buddy 档平级、独立账号池/粘性/记账）；需先在 BuddyAI 页登录国际账号',
-                      },
-                      {
-                        key: 'buddyAiStickyEnabled' as const,
-                        label: 'buddy-ai 会话粘性',
-                        desc: '显式 conversationId 在国际池内绑定账号（TTL 同国内档口径）；默认关',
-                      },
-                    ] as const
-                  ).map((item) => (
-                    <label
-                      key={item.key}
-                      className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50"
-                    >
-                      <input
-                        type="checkbox"
-                        className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
-                        checked={wbFlags[item.key]}
-                        onChange={() => setWbFlags((prev) => ({ ...prev, [item.key]: !prev[item.key] }))}
-                      />
-                      <span className="min-w-0">
-                        <span className="block text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
-                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">{item.desc}</span>
-                      </span>
-                    </label>
-                  ))}
-                </div>
+                {/* 国际版（buddy-ai）开关已迁至 BuddyAI · 资源调度页（资源开关与调度参数节），
+                    此处不再重复；wbFlags 仍加载/回传 buddyAi* 键，保存国内开关不会清掉国际档配置 */}
               </div>
 
               {/* 调度参数（F-76②/③/F-77：数值热参数，保存即热生效） */}

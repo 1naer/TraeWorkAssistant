@@ -252,6 +252,7 @@ fn delete_inner(
             &mut pool_file.trae_tag_ids,
             &mut pool_file.wb_tag_ids,
             &mut pool_file.qoder_tag_ids,
+            &mut pool_file.buddy_ai_tag_ids,
         ] {
             if ids.iter().any(|t| t == id) {
                 ids.retain(|t| t != id);

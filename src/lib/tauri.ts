@@ -338,7 +338,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
+    targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
   ) =>
     invoke('switch_account', {
@@ -347,7 +347,7 @@ export const api = {
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
@@ -490,6 +490,31 @@ export const api = {
       invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
         includeCredentials: includeCredentials ?? null,
       }),
+    /** 账号池导入（accounts_export 回导；合并语义：同 id 跳过，凭证副本仅回灌缺失账号） */
+    accountsImport: (poolJson: Record<string, unknown>) =>
+      invoke<{ added: number; skipped: number; invalid: number; tokens_added: number }>(
+        'buddy_ai_accounts_import',
+        { poolJson },
+      ),
+    /** 扫描本机 WorkBuddy AI 客户端登录账号（account-snapshot.json；识别+池内匹配） */
+    localScan: () =>
+      invoke<{
+        found: boolean;
+        reason?: string;
+        uid?: string;
+        nickname?: string;
+        edition_type?: string;
+        is_pro?: boolean;
+        saved_at_ms?: number;
+        in_pool?: boolean;
+        pool_account_id?: string;
+      }>('buddy_ai_local_scan'),
+    /** 环境重置（白名单目录清理；items 含 login = 登录态清除，前端强确认） */
+    envReset: (items: string[]) =>
+      invoke<{ results: { item: string; ok: boolean; detail: string }[]; failed: number }>(
+        'buddy_ai_env_reset',
+        { items },
+      ),
     /** 打开 WorkBuddy AI 国际客户端数据目录（%USERPROFILE%\.workbuddy-ai） */
     openDataDir: () => invoke<void>('buddy_ai_open_data_dir'),
     /** 手动同步 Intl 模型目录（/v3/config 直连 → 动态替换；返回替换模型数） */
@@ -817,6 +842,16 @@ export const api = {
         buddyAiStickyEnabled?: boolean;
         /** buddy-ai 池粘性 TTL 秒（P6 顺延补齐）；null/未传 = 保留原值 */
         buddyAiPoolStickyTtlSecs?: number;
+        /** buddy-ai 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        buddyAiAccountConcurrencyLimit?: number;
+        /** buddy-ai 会话粘性 TTL 秒；null/未传 = 保留原值 */
+        buddyAiStickyTtlSecs?: number;
+        /** buddy-ai 竞速对冲阈值毫秒（0 = 关闭）；null/未传 = 保留原值 */
+        buddyAiHedgeThresholdMs?: number;
+        /** buddy-ai 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
+        buddyAiGroupIds?: string[] | null;
+        /** buddy-ai 池标签筛选；null/未传 = 保留原值，空数组 = 清空 */
+        buddyAiTagIds?: string[] | null;
       },
       wbStrategy?: string,
     ) =>
@@ -855,6 +890,11 @@ export const api = {
         buddyAiEnabled: wbFlags?.buddyAiEnabled ?? null,
         buddyAiStickyEnabled: wbFlags?.buddyAiStickyEnabled ?? null,
         buddyAiPoolStickyTtlSecs: wbFlags?.buddyAiPoolStickyTtlSecs ?? null,
+        buddyAiAccountConcurrencyLimit: wbFlags?.buddyAiAccountConcurrencyLimit ?? null,
+        buddyAiStickyTtlSecs: wbFlags?.buddyAiStickyTtlSecs ?? null,
+        buddyAiHedgeThresholdMs: wbFlags?.buddyAiHedgeThresholdMs ?? null,
+        buddyAiGroupIds: wbFlags?.buddyAiGroupIds ?? null,
+        buddyAiTagIds: wbFlags?.buddyAiTagIds ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),

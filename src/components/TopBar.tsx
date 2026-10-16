@@ -489,7 +489,7 @@ function BuddyAiTopBar() {
     <>
       <div className="flex items-center gap-2">
         {wbLocate?.exe ? (
-          <Badge tone="green" title={wbLocate.version ? `WorkBuddy AI 当前版本：v${wbLocate.version}（${wbLocate.exe}）` : wbLocate.exe}>
+          <Badge tone="green" title={wbLocate.version ? `WorkBuddy AI 当前版本：v${wbLocate.version}` : 'WorkBuddy AI 国际版客户端'}>
             <MonitorCheck size={13} /> WorkBuddy AI已安装
           </Badge>
         ) : (
@@ -498,7 +498,7 @@ function BuddyAiTopBar() {
           </Badge>
         )}
         {cbLocate?.exe ? (
-          <Badge tone="green" title={cbLocate.version ? `CodeBuddy AI 当前版本：v${cbLocate.version}（${cbLocate.exe}）` : cbLocate.exe}>
+          <Badge tone="green" title={cbLocate.version ? `CodeBuddy AI 当前版本：v${cbLocate.version}` : 'CodeBuddy AI 国际客户端'}>
             <MonitorCheck size={13} /> CodeBuddy AI已安装
           </Badge>
         ) : (
@@ -527,7 +527,7 @@ function BuddyAiTopBar() {
           {launching === 'wb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开WorkBuddy AI
         </button>
         <button onClick={() => void launchApp('cb')} className="btn-outline" disabled={launching != null}>
-          {launching === 'cb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开CodeBuddy
+          {launching === 'cb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开 CodeBuddy AI
         </button>
         {proxy.running ? (
           <button onClick={stopProxy} className="btn-outline">

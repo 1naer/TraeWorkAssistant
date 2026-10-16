@@ -77,9 +77,11 @@ const TASKS: &[SchedTask] = &[
     // Buddy 国际版凭证兜底续期（2026-10-16 六页对齐批 3，对齐国内 wb-renew）：
     // lazy 48h——AT 到期前 48h 内才真正刷新；开关独立（默认开，环境配置页可关）
     SchedTask { key: "buddy-ai-renew", name: "Buddy 国际版凭证兜底续期", hhmm: "10:35", kind: "fix" },
-    // Buddy 国际版积分数据每日同步（对齐国内看板同步口径）：get-user-resource 全池
-    // 取数 → 池三键回写 + 当日快照落库（趋势曲线数据源）；默认 23:45 错峰
-    SchedTask { key: "buddy-ai-credits-sync", name: "Buddy 国际版积分数据同步", hhmm: "23:45", kind: "fix" },
+    // Buddy 国际版积分数据同步（对齐国内看板同步口径）：get-user-resource 全池
+    // 取数 → 池三键回写 + 当日快照落库（趋势曲线数据源）；五模式可配
+    //（off/hourly/every_hours/every_days/daily，settings.buddy_ai_credits_sync_mode，
+    // daily 时刻默认 23:45 错峰）
+    SchedTask { key: "buddy-ai-credits-sync", name: "Buddy 国际版积分数据同步", hhmm: "23:45", kind: "credits" },
     // 看板数据同步（原快照任务升级为可配置频率：每日 HH:MM / 每小时 / 关闭）：
     // wb 侧含积分 fresh 拉取+池回写+快照、Token 统计重扫与官方用量刷新；
     // 排到晚間接近日末，差分口径最准；此前无定时写入是近 7 日消耗缺天的根因
@@ -143,12 +145,14 @@ const COMPACT_INTERVAL_HOURS: i64 = 6;
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
-/// EveryHours(h)=每 h 小时（距上次成功执行 ≥h·1h，无记录=首次立即跑）
+/// EveryHours(h)=每 h 小时（距上次成功执行 ≥h·1h，无记录=首次立即跑）；
+/// EveryDays(d)=每 d 天（距上次成功执行 ≥d·24h，无记录=首次立即跑）
 enum SchedPlan {
     Skip,
     Daily(String),
     Hourly,
     EveryHours(i64),
+    EveryDays(i64),
 }
 
 /// credits 类任务的同步模式（空/未知值按各平台默认处理——every_hours 每2小时
@@ -158,10 +162,11 @@ fn credits_sync_mode(st: &AppState, key: &str) -> String {
     let raw = match key {
         "wb-credits-snapshot" => s.wb_credits_sync_mode.as_str(),
         "qoder-credits-snapshot" => s.qoder_credits_sync_mode.as_str(),
+        "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_mode.as_str(),
         _ => s.trae_credits_sync_mode.as_str(),
     };
     match raw.trim() {
-        "off" | "hourly" | "daily" | "every_hours" => raw.trim().to_string(),
+        "off" | "hourly" | "daily" | "every_hours" | "every_days" => raw.trim().to_string(),
         _ => "every_hours".to_string(),
     }
 }
@@ -172,9 +177,21 @@ fn credits_sync_hours(st: &AppState, key: &str) -> i64 {
     let raw = match key {
         "wb-credits-snapshot" => s.wb_credits_sync_hours.as_str(),
         "qoder-credits-snapshot" => s.qoder_credits_sync_hours.as_str(),
+        "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_hours.as_str(),
         _ => s.trae_credits_sync_hours.as_str(),
     };
     raw.trim().parse::<i64>().unwrap_or(2).clamp(1, 24)
+}
+
+/// credits 类任务 every_days 模式的间隔天数：非法/越界回退 1（1..=30）
+/// （当前仅 buddy-ai-credits-sync 提供 every_days 档；其余平台按需扩展）
+fn credits_sync_days(st: &AppState, key: &str) -> i64 {
+    let s = st.settings();
+    let raw = match key {
+        "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_days.as_str(),
+        _ => "",
+    };
+    raw.trim().parse::<i64>().unwrap_or(1).clamp(1, 30)
 }
 
 /// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用）
@@ -190,6 +207,7 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
         "credits" => match credits_sync_mode(st, t.key).as_str() {
             "hourly" => SchedPlan::Hourly,
             "every_hours" => SchedPlan::EveryHours(credits_sync_hours(st, t.key)),
+            "every_days" => SchedPlan::EveryDays(credits_sync_days(st, t.key)),
             _ => SchedPlan::Daily(effective_hhmm(st, t)),
         },
         // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
@@ -253,6 +271,14 @@ fn tick(app: &AppHandle, st: &AppState) {
                 }
                 format!("每{hours}小时")
             }
+            SchedPlan::EveryDays(days) => {
+                if let Some(ts) = last_run_ts(st, t.key) {
+                    if chrono::Utc::now().timestamp_millis() - ts < days * 24 * HOURLY_INTERVAL_MS {
+                        continue;
+                    }
+                }
+                format!("每{days}天")
+            }
         };
         // 失败冷却：退避窗口内静默等待重试，不重复执行也不刷日志
         if let Some(ts) = last_fail_ts(st, t.key) {
@@ -277,7 +303,7 @@ fn tick(app: &AppHandle, st: &AppState) {
         };
         match outcome {
             Ok(v) => {
-                let summary = summarize(&v);
+                let summary = summarize(&v, t.key);
                 // skipped_busy（审查修复：qoder-checkin 轮次锁被 UI 路径持有的幂等跳过）
                 // 不 mark_run——跳过≠完成，mark_run 会固化「当日已跑」关闭当日重试链，
                 // UI 轮次的失败账号将失去当日调度兜底。其余 skipped（空池静默空转）
@@ -347,7 +373,9 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
         "qoder-checkin" => Some(st.settings().qoder_checkin_hhmm),
         "buddy-ai-checkin" => Some(st.settings().buddy_ai_checkin_hhmm),
+        "buddy-ai-renew" => Some(st.settings().buddy_ai_renew_hhmm),
         "buddy-ai-credits-sync" => Some(st.settings().buddy_ai_credits_sync_hhmm),
+        "buddy-ai-catalog-sync" => Some(st.settings().buddy_ai_catalog_sync_hhmm),
         "qoder-credits-snapshot" => Some(st.settings().qoder_credits_sync_hhmm),
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
@@ -390,15 +418,16 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
         // Buddy 国际版每日活跃打卡（阶段 3b）：独立开关（默认关，国际档显式开启制）
         "buddy-ai-checkin" => crate::commands::workbuddy::buddy_ai_checkin_enabled(st),
-        // Buddy 国际版凭证兜底续期 / 积分数据同步（2026-10-16，默认开，任务配置页可关）
+        // Buddy 国际版凭证兜底续期（2026-10-16，默认开，任务配置页可关）
         "buddy-ai-renew" => st.settings().buddy_ai_renew_enabled,
-        "buddy-ai-credits-sync" => st.settings().buddy_ai_credits_sync_enabled,
         // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
         // Qoder 会话流水定时合并（环境配置页可关；默认开，每日 04:30）
         "qoder-sessions-compact" => st.settings().qoder_sessions_compact_enabled,
-        // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（hourly/daily 均视为启用）
-        "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot" => {
+        // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（其余模式均视为启用；
+        // buddy-ai 旧 enabled 布尔已由 state 归一化派生进 mode）
+        "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot"
+        | "buddy-ai-credits-sync" => {
             credits_sync_mode(st, key) != "off"
         }
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
@@ -822,12 +851,14 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
     }
 }
 
-/// 结果 JSON → 单行摘要（签到轮次取 ok/already/failed 计数，其余截断展示）
-fn summarize(v: &Value) -> String {
+/// 结果 JSON → 单行摘要（签到/打卡轮次取 ok/already/failed 计数，其余截断展示；
+/// buddy-ai 活跃打卡用「已打」，国内各平台签到仍用「已签」）
+fn summarize(v: &Value, task_key: &str) -> String {
     if v.is_object() {
         let get = |k: &str| v.get(k).and_then(Value::as_i64);
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
-            return format!("成功 {o}，已签 {a}，失败 {f}");
+            let unit = if task_key == "buddy-ai-checkin" { "已打" } else { "已签" };
+            return format!("成功 {o}，{unit} {a}，失败 {f}");
         }
     }
     let s = serde_json::to_string(v).unwrap_or_default();
@@ -846,6 +877,7 @@ pub fn scheduler_status(st: tauri::State<AppState>) -> Value {
             let time = match sched_plan(&st, t) {
                 SchedPlan::Hourly => "每小时".to_string(),
                 SchedPlan::EveryHours(h) => format!("每{h}小时"),
+                SchedPlan::EveryDays(d) => format!("每{d}天"),
                 SchedPlan::Daily(hhmm) => hhmm,
                 SchedPlan::Skip => "已关闭".to_string(),
             };

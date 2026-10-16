@@ -74,6 +74,15 @@ pub enum TargetApp {
     /// %APPDATA%\com.qodercn.app.stable，根级 Chromium 会话，与豆包多 Profile
     /// 布局不同构 → electron_root 管线）。与 Qoder IDE 为两套独立登录态。
     QoderWork,
+    /// 2026-10-16：BuddyAI 国际版 WorkBuddy AI 客户端（authfile 布局变体：
+    /// 数据目录 ~/.workbuddy-ai，auth 文件同目录异名 workbuddy-desktop-ai.info；
+    /// 池为 buddy_ai_accounts，凭证合成走 buddy-ai token store）
+    WorkBuddyAI,
+    /// 2026-10-16：BuddyAI 国际版 CodeBuddy AI 客户端（与国内 CodeBuddy CN 为
+    /// 两个独立安装：国际 = Programs\CodeBuddy + %APPDATA%\CodeBuddy；国内 =
+    /// Programs\CodeBuddy CN + %APPDATA%\CodeBuddy CN）。登录真源同为客户端
+    /// vscdb（国际 roaming 目录），槽目录独立 profiles_codebuddy_ai
+    CodeBuddyAI,
 }
 
 impl TargetApp {
@@ -89,10 +98,15 @@ impl TargetApp {
             "CodeBuddy" => Ok(TargetApp::CodeBuddy),
             "Qoder" => Ok(TargetApp::Qoder),
             "QoderWork" => Ok(TargetApp::QoderWork),
+            // buddy-ai 国际版：WorkBuddyAI / CodeBuddyAI 均为独立档案
+            //（CodeBuddyAI 修复：此前归一国内 CodeBuddy 档案导致切换走了国内
+            // CN 客户端；两客户端 exe/进程/roaming 数据目录均不同，见 profile.rs）
+            "WorkBuddyAI" => Ok(TargetApp::WorkBuddyAI),
+            "CodeBuddyAI" => Ok(TargetApp::CodeBuddyAI),
             // Err 文案带合法值清单 + 旧值指引（审查 P3）：调用方（CLI/持久化
             // 读取）只报「未知应用类型」时无从排障，TraeWork 旧值需指路
             other => Err(format!(
-                "未知应用类型: {other}（合法值: Trae | Doubao | WorkBuddy | CodeBuddy | Qoder | QoderWork；TraeWork 已于 v3.7.12 并入 Trae，存量数据由启动迁移自动改写，外部配置请改存为 Trae）"
+                "未知应用类型: {other}（合法值: Trae | Doubao | WorkBuddy | CodeBuddy | WorkBuddyAI | CodeBuddyAI | Qoder | QoderWork；TraeWork 已于 v3.7.12 并入 Trae，存量数据由启动迁移自动改写，外部配置请改存为 Trae）"
             )),
         }
     }
@@ -168,7 +182,12 @@ impl Session {
             include_indexeddb: args.include_indexeddb,
             machine_id_override: args.machine_id_override.clone(),
             auth_dir: authfile::wb_auth_dir(),
-            auth_file: authfile::wb_auth_file(),
+            // 国际版 WorkBuddy AI：同目录异名 auth 文件（workbuddy-desktop-ai.info），
+            // 与国内 WorkBuddy 的 workbuddy-desktop.info 共存互不干扰
+            auth_file: match args.target_app {
+                TargetApp::WorkBuddyAI => authfile::wb_ai_auth_file(),
+                _ => authfile::wb_auth_file(),
+            },
             detected_live_uid: None,
             expected_current_uid: args.expected_current_uid.clone(),
             bootstrap_done: false,
@@ -810,7 +829,9 @@ fn bootstrap_snapshot_from_token_store(
     uid: &str,
     sink: &dyn ProgressSink,
 ) -> Option<String> {
-    if sess.prof.app_name != "WorkBuddy" {
+    // 仅 authfile 布局的 WorkBuddy 系可合成（CodeBuddy 登录真源在客户端加密
+    // vscdb，工具侧无法离线合成；国际 WorkBuddy AI 走 buddy-ai token store）
+    if !matches!(sess.prof.app_name, "WorkBuddy" | "WorkBuddy AI") {
         return None;
     }
     sink.step(
@@ -818,7 +839,12 @@ fn bootstrap_snapshot_from_token_store(
         StepStatus::Info,
         &format!("目标账号 {uid} 无快照，尝试用工具侧凭证副本合成最小登录态…"),
     );
-    let store = crate::tasks::wb_common::token_store_load_secure(&sess.data_dir);
+    // 国际版凭证在 buddy-ai token store（独立表 + buddy-ai vault 命名空间）
+    let store = if sess.target == TargetApp::WorkBuddyAI {
+        crate::tasks::wb_common::buddy_ai_token_store_load(&sess.data_dir)
+    } else {
+        crate::tasks::wb_common::token_store_load_secure(&sess.data_dir)
+    };
     let Some(rec) = store.get("tokens").and_then(|t| t.get(uid)) else {
         sink.step(
             "bootstrap",
@@ -843,8 +869,12 @@ fn bootstrap_snapshot_from_token_store(
         return None;
     }
     // 真实 uid 以账号池条目为准（uid 是 uuid 体系，槽名 wb-<hash> 只是池 id）；
-    // 池缺失时回退凭证记录里的 uid
-    let pool = crate::store::docs::wb_pool_load(&crate::store::db(&sess.data_dir));
+    // 池缺失时回退凭证记录里的 uid。国际版查 buddy-ai 独立池
+    let pool = if sess.target == TargetApp::WorkBuddyAI {
+        crate::store::docs::buddy_ai_pool_load(&crate::store::db(&sess.data_dir))
+    } else {
+        crate::store::docs::wb_pool_load(&crate::store::db(&sess.data_dir))
+    };
     let pool_uid = pool
         .get("accounts")
         .and_then(|a| a.as_array())
@@ -897,7 +927,7 @@ fn switch_flow(
         };
         let Some(bootstrap_uid) = bootstrap_uid else {
             let msg = match (sess.prof.layout, sess.prof.app_name) {
-                (Layout::Authfile, "CodeBuddy") => format!(
+                (Layout::Authfile, "CodeBuddy" | "CodeBuddy AI") => format!(
                     "目标账号 {uid} 无快照，且 CodeBuddy 登录真源在客户端加密数据库（vscdb），\
                      工具无法自动合成。这是「切换要快照、快照要保存、保存又被当前登录不一致拒绝」\
                      的冷启动闭环：请先在客户端手动登录账号 {uid}（旧账号暂不退出也可直接切换登录），\

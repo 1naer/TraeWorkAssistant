@@ -28,7 +28,9 @@ pub const FREE_MODEL: &str = "deepseek-v4.1-flash";
 /// 建会话 prompt（外部项目同款最小一轮）
 const PROMPT_TEXT: &str = "Hi";
 /// ⑤ 完成判定轮询超时（可配口径默认 120s）+ 轮询间隔
-const COMPLETE_TIMEOUT_SECS: u64 = 120;
+/// 会话完成判定窗口（180s：实测 17:52 轮 conv 已建但 120s 未完成判失败，
+/// 4 分钟后调度轮同账号成功——沙箱对话偶发慢，放宽到 3 分钟减少误判）
+const COMPLETE_TIMEOUT_SECS: u64 = 180;
 const COMPLETE_POLL_SECS: u64 = 3;
 /// 出口级瞬时抖动退避：1s 起翻倍封顶 15s，每步最多 3 次重试
 const STEP_RETRIES: u32 = 3;
@@ -242,6 +244,7 @@ fn process_account(
     nickname: &str,
     token: &str,
     uid: &str,
+    emit: &mut dyn FnMut(&Value),
 ) -> Value {
     let base = "https://www.workbuddy.ai";
     let fail = |m: String| result_ev(acct_id, nickname, "fail", &m);
@@ -279,10 +282,21 @@ fn process_account(
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())?;
         let v: Value = resp.into_json().map_err(|e| BackoffErr::Msg(e.to_string()))?;
-        crate::fs_utils::dig(&v, &["data", "id"])
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| BackoffErr::Msg(format!("建会话响应无 data.id：{}", trim_json(&v))))
+        // 2026-10-16 实抓修复：dig 是「任意键命中即返回」语义（find_map 逐键全树搜），
+        // ["data","id"] 会命中 data 对象本身导致 as_str() 失败——改用 path 严格逐段下钻；
+        // id 以字符串为主，兼容数字形态
+        let id = crate::fs_utils::path(&v, &["data", "id"])
+            .ok_or_else(|| BackoffErr::Msg(format!("建会话响应无 data.id：{}", trim_json(&v))))?;
+        Ok(match id {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            other => {
+                return Err(BackoffErr::Msg(format!(
+                    "建会话响应 data.id 类型异常（{other}）：{}",
+                    trim_json(&v)
+                )))
+            }
+        })
     });
     let conv_id = match conv_id {
         Ok(v) => v,
@@ -325,17 +339,22 @@ fn process_account(
         .timeout_connect(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(30))
         .build();
-    let conn_id = with_backoff(|| {
+    // 2026-10-16 实测修复（404 根因）：SSE Response 必须带出闭包保持存活——原实现
+    // 在 with_backoff 闭包返回时 drop，服务端随即回收 ACP 连接，④ 全部
+    // 404 {"error":"connection not found"}（响应体已由 4xx 诊断落盘佐证）
+    let sse = with_backoff(|| {
         let resp = acp_agent.get(&link)
             .set("Accept", "text/event-stream")
             .set("Authorization", &format!("Bearer {sandbox_token}"))
             .set("User-Agent", "Mozilla/5.0")
             .call()?;
-        resp.header("Acp-Connection-Id")
+        let conn = resp
+            .header("Acp-Connection-Id")
             .map(|s| s.to_string())
-            .ok_or_else(|| BackoffErr::Msg("ACP 响应缺 Acp-Connection-Id".to_string()))
+            .ok_or_else(|| BackoffErr::Msg("ACP 响应缺 Acp-Connection-Id".to_string()))?;
+        Ok((resp, conn))
     });
-    let conn_id = match conn_id {
+    let (mut _sse_resp, conn_id) = match sse {
         Ok(v) => v,
         Err(e) => return fail(format!("ACP 通道建立失败：{e}")),
     };
@@ -373,25 +392,63 @@ fn process_account(
     for (rid, method, params) in steps {
         let payload = rpc(rid, method, params);
         let res = with_backoff(|| {
-            let resp = acp_agent.post(&link)
+            let out = acp_agent.post(&link)
                 .set("Acp-Connection-Id", &conn_id)
                 .set("Authorization", &format!("Bearer {sandbox_token}"))
                 .set("Content-Type", "application/json")
-                .set("User-Agent", "Mozilla/5.0")
-                .send_string(&payload.to_string())?;
-            // 202 = 受理（SSE 异步回 session/update）；200 兼容同步响应形态
-            Ok(u32::from(resp.status()))
+                // 2026-10-16 实测修复：POST 缺 Accept/Origin 时沙箱网关回 406——
+                // 与 ③ GET 同口径补 SSE Accept + 站点 Origin/Referer
+                .set("Accept", "text/event-stream, application/json")
+                .set("Origin", "https://www.workbuddy.ai")
+                .set("Referer", "https://www.workbuddy.ai/")
+                .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                .send_string(&payload.to_string());
+            match out {
+                // 202 = 受理（SSE 异步回 session/update）；200 兼容同步响应形态
+                Ok(resp) => Ok(u32::from(resp.status())),
+                // 4xx 诊断：响应体落 app.log（BackoffErr::Status 只带 code 丢失 body，
+                // Accept/Origin 修复是否命中需原文佐证）
+                Err(ureq::Error::Status(code, resp)) => {
+                    if let Ok(body) = resp.into_string() {
+                        let head: String = body.chars().take(600).collect();
+                        crate::fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("buddy-ai: ACP {method} HTTP {code} 响应体：{head}"),
+                        );
+                    }
+                    Err(BackoffErr::Status(code))
+                }
+                Err(e) => Err(BackoffErr::from(e)),
+            }
         });
         if let Err(e) = res {
             return fail(format!("ACP {method} 失败：{e}"));
         }
     }
+    // 四连完成后释放 SSE 流（⑤ 轮询走 console 端点，不需要连接存活；120s 窗口远超
+    // acp_agent 30s 超时，拖着反而可能被超时强行断开产生噪音日志）
+    drop(_sse_resp);
 
-    // ⑤ 完成判定轮询（data.status == "completed"，120s 超时）
+    // ⑤ 完成判定轮询（data.status == "completed"，180s 超时）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(COMPLETE_TIMEOUT_SECS);
     let mut completed = false;
+    let mut poll_rounds = 0u64;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(COMPLETE_POLL_SECS));
+        poll_rounds += 1;
+        // 心跳（长静默期修复）：每 5 轮（15s）向前端报一次等待进度——
+        // 此前整个轮询期零事件，用户感知为「点了没反应一直执行中」
+        if poll_rounds % 5 == 0 {
+            emit(&json!({
+                "type": "progress",
+                "name": nickname,
+                "message": format!(
+                    "等待会话完成…（{}s/{}s）",
+                    poll_rounds * COMPLETE_POLL_SECS,
+                    COMPLETE_TIMEOUT_SECS
+                ),
+            }));
+        }
         let status = with_backoff(|| {
             let resp = web_headers(
                 agent.get(&format!("{base}/console/as/conversations/{conv_id}")),
@@ -552,7 +609,14 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
         } else {
             pool_uid.clone()
         };
-        let mut ev = process_account(state, &agent, id, name, &token, &uid);
+        // 开跑即报（长静默修复）：此前逐账号事件仅在处理完成后发出，
+        // 多分钟的六步链期间前端零反馈，用户感知为「点了没反应」
+        emit(&json!({
+            "type": "progress",
+            "name": name,
+            "message": format!("开始处理（{}/{}），六步链预计 1-3 分钟…", i + 1, accounts.len()),
+        }));
+        let mut ev = process_account(state, &agent, id, name, &token, &uid, &mut *emit);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);

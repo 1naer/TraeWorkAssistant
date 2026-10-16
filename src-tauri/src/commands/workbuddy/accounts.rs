@@ -315,6 +315,10 @@ fn read_current_account_marker(dir: &std::path::Path) -> Option<String> {
 /// 与 `is_current_workbuddy` / `is_current_codebuddy` 徽标同源；文件不存在 → None。
 pub fn current_account_marker(state: &AppState, app: &str) -> Option<String> {
     let dir = match app {
+        // 国际版：WorkBuddy AI / CodeBuddy AI 独立槽目录（CodeBuddyAI 修复：
+        // 两客户端为独立安装，登录态/快照互不混用）
+        "WorkBuddyAI" => "profiles_workbuddy_ai",
+        "CodeBuddyAI" => "profiles_codebuddy_ai",
         "CodeBuddy" => "profiles_codebuddy",
         _ => "profiles_workbuddy",
     };
@@ -359,9 +363,19 @@ pub fn pool_account_id_by_uid(state: &AppState, uid: &str) -> Option<String> {
 /// 登录/切换改写（实测：恢复某账号快照启动后该值变为该账号 uid）。
 /// None = 文件不存在/未登录/解析失败（调用方 fail-open）。
 pub fn codebuddy_live_uid() -> Option<String> {
+    cb_live_uid_inner("CodeBuddy CN")
+}
+
+/// 国际版 CodeBuddy AI 客户端 live uid（%APPDATA%\CodeBuddy\User\globalStorage\
+/// storage.json genie.userId；2026-10-16 本机实测两客户端 roaming 目录隔离）
+pub fn codebuddy_ai_live_uid() -> Option<String> {
+    cb_live_uid_inner("CodeBuddy")
+}
+
+fn cb_live_uid_inner(roaming_dir: &str) -> Option<String> {
     let appdata = std::env::var("APPDATA").ok()?;
     let p = std::path::PathBuf::from(appdata)
-        .join("CodeBuddy CN")
+        .join(roaming_dir)
         .join("User")
         .join("globalStorage")
         .join("storage.json");

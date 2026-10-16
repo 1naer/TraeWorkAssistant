@@ -95,6 +95,20 @@ impl WbView {
         }
     }
 
+    /// 家族竞速对冲阈值视图（per-pool 独立配置：CN 用 wb_hedge_threshold_ms，
+    /// Intl 用 buddy_ai_hedge_threshold_ms；0 = 关闭对冲）
+    pub fn route_hedge_ms(&self) -> u64 {
+        if self.buddy_ai {
+            self.state
+                .buddy_ai_hedge_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.state
+                .wb_hedge_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
     /// 家族模型级冷却表视图（独立实例：CN/Intl 同名模型不混轮）
     pub fn route_model_cooldowns(&self) -> &Mutex<std::collections::HashMap<String, (i64, u32)>> {
         if self.buddy_ai {
@@ -435,7 +449,7 @@ fn race_first_byte(
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
 ) -> Result<RaceWin, ()> {
-    let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let hedge_ms = state.route_hedge_ms();
     if hedge_ms == 0 {
         return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
             lines,

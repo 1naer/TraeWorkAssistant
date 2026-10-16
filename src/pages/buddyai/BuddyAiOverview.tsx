@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, CheckCircle2, Circle, ChevronRight, Coins, ExternalLink, Loader2 } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight, ExternalLink, Loader2 } from 'lucide-react';
 import {
   Bar,
   BarChart,
@@ -11,22 +11,23 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { Badge, Spinner, StatCard } from '../../components/ui';
+import { Badge, StatCard } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
-import type { AppLocate, BuddyAiAccountView, ViewKey, WbCheckinRecord, WbModelInfo } from '../../types';
+import type { AppLocate, BuddyAiAccountView, ViewKey, WbCheckinRecord } from '../../types';
 
 /**
  * BuddyAI · 概述页（六页子导航对齐国内 Buddy「概述」形态）。
  *
- * 顶部统计卡（账号 / 积分 / 打卡调度 / 凭证告警）+ 配置导航（导入账号 → 开启打卡 →
- * 同步积分 → 开启国际档调度）+ 国际档模型目录（动态抓取优先/静态兜底）+ 隔离说明。
- * 数据全部复用 buddy_ai_* 独立池命令，与国内 Buddy 概述零数据共享。
+ * 顶部统计卡（账号总数 / 可用总积分 / 登录账号 / 本机套餐 / 凭证告警，镜像国内五卡）+
+ * 配置导航（安装客户端 → 扫描本机账号 → 首次打卡 → 查询积分 → 国际档调度[可选]）。
+ * 数据全部复用 buddy_ai_* 独立池命令，与国内 Buddy 概述零数据共享；
+ * 模型目录统一在「资源调度」页处理。
  */
 
-/** 配置导航步骤（对齐 Buddy 概述 SetupGuide 形态） */
+/** 配置导航步骤（对齐国内 Buddy 概述 SetupGuide 形态；optional 步骤不计入完成度） */
 interface Step {
   key: string;
   title: string;
@@ -34,6 +35,8 @@ interface Step {
   done: boolean;
   actionLabel: string;
   view: ViewKey;
+  /** 可选步骤：不计入 x/y 完成度（如国际档调度） */
+  optional?: boolean;
 }
 
 export default function BuddyAiOverview() {
@@ -44,23 +47,22 @@ export default function BuddyAiOverview() {
   const isDark = useIsDark();
   const [accounts, setAccounts] = useState<BuddyAiAccountView[]>([]);
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
-  const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   const [intlEnabled, setIntlEnabled] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [wbLocate, setWbLocate] = useState<AppLocate | null>(null);
   const [openingClient, setOpeningClient] = useState(false);
-  const [catalogSyncing, setCatalogSyncing] = useState(false);
+  // 本机登录账号（account-snapshot.json：editionType = 本机套餐真实口径）
+  const [localAcct, setLocalAcct] = useState<{ nickname: string; edition_type: string; is_pro: boolean } | null>(null);
 
   const refresh = async () => {
     setRefreshing(true);
     try {
-      const [accs, recs, cat, pf] = await Promise.all([
+      const [accs, recs, pf] = await Promise.all([
         api.buddyai.accountsList().catch((e) => {
           pushToast('error', `账号列表加载失败：${String(e).slice(0, 120)}`);
           return [] as BuddyAiAccountView[];
         }),
         api.buddyai.checkinResults(30).catch(() => [] as WbCheckinRecord[]),
-        api.apiServer.buddyAiCatalogList().catch(() => [] as WbModelInfo[]),
         api.apiServer.poolList().catch((e) => {
           // FM-1：加载失败与「未开启」必须可区分（原静默吞掉显示假态）
           pushToast('error', `池配置加载失败：${String(e).slice(0, 120)}`);
@@ -69,8 +71,13 @@ export default function BuddyAiOverview() {
       ]);
       setAccounts(accs);
       setRecords(recs);
-      setCatalog(cat);
       setIntlEnabled(pf?.buddy_ai_enabled ?? false);
+      api.buddyai
+        .localScan()
+        .then((r) => {
+          if (r.found) setLocalAcct({ nickname: r.nickname ?? '', edition_type: r.edition_type ?? '', is_pro: r.is_pro ?? false });
+        })
+        .catch(() => {});
     } finally {
       setRefreshing(false);
     }
@@ -114,51 +121,67 @@ export default function BuddyAiOverview() {
   const checkinEnabled = settings?.buddy_ai_checkin_enabled === true;
   const creditsFetched = withBalance.length > 0;
 
-  // 配置导航（步骤完成态实时判定；对齐国内第一步「安装客户端」含打开动作）
+  // 登录账号 / 本机套餐（对齐国内概述口径）：国际版无 edition_type 数据源，
+  // 登录账号 = 凭证可用账号数；本机套餐 = 积分包名聚合（打卡入账 30/50 按套餐定档）
+  const pkgNames = useMemo(
+    () =>
+      [
+        ...new Set(
+          accounts.flatMap((a) => (a.credits_packages ?? []).map((p) => p.name).filter(Boolean)),
+        ),
+      ].slice(0, 3),
+    [accounts],
+  );
+  const today = new Date().toLocaleDateString('sv-SE');
+
+  // 配置导航（步骤完成态实时判定；镜像国内五步：安装 → 扫描本机账号 → 首签 → 积分 → 调度[可选]）
   const steps: Step[] = [
     {
       key: 'client',
-      title: '安装国际客户端',
-      desc: '主客户端 WorkBuddy AI（Programs\\WorkBuddyAI）：打卡 / 积分 / 调度全功能，路径未识别时到「环境配置」处理。',
+      title: '安装 WorkBuddy AI 客户端',
+      desc: '主客户端：打卡/积分/调度全功能。路径未自动识别时可在「环境配置」人工指定。',
       done: !!wbLocate?.exe,
       actionLabel: wbLocate?.exe ? '打开客户端' : '去配置',
       view: 'buddyai-settings',
     },
     {
       key: 'account',
-      title: '导入国际账号',
-      desc: '「账号管理」扫码登录 workbuddy.ai OAuth，或手工导入国际账号 token（须为 .workbuddy.ai 域）。',
+      title: '扫描本机账号',
+      desc: '在客户端登录后到「账号管理」扫描本机 .workbuddy-ai 账号，或用 workbuddy.ai OAuth 登录入池。',
       done: total > 0,
       actionLabel: '去导入',
       view: 'buddyai-accounts',
     },
     {
       key: 'checkin',
-      title: '开启每日活跃打卡',
-      desc: '网页会话 + 沙箱跑一轮对话，服务端自动入账 30/50 积分；支持每日定时与手动触发。',
-      done: checkinEnabled,
-      actionLabel: '去配置',
+      title: '完成首次打卡',
+      desc: '验证打卡链路是否跑通（凭证有效、接口可达），成功才落幂等戳。',
+      done: records.some((r) => r.date === today && r.status !== 'fail'),
+      actionLabel: '去打卡',
       view: 'buddyai-checkin',
     },
     {
       key: 'credits',
-      title: '同步积分余额',
-      desc: '全池 get-user-resource 实时取数，看板展示余额与到期情况。',
+      title: '查询积分余额',
+      desc: '录入凭证后查询各账号积分包余额与到期情况，看板展示趋势。',
       done: creditsFetched,
-      actionLabel: '去同步',
+      actionLabel: '查看积分',
       view: 'buddyai-credits',
     },
     {
       key: 'dispatch',
-      title: '开启 buddy-ai 国际档调度',
-      desc: '独立池参与统一网关路由（显式开启制），与国内 Buddy 档平级、互不影响。',
+      title: '开启国际档调度（可选）',
+      desc: 'buddy-ai 独立池参与统一网关路由，与国内 Buddy 档平级、互不影响。',
       done: intlEnabled,
       actionLabel: '去开启',
       view: 'buddyai-api-service',
+      optional: true,
     },
   ];
-  const completed = steps.filter((s) => s.done).length;
-  const allDone = completed === steps.length;
+  // 可选步骤不计入完成度（未开调度不阻塞「全部完成」）
+  const required = steps.filter((s) => !s.optional);
+  const completed = required.filter((s) => s.done).length;
+  const allDone = completed === required.length;
 
   // 近 30 天打卡趋势（P2 数据源：buddy_ai_checkin_results 表；缺日补零，镜像国内堆叠口径）
   const localDateStr = (dt: Date) =>
@@ -213,9 +236,9 @@ export default function BuddyAiOverview() {
         }
       />
 
-      {/* 顶部统计卡 */}
+      {/* 顶部统计卡（镜像国内五卡：账号总数/可用总积分/登录账号/本机套餐/告警提醒） */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <StatCard label="账号总数" value={total} hint={`可用 ${usable} · ${checkinHint}`} tone="brand" />
+        <StatCard label="账号总数" value={total} hint={checkinHint} tone="brand" />
         <StatCard
           label="可用总积分"
           value={withBalance.length ? totalBalance.toFixed(2) : '—'}
@@ -223,16 +246,22 @@ export default function BuddyAiOverview() {
           tone="amber"
         />
         <StatCard
-          label="打卡调度"
-          value={checkinEnabled ? '已开启' : '未开启'}
-          hint="官方 30/50 积分 · 幂等每日一次"
-          tone={checkinEnabled ? 'green' : 'slate'}
+          label="登录账号"
+          value={usable > 0 ? usable : '未登录'}
+          hint={`凭证可用 ${usable}/${total}，可参与打卡与调度`}
+          tone={usable > 0 ? 'violet' : 'slate'}
         />
         <StatCard
-          label="国际档调度"
-          value={intlEnabled ? '已开启' : '未开启'}
-          hint="buddy-ai 独立池参与网关路由"
-          tone={intlEnabled ? 'green' : 'slate'}
+          label="本机套餐"
+          value={localAcct ? (localAcct.edition_type || 'free') + (localAcct.is_pro ? '（Pro）' : '') : pkgNames[0] ?? '—'}
+          hint={
+            localAcct
+              ? `本机登录：${localAcct.nickname || '—'}（account-snapshot 实抓）`
+              : pkgNames.length > 1
+                ? `积分包含 ${pkgNames.join(' / ')}`
+                : '未检测到本机登录（账号管理 → 扫描本机账号）'
+          }
+          tone="violet"
         />
         <StatCard
           label="凭证告警"
@@ -357,60 +386,9 @@ export default function BuddyAiOverview() {
         </ol>
         {allDone && (
           <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
-            全部配置已完成，每日打卡与国际档调度交给自动化即可！
+            全部配置已完成，每日打卡与积分同步交给自动化即可！
           </div>
         )}
-      </div>
-
-      {/* 国际档模型目录（动态抓取优先 / 静态兜底） */}
-      <div className="card mt-5 p-4">
-        <div className="mb-2 flex flex-wrap items-center gap-2">
-          <Coins size={15} className="text-brand-500" />
-          <span className="text-sm font-medium">国际档模型目录</span>
-          <span className="text-xs text-slate-400">API 服务启动时直连官网 /v3/config 动态刷新 · 失败回落静态兜底</span>
-          <button
-            className="btn-outline ml-auto inline-flex items-center gap-1 px-2 py-1 text-xs"
-            disabled={catalogSyncing}
-            onClick={() => {
-              setCatalogSyncing(true);
-              api.buddyai
-                .catalogSync()
-                .then((n) => pushToast('success', `Intl 模型目录已同步（${n} 个模型）`))
-                .catch((e) => pushToast('error', `目录同步失败：${String(e).slice(0, 140)}`))
-                .finally(() => {
-                  setCatalogSyncing(false);
-                  void refresh();
-                });
-            }}
-          >
-            <RefreshCw size={12} className={catalogSyncing ? 'animate-spin' : ''} /> 同步目录
-          </button>
-        </div>
-        {catalog.length === 0 ? (
-          <p className="py-2 text-xs text-slate-400">目录未加载</p>
-        ) : (
-          <div className="flex flex-wrap gap-1.5">
-            {catalog.map((m) => (
-              <span
-                key={m.id}
-                className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-[11px] dark:border-zinc-700"
-                title={`倍率 ${m.rate.toFixed(2)}x（占位）`}
-              >
-                {m.id}
-                <span className="text-slate-400">{m.rate.toFixed(2)}x</span>
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* 隔离说明 */}
-      <div className="card mt-5 p-4 text-xs leading-5 text-slate-500 dark:text-zinc-400">
-        <div className="mb-1 text-sm font-medium text-slate-700 dark:text-zinc-200">隔离说明</div>
-        BuddyAI 为 Buddy 国际版独立应用（workbuddy.ai 域）：账号池 / 凭证存储（buddy-ai vault
-        命名空间）/ 模型冷却 / 用量记账 / 清洗模板全部独立，与国内 Buddy 档零数据共享。
-        应用入口默认隐藏，可在「环境配置」中开启显示。
-        {refreshing ? <span className="ml-1 inline-flex items-center gap-1 text-slate-400"><Spinner /> 刷新中…</span> : null}
       </div>
     </div>
   );

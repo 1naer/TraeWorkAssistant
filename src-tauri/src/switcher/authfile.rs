@@ -39,6 +39,23 @@ pub(crate) fn wb_auth_file() -> PathBuf {
     wb_auth_dir().join(WB_AUTH_FILE_NAME)
 }
 
+/// 国际版 WorkBuddy AI auth 文件（同目录异名：workbuddy-desktop-ai.info，
+/// 与国内 workbuddy-desktop.info 共存互不干扰；2026-10-16 本机实测确认）。
+/// 由 Session::new 按 TargetApp::WorkBuddyAI 注入 sess.auth_file。
+pub(crate) fn wb_ai_auth_file() -> PathBuf {
+    wb_auth_dir().join("workbuddy-desktop-ai.info")
+}
+
+/// 快照槽内 auth 文件名（随会话目标而异：国内 / 国际异名共存，
+/// 备份与恢复按会话实际 auth 文件名对齐，勿再硬编码常量）
+fn slot_auth_name(sess: &Session) -> String {
+    sess.auth_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(WB_AUTH_FILE_NAME)
+        .to_string()
+}
+
 /// 关闭客户端后 auth 文件可能仍被延迟回写（强杀后残留子进程退出落盘，实测恢复后
 /// 3 秒被旧账号回写）。备份前等待其静默：mtime 连续 2 秒不变（最长 10 秒），
 /// 避免把"回写到一半"的旧登录备份进快照。
@@ -118,7 +135,7 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     let mut copied = 0usize;
 
     // L1 必选：auth 文件
-    match std::fs::copy(&auth_file, dest.join("auth").join(WB_AUTH_FILE_NAME)) {
+    match std::fs::copy(&auth_file, dest.join("auth").join(slot_auth_name(sess))) {
         Ok(_) => {
             copied += 1;
             sink.step("backup", StepStatus::Ok, "L1 auth 文件已备份");
@@ -183,13 +200,61 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         }
     }
 
+    // Intl 扩展（仅 WorkBuddy AI）：国际客户端登录态除 auth 文件外，还落在
+    // security/<uid> 加密 vault（cipher 目录）与根级 user-<uid>* 目录（与
+    // storage/user-* 并存，本机实测 2026-10-16）——随账号一并快照
+    if sess.prof.app_name == "WorkBuddy AI" {
+        if let Some(uid) = &uid {
+            let mut root_dirs: Vec<PathBuf> = std::fs::read_dir(&sess.prof.data_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.is_dir()
+                                && p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|n| n.starts_with(&format!("user-{uid}")))
+                                    .unwrap_or(false)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            root_dirs.sort();
+            for d in &root_dirs {
+                let name = d.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let target = dest.join("root_user").join(&name);
+                let _ = std::fs::remove_dir_all(&target);
+                if copy::copy_snapshot_item(d, &target) {
+                    copied += 1;
+                }
+            }
+            if !root_dirs.is_empty() {
+                sink.step(
+                    "backup",
+                    StepStatus::Ok,
+                    &format!("Intl 根级用户数据已备份（{} 个目录）", root_dirs.len()),
+                );
+            }
+            let sec_dir = sess.prof.data_dir.join("security").join(uid);
+            if sec_dir.is_dir() {
+                let target = dest.join("security").join(uid);
+                let _ = std::fs::remove_dir_all(&target);
+                if copy::copy_snapshot_item(&sec_dir, &target) {
+                    copied += 1;
+                    sink.step("backup", StepStatus::Ok, "Intl security vault 已备份");
+                }
+            }
+        }
+    }
+
     // L3（仅 CodeBuddy）：vscdb 登录真源快照。CodeBuddy CN 桌面端登录态在
     // %APPDATA%\CodeBuddy CN\User\globalStorage（state.vscdb 的 secret://…
     // planning-genie.new.accessTokencn，实测确认），仅备份共享 auth 文件对它无效
     //（root cause：切 CodeBuddy "还是最初的登录账号"）。含 backup 库与扩展存储目录
     //（防 VS Code 启动从 backup/扩展缓存恢复旧登录）。客户端已由 stop_app 关闭，
     // vscdb 无锁可整文件复制。
-    if sess.prof.app_name == "CodeBuddy" {
+    if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
         if let Some(gs_dir) = &sess.prof.cb_global_storage_dir {
             if gs_dir.join("state.vscdb").exists() {
                 let dest_vscdb = dest.join("vscdb");
@@ -263,7 +328,7 @@ pub fn restore_authfile(
     let auth_dir = &sess.auth_dir;
     let auth_file = &sess.auth_file;
     let (src, _slot_label) = copy::resolve_slot(sess, slot, sink)?;
-    let auth_src = src.join("auth").join(WB_AUTH_FILE_NAME);
+    let auth_src = src.join("auth").join(slot_auth_name(sess));
     if !auth_src.exists() {
         sink.step(
             "restore",
@@ -279,7 +344,7 @@ pub fn restore_authfile(
     // 共享 auth 会把 WorkBuddy 的登录一并切走（实测「切 CodeBuddy 时 WorkBuddy
     // 伴随切换」根因）。CodeBuddy 恢复跳过 L1 回写，仅走 L3 vscdb；
     // WorkBuddy 恢复保持原语义。
-    let is_codebuddy = sess.prof.app_name == "CodeBuddy";
+    let is_codebuddy = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI");
     if is_codebuddy {
         sink.step(
             "restore",
@@ -335,9 +400,50 @@ pub fn restore_authfile(
         sink.step("restore", StepStatus::Ok, "L2 用户数据已恢复");
     }
 
+    // Intl 扩展（仅 WorkBuddy AI）：security/<uid> vault 与根级 user-<uid>* 对称回写
+    //（备份侧同构；槽内没有 = 旧版快照或目标账号从未在本机登录，跳过不报错）
+    if sess.prof.app_name == "WorkBuddy AI" {
+        let slot_root = src.join("root_user");
+        if slot_root.exists() {
+            if let Ok(entries) = std::fs::read_dir(&slot_root) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let target = sess.prof.data_dir.join(&name);
+                    let _ = std::fs::remove_dir_all(&target);
+                    if copy::copy_snapshot_item(&p, &target) {
+                        restored += 1;
+                    }
+                }
+                sink.step("restore", StepStatus::Ok, "Intl 根级用户数据已恢复");
+            }
+        }
+        let slot_sec = src.join("security");
+        if slot_sec.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&slot_sec) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let target = sess.prof.data_dir.join("security").join(&name);
+                    let _ = std::fs::remove_dir_all(&target);
+                    if copy::copy_snapshot_item(&p, &target) {
+                        restored += 1;
+                    }
+                }
+                sink.step("restore", StepStatus::Ok, "Intl security vault 已恢复");
+            }
+        }
+    }
+
     // L3（仅 CodeBuddy）：回写 vscdb 登录真源。旧版快照（L3 落地前）无 vscdb →
     // 仅告警不硬失败（auth 文件仍恢复，但客户端登录态大概率不变——如实提示重新保存）。
-    if sess.prof.app_name == "CodeBuddy" {
+    if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
         if let Some(gs_dir) = &sess.prof.cb_global_storage_dir {
             let slot_vscdb = src.join("vscdb");
             if slot_vscdb.join("state.vscdb").exists() {
@@ -662,7 +768,7 @@ pub fn synthesize_auth_snapshot(
     if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
         .map_err(|e| e.to_string())
         .and_then(|()| {
-            std::fs::write(dest.join("auth").join(WB_AUTH_FILE_NAME), &body)
+            std::fs::write(dest.join("auth").join(slot_auth_name(sess)), &body)
                 .map_err(|e| e.to_string())
         })
     {
@@ -753,14 +859,14 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     let has_snap_dir = snap_file.parent().map(|p| p.exists()).unwrap_or(false);
     // F2-4 端隔离：CodeBuddy 恢复不再回写共享 auth 文件（该文件属 WorkBuddy 登录
     // 驱动源），信号②对其恒无意义且会误报「疑似被其他进程回写」——仅 WorkBuddy 检查
-    let check_auth = sess.prof.app_name != "CodeBuddy";
+    let check_auth = !matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI");
 
     // F1-2 因果信号锚点：记录"恢复落盘后"的 auth 文件 mtime
     let restore_mtime = std::fs::metadata(&auth_file).and_then(|m| m.modified()).ok();
     // 信号③锚点（仅 CodeBuddy）：恢复落盘后的 vscdb mtime。仅在快照确实包含 vscdb
     // 登录真源（本次恢复覆盖了它）时启用——旧版快照（无 vscdb 槽）只恢复了 auth 文件，
     // 登录真源未变，客户端启动正常写 vscdb 也会翻动 mtime，贸然启用会假阳性确认。
-    let slot_has_vscdb = sess.prof.app_name == "CodeBuddy"
+    let slot_has_vscdb = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI")
         && sess
             .prof
             .profiles_dir
@@ -913,7 +1019,7 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
 /// 「客户端尚未回写」，判 Reverted 即假阳性。
 /// WorkBuddy 信号②本就是内容级校验，直接确认（零额外延迟）。
 fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressSink) -> VerifyResult {
-    if sess.prof.app_name != "CodeBuddy" {
+    if !matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
         sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
         return VerifyResult::Ok;
     }

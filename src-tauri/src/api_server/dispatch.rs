@@ -1108,6 +1108,7 @@ mod tests {
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             buddy_ai_pool: super::super::pool::ApiPool::new(),
             buddy_ai_enabled: AtomicBool::new(false),
             buddy_ai_sticky_enabled: AtomicBool::new(false),

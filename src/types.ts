@@ -492,6 +492,28 @@ export interface Settings {
   buddy_ai_checkin_hhmm: string;
   /** buddy-ai 打卡多账号间隔秒（默认 3，0 = 关闭） */
   buddy_ai_checkin_gap_secs: number | null;
+  /** buddy-ai 凭证兜底续期调度开关（默认开，lazy 48h——AT 到期前 48h 内才真正刷新） */
+  buddy_ai_renew_enabled: boolean;
+  /** buddy-ai 凭证兜底续期时刻 HH:MM（默认 10:35） */
+  buddy_ai_renew_hhmm: string;
+  /** buddy-ai 积分数据每日同步开关（默认开；旧键，新装由 mode 派生） */
+  buddy_ai_credits_sync_enabled: boolean;
+  /** buddy-ai 积分同步时刻 HH:MM（默认 23:45） */
+  buddy_ai_credits_sync_hhmm: string;
+  /** buddy-ai 积分同步模式：off | hourly | every_hours | every_days | daily（空 = 旧数据） */
+  buddy_ai_credits_sync_mode: string;
+  /** buddy-ai 积分同步间隔小时数（every_hours 模式，默认 2，1..24） */
+  buddy_ai_credits_sync_hours: string;
+  /** buddy-ai 积分同步间隔天数（every_days 模式，默认 1，1..30） */
+  buddy_ai_credits_sync_days: string;
+  /** buddy-ai 模型目录每日同步开关（默认开） */
+  buddy_ai_catalog_sync_enabled: boolean;
+  /** buddy-ai 模型目录同步时刻 HH:MM（默认 05:55） */
+  buddy_ai_catalog_sync_hhmm: string;
+  /** WorkBuddy AI 国际版 exe 手动路径（BuddyAI 环境配置页；null = 自动检测） */
+  workbuddy_ai_path: string | null;
+  /** CodeBuddy AI 国际客户端 exe 手动路径（null = 自动检测） */
+  codebuddy_ai_path: string | null;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
@@ -725,6 +747,16 @@ export interface ApiPoolFile {
   buddy_ai_sticky_enabled?: boolean;
   /** buddy-ai 池粘性 TTL 秒（per-pool 参数，默认 300） */
   buddy_ai_pool_sticky_ttl_secs?: number;
+  /** buddy-ai 池账号并发上限（0 = 不限，默认 1） */
+  buddy_ai_account_concurrency_limit?: number;
+  /** buddy-ai 显式会话粘性 TTL 秒（默认 1800） */
+  buddy_ai_sticky_ttl_secs?: number;
+  /** buddy-ai 竞速对冲阈值毫秒（0 = 关闭，默认 8000） */
+  buddy_ai_hedge_threshold_ms?: number;
+  /** buddy-ai 池分组筛选：非空 = 仅所选分组的国际账号参与调度；空 = 不限分组 */
+  buddy_ai_group_ids?: string[];
+  /** buddy-ai 池标签筛选：与分组筛选取交集（D5）；空 = 不限标签 */
+  buddy_ai_tag_ids?: string[];
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
   /** 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行 */
@@ -1149,6 +1181,14 @@ export interface BuddyAiAccountView {
   has_credential: boolean;
   /** token rec domain（恒含 .workbuddy.ai） */
   domain: string;
+  /** WorkBuddy AI 端当前账号（国际 auth 文件 workbuddy-desktop-ai.info uid 匹配） */
+  is_current_workbuddy?: boolean;
+  /** CodeBuddy AI 端当前账号（live storage.json genie.uid 匹配） */
+  is_current_codebuddy?: boolean;
+  /** WorkBuddy AI 端快照槽已建立（主槽或 .bak 回退槽） */
+  has_snapshot_workbuddy?: boolean;
+  /** CodeBuddy AI 端快照槽已建立 */
+  has_snapshot_codebuddy?: boolean;
 }
 
 export interface WorkBuddyAccountView {

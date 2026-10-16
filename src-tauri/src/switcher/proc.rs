@@ -334,7 +334,13 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
     // 分离启动（对齐 PS Start-Process，不等待）；启动失败 throw → 顶层 catch fatal。
     // 记录 spawn 主进程 PID：Electron 主进程关闭时其子进程（GPU/renderer 等）随之退出，
     // 关闭阶段按此 PID 精确命中本次实例。
-    let child = cmd.spawn().map_err(|e| {
+    // 静默子进程 stdio：客户端（Electron）自身的弃用警告/RequestStore 日志
+    // 不再混入应用控制台（客户端有自己的日志文件，排障不受影响）
+    let child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
         super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
     })?;
     let pid = child.id();

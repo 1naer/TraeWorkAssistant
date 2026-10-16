@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
@@ -77,7 +77,8 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
-    cmd.spawn().map_err(|e| format!("启动 Trae 失败: {e}"))?;
+    // 静默子进程 stdio：客户端自身日志不混入应用控制台（客户端有自己的日志文件）
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("启动 Trae 失败: {e}"))?;
     Ok(())
 }
 
@@ -272,7 +273,7 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             ],
             proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
             user_data_dir: format!("{home}\\.workbuddy-ai"),
-            settings_key: None,
+            settings_key: Some("workbuddy_ai_path"),
         },
         // CodeBuddy AI 国际客户端档案：用户实测与 codebuddy 同目录
         //（%LOCALAPPDATA%\Programs\CodeBuddy\CodeBuddy.exe），独立档案仅为
@@ -284,7 +285,7 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             exe_candidates: &["%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe"],
             proc_names: &["CodeBuddy"],
             user_data_dir: format!("{home}\\.codebuddy"),
-            settings_key: None,
+            settings_key: Some("codebuddy_ai_path"),
         },
         // CodeBuddy IDE 独立探测（顶栏安装徽标/打开客户端）：默认路径同 WorkBuddy 的 Electron 惯例。
         // 本机实测（2026-09-12）：安装形态为 CodeBuddy CN（带空格），exe/进程名均为 "CodeBuddy CN"，
@@ -293,9 +294,12 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             display: "CodeBuddy",
             reg_patterns: &["CodeBuddy"],
             reg_exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
+            // 2026-10-16（双客户端并存实测）：CN exe 优先——国际版 CodeBuddy.exe 读
+            // %APPDATA%\CodeBuddy，环境探测/重置/「打开 CodeBuddy」若选它会操作错端；
+            // 国际路径仅作老单安装布局兜底（国际版走 codebuddy_ai 档案）
             exe_candidates: &[
-                "%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe",
                 "%LOCALAPPDATA%\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe",
+                "%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe",
             ],
             proc_names: &["CodeBuddy", "CodeBuddy CN"],
             user_data_dir: format!("{home}\\.codebuddy"),
@@ -353,7 +357,7 @@ pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Resul
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
-    cmd.spawn().map_err(|e| format!("启动豆包失败: {e}"))?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("启动豆包失败: {e}"))?;
     Ok(())
 }
 
@@ -415,7 +419,7 @@ fn open_buddy_app(
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
-    cmd.spawn().map_err(|e| format!("启动 {display} 失败: {e}"))?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("启动 {display} 失败: {e}"))?;
     Ok(())
 }
 
@@ -508,6 +512,8 @@ pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate 
             "doubao_path" => settings.doubao_path,
             "workbuddy_path" => settings.workbuddy_path,
             "codebuddy_path" => settings.codebuddy_path,
+            "workbuddy_ai_path" => settings.workbuddy_ai_path,
+            "codebuddy_ai_path" => settings.codebuddy_ai_path,
             _ => None,
         };
         if let Some(p) = custom {

@@ -81,6 +81,9 @@ pub struct ApiSharedState {
     pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// buddy-ai（国际版）池粘性 TTL 秒（per-pool，默认 300；§4.2 粘性按池独立）
     pub buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// buddy-ai 竞速对冲阈值毫秒（per-pool 独立配置，0 = 关闭；WbView::route_hedge_ms
+    /// 按 CN/Intl 档取值）
+    pub buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64,
     /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
     /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
     pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
@@ -846,6 +849,7 @@ mod inflight_tests {
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
             buddy_ai_sticky: wb_sticky::StickyStore::default(),
+            buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             buddy_ai_pool: pool::ApiPool::new(),
             buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),

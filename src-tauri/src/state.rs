@@ -313,6 +313,12 @@ impl AppState {
             s.qoder_credits_sync_mode =
                 if s.qoder_credits_sync_enabled { "every_hours" } else { "off" }.into();
         }
+        // buddy-ai 积分同步模式零值归一：空视为旧数据（只有 enabled 布尔），
+        // 按旧开关派生保持语义：true→daily（原每日定时口径）、false→off
+        if s.buddy_ai_credits_sync_mode.trim().is_empty() {
+            s.buddy_ai_credits_sync_mode =
+                if s.buddy_ai_credits_sync_enabled { "daily" } else { "off" }.into();
+        }
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
         if s.wb_catalog_sync_hhmm.trim().is_empty() {
@@ -337,9 +343,20 @@ impl AppState {
             &mut s.wb_credits_sync_hours,
             &mut s.trae_credits_sync_hours,
             &mut s.qoder_credits_sync_hours,
+            &mut s.buddy_ai_credits_sync_hours,
         ] {
             let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
             *field = v.to_string();
+        }
+        // buddy-ai 积分同步 every_days 间隔天数：非法回退 1，越界 clamp 到 1..=30
+        {
+            let v = s
+                .buddy_ai_credits_sync_days
+                .trim()
+                .parse::<i64>()
+                .map(|d| d.clamp(1, 30))
+                .unwrap_or(1);
+            s.buddy_ai_credits_sync_days = v.to_string();
         }
         // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
         if s.pinned_app.trim().is_empty() || s.pinned_app == "buddy-ai" {

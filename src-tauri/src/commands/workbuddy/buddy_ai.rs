@@ -311,6 +311,20 @@ pub fn buddy_ai_accounts_list(state: State<'_, AppState>) -> Result<Vec<Value>, 
         .and_then(|t| t.as_object())
         .cloned()
         .unwrap_or_default();
+    // 切换/保存登录态上下文（对齐国内 is_current_* / has_snapshot_* 口径）：
+    // WB 当前 = 国际 auth 文件 uid；CB 当前 = CodeBuddy live storage.json genie.uid；
+    // 快照槽存在性 = 主槽或 .bak 回退槽
+    let ai_auth_uid = crate::switcher::authfile::auth_file_uid(
+        &crate::switcher::authfile::wb_ai_auth_file(),
+    );
+    // CB 当前 = 国际版客户端 live uid（%APPDATA%\CodeBuddy；2026-10-16 修复：
+    // 原误读国内 CodeBuddy CN 的 roaming，徽标/切换目标全部错端）
+    let cb_live_uid = super::accounts::codebuddy_ai_live_uid();
+    let profiles_wb_ai = state.data_dir.join("data").join("profiles_workbuddy_ai");
+    let profiles_cb = state.data_dir.join("data").join("profiles_codebuddy_ai");
+    let slot_exists = |dir: &std::path::Path, id: &str| {
+        dir.join(id).exists() || dir.join(format!("{id}.bak")).exists()
+    };
     Ok(pool
         .accounts
         .iter()
@@ -338,9 +352,27 @@ pub fn buddy_ai_accounts_list(state: State<'_, AppState>) -> Result<Vec<Value>, 
                         .unwrap_or(false)
                 }).unwrap_or(false),
                 "domain": rec.and_then(|r| as_str(fs_utils::dig(r, &["domain"]))).unwrap_or_else(|| INTL_DOMAIN.into()),
+                "is_current_workbuddy": ai_auth_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
+                "is_current_codebuddy": cb_live_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
+                "has_snapshot_workbuddy": slot_exists(&profiles_wb_ai, &a.id),
+                "has_snapshot_codebuddy": slot_exists(&profiles_cb, &a.id),
             })
         })
         .collect())
+}
+
+/// buddy-ai 池 uid 反查账号 id（switch.rs 切换/保存守卫用；与国内
+/// pool_account_id_by_uid 同型，数据源 buddy_ai_accounts 独立池）
+pub(crate) fn buddy_ai_pool_account_id_by_uid(state: &AppState, uid: &str) -> Option<String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    load_buddy_pool(state)
+        .accounts
+        .into_iter()
+        .find(|a| a.uid == uid)
+        .map(|a| a.id)
 }
 
 /// 移除 buddy-ai 账号（池条目 + token store 行 + buddy-ai vault 条目三清）
@@ -1162,6 +1194,199 @@ pub fn buddy_ai_accounts_export(
         v["tokens"] = json!({});
     }
     Ok(v)
+}
+
+/// buddy-ai 账号池导入（P8 对齐 workbuddy_accounts_import；accounts_export 的回导）。
+/// 合并语义：同 id 账号跳过（不覆盖池内现状），新账号追加；tokens 副本仅对
+/// token store 中不存在的账号回灌（避免覆盖池内更新的轮换凭证）。
+/// 返回 {added, skipped, invalid, tokens_added}。
+#[tauri::command(async)]
+pub fn buddy_ai_accounts_import(state: State<'_, AppState>, pool_json: Value) -> Result<Value, String> {
+    let arr = pool_json
+        .get("accounts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "导入文件缺少 accounts 数组（须为「导出账号」生成的 JSON）".to_string())?;
+    if arr.len() > 500 {
+        return Err(format!("导入账号数超限（{} > 500）", arr.len()));
+    }
+    let imported_tokens = pool_json.get("tokens").and_then(Value::as_object).cloned();
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut invalid = 0usize;
+    let mut new_accounts: Vec<WorkBuddyAccount> = Vec::new();
+    for row in arr {
+        match serde_json::from_value::<WorkBuddyAccount>(row.clone()) {
+            Ok(a) => new_accounts.push(a),
+            Err(_) => invalid += 1,
+        }
+    }
+
+    let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = load_buddy_pool(&state);
+    let mut token_targets: Vec<(String, Value)> = Vec::new();
+    for a in new_accounts {
+        // id 硬校验（与 buddy_ai_account_remove 的 64 字符上限同口径；防超长/带空白脏数据入池）
+        if a.id.is_empty() || a.id.len() > 64 || a.id.trim() != a.id {
+            invalid += 1;
+            continue;
+        }
+        if pool.accounts.iter().any(|x| x.id == a.id) {
+            skipped += 1;
+            continue;
+        }
+        // 凭证副本回灌：仅当 token store 中该 id 不存在（避免覆盖池内轮换后的新凭证）
+        if let Some(tmap) = &imported_tokens {
+            if let Some(rec) = tmap.get(&a.id) {
+                if rec.get("access_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                    || rec.get("refresh_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                {
+                    token_targets.push((a.id.clone(), rec.clone()));
+                }
+            }
+        }
+        pool.accounts.push(a);
+        added += 1;
+    }
+    if added > 0 {
+        save_buddy_pool(&state, &pool)?;
+    }
+    let mut tokens_added = 0usize;
+    for (id, rec) in token_targets {
+        if crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &id, &rec).is_ok() {
+            tokens_added += 1;
+        }
+    }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("buddy-ai: 导入账号池 added={added} skipped={skipped} invalid={invalid} tokens={tokens_added}"),
+    );
+    Ok(json!({ "added": added, "skipped": skipped, "invalid": invalid, "tokens_added": tokens_added }))
+}
+
+/// 扫描本机 WorkBuddy AI 客户端登录账号（P8 对齐国内「扫描本机账号」）。
+/// 数据源：`~/.workbuddy-ai/storage/skeleton/account-snapshot.json` 的 `primary`
+/// （uid / nickname / editionType / isPro / savedAt，客户端本机登录态落盘）。
+/// 国际版凭证存于 `security/{uid}` 加密 vault（不可提取明文），故本命令只做
+/// 「识别 + 池内匹配」：uid 已在池中 → in_pool=true；不在池中 → 前端引导 OAuth 扫码。
+#[tauri::command(async)]
+pub fn buddy_ai_local_scan(state: State<'_, AppState>) -> Result<Value, String> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() {
+        return Err("无法解析用户主目录（USERPROFILE 为空）".into());
+    }
+    let snap_path = std::path::PathBuf::from(&home)
+        .join(".workbuddy-ai")
+        .join("storage")
+        .join("skeleton")
+        .join("account-snapshot.json");
+    if !snap_path.is_file() {
+        return Ok(json!({
+            "found": false,
+            "reason": "未找到本机登录快照（客户端未安装或未登录）：~/.workbuddy-ai/storage/skeleton/account-snapshot.json"
+        }));
+    }
+    let raw = std::fs::read_to_string(&snap_path).map_err(|e| format!("读取登录快照失败: {e}"))?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| format!("解析登录快照失败: {e}"))?;
+    let p = v.get("primary").cloned().unwrap_or_default();
+    let uid = p.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    let nickname = p.get("nickname").and_then(Value::as_str).unwrap_or("").to_string();
+    let edition = p.get("editionType").and_then(Value::as_str).unwrap_or("").to_string();
+    let is_pro = p.get("isPro").and_then(Value::as_bool).unwrap_or(false);
+    let saved_at = p.get("savedAt").and_then(Value::as_i64).unwrap_or(0);
+    // 池内匹配：uid 或 nickname（uid 为空时按昵称兜底）
+    let pool = load_buddy_pool(&state);
+    let matched = pool
+        .accounts
+        .iter()
+        .find(|a| (!uid.is_empty() && a.uid == uid) || (!nickname.is_empty() && a.nickname == nickname))
+        .map(|a| a.id.clone());
+    Ok(json!({
+        "found": true,
+        "uid": uid,
+        "nickname": nickname,
+        "edition_type": edition,
+        "is_pro": is_pro,
+        "saved_at_ms": saved_at,
+        "in_pool": matched.is_some(),
+        "pool_account_id": matched.unwrap_or_default(),
+    }))
+}
+
+/// buddy-ai 环境重置（P8 对齐国内「环境重置」；白名单目录清理 + 可选登录态清除）。
+/// 白名单（硬编码，拒绝任意路径）：cache/logs/pending-telemetry/traces/shell-snapshots/
+/// editor-sdk-sandbox-ws/file-tree-manifests/memory/workspace-sessions（=workspace/sessions）；
+/// "login" 为登录态清除（security/{uid} 加密 vault 整目录删除 = 客户端登出，强确认后执行）。
+/// 返回逐项 {item, ok, detail}。
+#[tauri::command(async)]
+pub fn buddy_ai_env_reset(state: State<'_, AppState>, items: Vec<String>) -> Result<Value, String> {
+    const ALLOWED: &[&str] = &[
+        "cache",
+        "logs",
+        "pending-telemetry",
+        "traces",
+        "shell-snapshots",
+        "editor-sdk-sandbox-ws",
+        "file-tree-manifests",
+        "memory",
+        "workspace-sessions",
+        "login",
+    ];
+    if items.is_empty() || items.len() > ALLOWED.len() {
+        return Err("重置项为空或超限".into());
+    }
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() {
+        return Err("无法解析用户主目录（USERPROFILE 为空）".into());
+    }
+    let root = std::path::PathBuf::from(&home).join(".workbuddy-ai");
+    if !root.is_dir() {
+        return Err(format!("目录不存在：{}", root.display()));
+    }
+    let mut results: Vec<Value> = Vec::new();
+    for it in &items {
+        if !ALLOWED.contains(&it.as_str()) {
+            results.push(json!({ "item": it, "ok": false, "detail": "不在白名单内" }));
+            continue;
+        }
+        let targets: Vec<std::path::PathBuf> = match it.as_str() {
+            "workspace-sessions" => vec![root.join("workspace").join("sessions")],
+            // 登录态清除：security/ 下含 cipher/ 的 uid 目录（= 客户端加密凭证库）
+            "login" => std::fs::read_dir(root.join("security"))
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().is_dir() && e.path().join("cipher").is_dir())
+                        .map(|e| e.path())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            other => vec![root.join(other)],
+        };
+        let mut ok = true;
+        let mut detail = String::new();
+        for t in &targets {
+            if !t.exists() {
+                continue;
+            }
+            match std::fs::remove_dir_all(t) {
+                Ok(()) => detail.push_str(&format!("已清除 {}；", t.display())),
+                Err(e) => {
+                    ok = false;
+                    detail.push_str(&format!("清除 {} 失败: {e}；", t.display()));
+                }
+            }
+        }
+        if detail.is_empty() {
+            detail = "无内容".into();
+        }
+        results.push(json!({ "item": it, "ok": ok, "detail": detail.trim_end_matches('；') }));
+    }
+    let fail = results.iter().filter(|r| !r["ok"].as_bool().unwrap_or(false)).count();
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("buddy-ai: 环境重置 items={:?} 失败项={fail}", items),
+    );
+    Ok(json!({ "results": results, "failed": fail }))
 }
 
 /// 打开 WorkBuddy AI 国际客户端数据目录（P7 环境配置卡对齐国内

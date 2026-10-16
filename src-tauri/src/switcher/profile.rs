@@ -173,9 +173,12 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
             lnk_patterns: &["*CodeBuddy*"],
             reg_patterns: &["*CodeBuddy*"],
+            // 2026-10-16（双客户端并存实测）：CN exe 必须优先——国际版 exe 读
+            // %APPDATA%\CodeBuddy，启动它看不到恢复到 %APPDATA%\CodeBuddy CN 的
+            // 登录态；国际路径仅作老单安装布局的兜底（国际版切换走 CodeBuddyAI 档案）
             exe_candidates: vec![
-                PathBuf::from(format!("{local}\\Programs\\CodeBuddy\\CodeBuddy.exe")),
                 PathBuf::from(format!("{local}\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe")),
+                PathBuf::from(format!("{local}\\Programs\\CodeBuddy\\CodeBuddy.exe")),
             ],
             // F1-1 L3 层：CodeBuddy CN（VS Code fork）登录真源实测在自身 roaming 的
             // state.vscdb secret storage，不在共享 auth 文件——快照/恢复必须覆盖此处
@@ -227,6 +230,62 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ],
             cb_global_storage_dir: None,
             icube_items: super::icube::QODER_IDE_ITEMS,
+            force_agent_window: false,
+        },
+        // 2026-10-16：BuddyAI 国际版 WorkBuddy AI（authfile 布局变体）：
+        // 数据目录 ~/.workbuddy-ai（与国内 .workbuddy 不同根）；auth 文件同目录
+        // 异名 workbuddy-desktop-ai.info（Session::new 按 target 注入）；进程名
+        // 精确匹配 "WorkBuddyAI"/"WorkBuddy AI"，不会误杀国内 WorkBuddy 进程
+        // 2026-10-16（用户实测修复）：国际版 CodeBuddy AI 独立档案——此前
+        // CodeBuddyAI 归一国内 CodeBuddy 档案，切换走了国内 CN 客户端（进程
+        // "CodeBuddy CN" + %APPDATA%\CodeBuddy CN vscdb）。本机实测两客户端并存：
+        // 国际 = Programs\CodeBuddy\CodeBuddy.exe（进程 "CodeBuddy"）+
+        // %APPDATA%\CodeBuddy；国内 = Programs\CodeBuddy CN\CodeBuddy CN.exe +
+        // %APPDATA%\CodeBuddy CN；~/.codebuddy 双端共享。槽目录独立
+        //（profiles_codebuddy_ai），进程/快照/启动全部只认国际客户端
+        TargetApp::CodeBuddyAI => AppProfile {
+            app_name: "CodeBuddy AI",
+            layout: Layout::Authfile,
+            data_dir: PathBuf::from(format!("{home}\\.codebuddy")),
+            profiles_dir: data.join("data").join("profiles_codebuddy_ai"),
+            settings_path_key: "codebuddy_ai_path",
+            graceful_wait_secs: 5,
+            // 精确匹配国际客户端进程（"CodeBuddy"）；不得命中国内 "CodeBuddy CN"
+            proc_names: &["CodeBuddy"],
+            proc_patterns: &["CodeBuddy AI*"],
+            exe_names: &["CodeBuddy.exe"],
+            lnk_patterns: &["CodeBuddy.lnk", "*CodeBuddy AI*"],
+            reg_patterns: &["CodeBuddy"],
+            exe_candidates: vec![PathBuf::from(format!(
+                "{local}\\Programs\\CodeBuddy\\CodeBuddy.exe"
+            ))],
+            // 国际客户端登录真源 = %APPDATA%\CodeBuddy\User\globalStorage 的 vscdb
+            //（2026-10-16 本机实测存在），与国内 CodeBuddy CN 的 roaming 隔离
+            cb_global_storage_dir: Some(PathBuf::from(format!(
+                "{appdata}\\CodeBuddy\\User\\globalStorage"
+            ))),
+            icube_items: &[],
+            force_agent_window: false,
+        },
+        TargetApp::WorkBuddyAI => AppProfile {
+            app_name: "WorkBuddy AI",
+            layout: Layout::Authfile,
+            data_dir: PathBuf::from(format!("{home}\\.workbuddy-ai")),
+            profiles_dir: data.join("data").join("profiles_workbuddy_ai"),
+            settings_path_key: "workbuddy_ai_path",
+            graceful_wait_secs: 5,
+            proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
+            proc_patterns: &["WorkBuddyAI*", "WorkBuddy AI*"],
+            exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe", "WorkBuddy.exe"],
+            lnk_patterns: &["*WorkBuddyAI*", "*WorkBuddy AI*"],
+            reg_patterns: &["WorkBuddyAI", "WorkBuddy AI"],
+            exe_candidates: vec![
+                PathBuf::from(format!("{local}\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe")),
+                PathBuf::from(format!("{local}\\Programs\\WorkBuddyAI\\WorkBuddy AI.exe")),
+                PathBuf::from(format!("{local}\\Programs\\WorkBuddyAI\\WorkBuddy.exe")),
+            ],
+            cb_global_storage_dir: None,
+            icube_items: &[],
             force_agent_window: false,
         },
         TargetApp::QoderWork => AppProfile {
