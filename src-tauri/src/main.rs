@@ -188,6 +188,7 @@ fn main() {
             commands::accounts::refresh_jwt,
             commands::checkin::checkin_start,
             commands::checkin::checkin_trends,
+            commands::checkin::checkin_device_conflicts,
             commands::switch::switch_account,
             commands::switch::save_current_login,
             commands::switch::reset_device_ids,

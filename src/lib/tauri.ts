@@ -13,6 +13,7 @@ import type {
   CheckinDone,
   CheckinOpts,
   CheckinTrendPoint,
+  DeviceConflictGroup,
   CodeBuddyEnvCheck,
   CreditRecord,
   CreditDetail,
@@ -273,6 +274,9 @@ export const api = {
     // T8：近 N 天签到结果趋势（Dashboard 堆叠图）
     trends: (days?: number) =>
       invoke<CheckinTrendPoint[]>('checkin_trends', { days: days ?? null }),
+    /** 设备冲突组（issue #110 签到前预警）：device_map 中共用同一凭证的账号组 */
+    deviceConflicts: () =>
+      invoke<DeviceConflictGroup[]>('checkin_device_conflicts', {}),
   },
   misc: {
     deviceReset: (userId: string) => invoke('device_reset', { userId }),

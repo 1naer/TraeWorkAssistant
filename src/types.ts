@@ -518,6 +518,18 @@ export interface CheckinTrendPoint {
   failed: number;
 }
 
+/** 设备冲突账号（issue #110 签到前预警）：与同组其他账号共用同一 device_id */
+export interface DeviceConflictAccount {
+  user_id: string;
+  name: string;
+}
+
+/** 设备冲突组：同一 device_id 绑定 ≥2 个账号，服务端每日仅先签账号可领积分 */
+export interface DeviceConflictGroup {
+  device_id: string;
+  accounts: DeviceConflictAccount[];
+}
+
 export interface CreditRecord {
   date: string;
   user_id: string;
