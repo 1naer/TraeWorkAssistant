@@ -95,7 +95,7 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 
 1. **账号分池**：国际账号入 `buddy-ai` 池（独立池文件/表、独立 token store 键空间），禁止与 `wb` 池混居；存量混居账号一次性迁移（§4.7）。
 2. **配置分键**：调度策略、签到间隔、积分同步等配置键独立（`buddy_ai_*`），`Settings` 不复用国内字段。
-3. **失败域隔离**：换号轮换、冷却、熔断、空完成收尾均在池边界内闭环；`/healthz` 按池独立上报 selectable（对齐 [pool.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/pool.rs) `pool::selectable` 口径，Qoder 池接入同款教训）。
+3. **失败域隔离**：换号轮换、冷却、熔断、空完成收尾均在池边界内闭环；`/healthz` 按池独立上报 selectable（对齐 [pool.rs](file:///d:/code/AIWorkAssistant_main/src-tauri/src/api_server/pool.rs) `pool::selectable` 口径，Qoder 池接入同款教训）。**拍板注记（2026-10-15 审查）**：冷却表严格分池独立（buddy_ai_model_cooldowns），但 dispatch 回退闸门（BM-3 改造：`available_count >= 2`）允许 **Buddy↔BuddyAi 两池对「同目录共有模型」互为回退源**——这是有意的可用性放宽（两区共有 id 如 glm/kimi 系），Intl 专属 id 仍严格锁 buddy-ai 池（`buddy_intl_only` 门控）；若要求两区完全互不回退，需把回退候选按池过滤，当前按放宽执行。
 4. **指纹分区**：清洗模板表独立键（`buddy_ai_template_map`），内置默认表按区生成；11128 强制清洗、请求级快照机制照搬复用。
 5. **记账分区**：`UsageBucket::BuddyAi => "buddy-ai"`，非流式聚合所有轮换出口仍保证**恰好一条 record_usage 终态行**。
 6. **UI 分区**：账号、签到、设置、API 服务页均以区域维度分区展示，不出现同列表混排。
@@ -167,7 +167,7 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 | 非流式聚合 / toolexec | 同构 | 复用 |
 | SSE 转发（has_content / -9901 哨兵） | 同 + **heartbeat 注释行容忍 / reasoning_content 兼容**（R-8 实测新增） | 复用 + 小增强 |
 | 指纹清洗（`wb_template_map` + 11128 强制清洗 + 请求级快照） | `buddy_ai_template_map`（英文身份句内置表；11128 实测为 payload 校验，首条必须 system prompt） | 机制复用、模板分区 |
-| 粘性会话 wb_sticky | 独立前缀 `ba:` | 复用骨架 |
+| 粘性会话 wb_sticky | 独立前缀 `g:`（2026-10-15 勘误：§3.5 原写 `ba:` 与实现/隔离清单不符，代码为准） | 复用骨架 |
 | 每日签到 wb_checkin（daily-checkin） | **每日活跃打卡**（网页会话 + ACP 六步链，§4.5 补篇，全链已实测） | 新任务 `buddy_ai_checkin` |
 | 积分查询 wb_credits | get-user-resource（`TotalDosage` / `Accounts[]` 字段链，R-6 实测） | 解析链按区对齐 |
 | 积分快照同步 / 运行期保鲜 | 同构 | 复用 |
@@ -242,7 +242,7 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 - **省钱红线：`session/set_model` 必发**——建会话 body 里的 model 只进 manifest，不额外发这条请求则会话按默认 Auto 模型计费**扣积分**（外部项目踩坑实证；免费模型钉 `deepseek-v4.1-flash`）。
 - **幂等**：本地 `lastDailyChat` 日期戳（落 token store 账号命名空间），网页腿成功才落盘；失败不落盘、下轮巡检自动重试——与「重试退避/断连都落账」口径互为镜像（不成功不记打卡，防假打卡占位）。
 - **调度**：对齐国内签到调度器形态（整点巡检），每账号先查幂等戳再动；间隔键 `buddy_ai_checkin_gap_secs`。
-- **代理**：ACP 通道走 CONNECT 隧道且必须显式塞 `Proxy-Authorization`（缺失 407）；出口级瞬时抖动秒级退避（1s 起翻倍封顶 15s），避免一次抖动熔断整池。
+- **代理**：~~ACP 通道走 CONNECT 隧道且必须显式塞 `Proxy-Authorization`（缺失 407）~~ → **实现口径（2026-10-15 勘误）**：全链 ureq 直连（R-4 实测 3 秒跑通），CONNECT+Proxy-Authorization 适配仅在「出站被强制代理（407 环境）」时才需要，当前未实现——若部署环境强制出站代理，打卡会恒败于「ACP 通道建立失败」，届时补 ureq Proxy 层。出口级瞬时抖动秒级退避（1s 起翻倍封顶 15s），避免一次抖动熔断整池。
 - **身份**：网页腿不用设备指纹头（UID 派生指纹仅桌面腿用，本任务无桌面腿）。
 
 ### 4.6 前端
@@ -258,7 +258,7 @@ Intl 族（已由外部项目情报确认，详见 §9 附录）
 
 ### 4.7 存量迁移与兼容
 
-- 现网 `wb` 池中 `global_region=true` 的账号（当前混居）→ 启动时一次性迁移到 `buddy-ai` 池：
+- 现网 `wb` 池中 `global_region=true` 的账号（当前混居）→ 启动时一次性迁移到 `buddy-ai` 池（**实现口径 2026-10-15 勘误**：备份为 store kv `buddy_ai_migration_backup` 快照而非文件 `move_to_backup`，意图等价——中断可恢复、幂等 marker 防重扫；marker 置位先于 token 行删除，rename 失败降级语义同下）：
   - 迁移前 `move_to_backup` 备份原池文件；**rename 失败降级 Error 且不置位迁移版本号**（Trae 存量迁移同款教训，防旧 JSON 回覆覆盖运行期配置）；
   - token store 侧同步把 `tokens.<id>` 搬到 `tokens_buddy_ai.<id>`（原子写，断电半截防护对齐 `edit_qoder_storage_ids` 口径）；
   - 迁移报告结构化（`settings_note` 字段先例），不搞子串匹配推断；

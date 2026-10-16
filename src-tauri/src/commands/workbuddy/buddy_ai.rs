@@ -372,8 +372,13 @@ pub fn buddy_ai_account_remove(state: State<'_, AppState>, user_id: String) -> R
 /// 失败不标记 needs_relogin（§4.1：Intl 刷新失败按暂态处理，避免误杀真实有效凭证）。
 #[tauri::command(async)]
 pub fn buddy_ai_refresh_token(state: State<'_, AppState>, user_id: String) -> Result<String, String> {
+    buddy_ai_refresh_impl(&state, &user_id)
+}
+
+/// 续期实现（命令与调度器兜底续期任务共用；锁序/合并写回口径与原命令一致）
+pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<String, String> {
     let acct = {
-        let pool = load_buddy_pool(&state);
+        let pool = load_buddy_pool(state);
         pool.accounts
             .iter()
             .find(|a| a.id == user_id)
@@ -477,6 +482,100 @@ pub fn buddy_ai_refresh_token(state: State<'_, AppState>, user_id: String) -> Re
     Ok("凭证已续期".into())
 }
 
+// ── 定时任务（2026-10-16 六页对齐批 3）：凭证兜底续期 + 模型目录同步 ──────────
+
+/// buddy-ai 凭证兜底续期任务（对齐国内 wb-renew lazy 口径）：仅刷新 AT 剩余 ≤48h
+/// 的启用账号；全部失败返 Err 交调度器 30 分钟冷却重试，部分失败按暂态容忍
+pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
+    let pool = load_buddy_pool(state);
+    let now = chrono::Utc::now().timestamp();
+    let due: Vec<String> = pool
+        .accounts
+        .iter()
+        .filter(|a| {
+            !a.disabled
+                && a.access_token_expires_at
+                    .map(|e| e <= now + 48 * 3600)
+                    .unwrap_or(false)
+        })
+        .map(|a| a.id.clone())
+        .collect();
+    if due.is_empty() {
+        return Ok(json!({ "ok": true, "skipped": "无临期账号" }));
+    }
+    let mut renewed = 0usize;
+    let mut failed = 0usize;
+    for id in &due {
+        match buddy_ai_refresh_impl(state, id) {
+            Ok(_) => renewed += 1,
+            Err(e) => {
+                failed += 1;
+                fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 兜底续期失败 id={id}: {e}"));
+            }
+        }
+    }
+    if renewed == 0 {
+        return Err(format!("buddy-ai 凭证续期全部失败（{failed} 个临期账号）"));
+    }
+    Ok(json!({ "ok": true, "renewed": renewed, "failed": failed }))
+}
+
+/// buddy-ai 模型目录同步实现（/v3/config 直连；手动命令与调度任务共用）。
+/// 池内无可用凭证返回 Err（调度侧空池静默跳过不计失败）
+pub fn buddy_ai_catalog_sync_impl(state: &AppState) -> Result<usize, String> {
+    let pool = load_buddy_pool(state);
+    let tokens = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
+        .get("tokens")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    // 首个有凭证、未停用、未需重登的账号
+    for a in &pool.accounts {
+        if a.disabled || a.needs_relogin {
+            continue;
+        }
+        let rec = tokens.get(&a.id).cloned().unwrap_or_default();
+        let token = as_str(fs_utils::dig(&rec, &["access_token"]))
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            continue;
+        }
+        let uid = if a.uid.is_empty() {
+            as_str(fs_utils::dig(&rec, &["uid"])).unwrap_or_default().to_string()
+        } else {
+            a.uid.clone()
+        };
+        return crate::api_server::wb_catalog::buddy_ai_fetch_and_replace(&state.data_dir, &uid, &token)
+            .inspect(|n| {
+                // 首抓核对诊断（2026-10-16）：落盘成功后把前 3 条解析样本（rate/上下文/档位）
+                // 落 app.log——倍率字段名候选集是否命中原响应，一眼可判
+                let cat = crate::api_server::wb_catalog::buddy_ai_load(&state.data_dir);
+                let sample: Vec<String> = cat
+                    .iter()
+                    .take(3)
+                    .map(|m| {
+                        format!(
+                            "{} rate={} ctx={} efforts={:?}",
+                            m.id, m.rate, m.context_length, m.supported_efforts
+                        )
+                    })
+                    .collect();
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("buddy-ai: Intl 目录首抓核对样本（{n} 模型）: {}", sample.join(" | ")),
+                );
+            });
+    }
+    Err("无可用 buddy-ai 账号凭证".into())
+}
+
+/// 手动同步 Intl 模型目录（资源调度页 / 概述页「同步目录」按钮）
+#[tauri::command(async)]
+pub fn buddy_ai_catalog_sync(state: State<'_, AppState>) -> Result<usize, String> {
+    buddy_ai_catalog_sync_impl(&state)
+}
+
 // ── 存量迁移（§4.7）：wb 池混居的 global_region=true 账号一次性迁入 buddy-ai 池 ──
 
 const MIGRATION_MARKER: &str = "buddy_ai_pool_migrated_v1";
@@ -561,8 +660,18 @@ pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
 /// 手动触发与调度器看板同步共用解析 fn（fetch_total_dosage）。
 #[tauri::command(async)]
 pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<Vec<Value>, String> {
+    let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    buddy_ai_credits_sync_impl(&state, Some(rt.inner()))
+}
+
+/// 调度器/命令共用的积分同步实现（runtime 句柄用于运行池三键拨新——issue #109 同类；
+/// CLI 进程传 None 跳过，对齐 wb_credits_snapshot_task 口径）
+pub fn buddy_ai_credits_sync_impl(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<Vec<Value>, String> {
     let agent = crate::tasks::http_agent(30);
-    let pool = load_buddy_pool(&state);
+    let pool = load_buddy_pool(state);
     let tokens = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
         .get("tokens")
         .and_then(Value::as_object)
@@ -587,7 +696,7 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
     // 短临界区回写快照三键
     {
         let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = load_buddy_pool(&state);
+        let mut pool = load_buddy_pool(state);
         let now = chrono::Utc::now().to_rfc3339();
         for (id, snap) in &out {
             if let Some(a) = pool.accounts.iter_mut().find(|a| &a.id == id) {
@@ -602,22 +711,23 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
                 }
             }
         }
-        save_buddy_pool(&state, &pool)?;
+        save_buddy_pool(state, &pool)?;
         // P8：手动同步回写后刷新当日积分快照（锁内调用）
-        buddy_ai_credits_snapshot_save(&state, &pool);
+        buddy_ai_credits_snapshot_save(state, &pool);
     }
     // 运行池三键拨新（issue #109 同类，buddy-ai 国际池）：账号记录已回写，但网关
     // 运行池钉死在装配时刻——expire_first「有过期时间者优先」会恒压池内
     // expire=None 的账号，充值续期后的新到期进不了池。快照缺到期信息时保留池内
     // 旧值（对齐上方账号记录 expire 仅 Some 才覆盖的口径），余额以本次取数为准
     {
-        let rt = app
-            .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
-        let shared = rt
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|g| g.shared.clone());
+        let shared = runtime
+            .map(|rt| {
+                rt.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|g| g.shared.clone())
+            })
+            .unwrap_or(None);
         if let Some(shared) = shared {
             let current: std::collections::HashMap<String, Option<i64>> = shared
                 .buddy_ai_pool
@@ -648,7 +758,7 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
         ),
     );
     // 返回刷新后的账号视图（前端直接替换列表，免二次拉取）
-    let pool = load_buddy_pool(&state);
+    let pool = load_buddy_pool(state);
     let tokens2 = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
         .get("tokens")
         .and_then(Value::as_object)
@@ -680,6 +790,11 @@ pub fn buddy_ai_credits_fetch(app: AppHandle, state: State<AppState>) -> Result<
 /// buddy-ai 打卡调度开关（scheduler enabled 分支用）
 pub(crate) fn buddy_ai_checkin_enabled(state: &AppState) -> bool {
     state.settings().buddy_ai_checkin_enabled
+}
+
+/// buddy-ai 池账号数（调度器 models 类任务空池静默跳过判定用）
+pub(crate) fn buddy_ai_pool_size(state: &AppState) -> usize {
+    load_buddy_pool(state).accounts.len()
 }
 
 /// 启动打卡补跑（对齐 startup_auto_checkin 形态）：60s 延迟 → 抢轮次锁 →
@@ -1047,6 +1162,25 @@ pub fn buddy_ai_accounts_export(
         v["tokens"] = json!({});
     }
     Ok(v)
+}
+
+/// 打开 WorkBuddy AI 国际客户端数据目录（P7 环境配置卡对齐国内
+/// workbuddy_open_auth_dir；目录为 %USERPROFILE%\.workbuddy-ai，与国内
+/// .workbuddy 为不同安装目录）。目录不存在时降级打开其父目录（首次安装前
+/// 该目录尚未生成，父目录即用户主目录，仍有定位价值）
+#[tauri::command(async)]
+pub fn buddy_ai_open_data_dir() -> Result<(), String> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() {
+        return Err("无法解析用户主目录（USERPROFILE 为空）".into());
+    }
+    let dir = std::path::PathBuf::from(&home).join(".workbuddy-ai");
+    let target = if dir.is_dir() { dir.clone() } else { dir.parent().map(|p| p.to_path_buf()).ok_or_else(|| format!("目录不存在：{}", dir.display()))? };
+    std::process::Command::new("explorer")
+        .arg(&target)
+        .spawn()
+        .map_err(|e| format!("打开数据目录失败: {e}"))?;
+    Ok(())
 }
 
 /// buddy-ai 每日活跃打卡结果查询（P2 对齐 workbuddy_checkin_results；数据源

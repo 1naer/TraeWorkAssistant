@@ -226,8 +226,10 @@ function BuddyTopBar() {
     const label = which === 'wb' ? 'WorkBuddy' : 'CodeBuddy';
     setLaunching(which);
     try {
-      if (which === 'wb') await api.env.openWorkbuddyApp();
-      else await api.env.openCodebuddyApp();
+      // 代理运行中时注入 --proxy-server：客户端流量必走本地 MITM 代理（国内 Buddy 域抓包）
+      const port = proxy.running ? proxy.port : undefined;
+      if (which === 'wb') await api.env.openWorkbuddyApp(port);
+      else await api.env.openCodebuddyApp(port);
       pushToast('success', `已启动 ${label}`);
     } catch (err) {
       const msg = String(err);
@@ -468,8 +470,11 @@ function BuddyAiTopBar() {
     const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy AI';
     setLaunching(which);
     try {
-      if (which === 'wb') await api.env.openWorkbuddyAiApp();
-      else await api.env.openCodebuddyAiApp();
+      // 代理运行中时注入 --proxy-server：客户端流量必走本地 MITM 代理，
+      // workbuddy.ai 官网请求（模型目录 /v3/config 等）可抓包
+      const port = proxy.running ? proxy.port : undefined;
+      if (which === 'wb') await api.env.openWorkbuddyAiApp(port);
+      else await api.env.openCodebuddyAiApp(port);
       pushToast('success', `已启动 ${label}`);
     } catch (err) {
       const msg = String(err);

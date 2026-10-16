@@ -413,14 +413,17 @@ pub fn resolve_target(
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = super::wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    // 审查修复（buddy-ai Intl 专属模型误路由）：CN 目录未命中时并查 Intl 静态目录
+    // Intl 目录动态化（2026-10-15）：动态抓取结果优先（kv buddy_ai_model_catalog），
+    // 缺失回落内置静态表——/v3/config 实抓成功后倍率/上下文即随动态目录生效
+    let intl_catalog = super::wb_catalog::buddy_ai_load(&state.data_dir);
+    // 审查修复（buddy-ai Intl 专属模型误路由）：CN 目录未命中时并查 Intl 目录
     //（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等 Intl 专属 id
     // 不在 CN 目录，原实现 buddy_hit=None → 落 Trae 透传语义被误路由 Trae 上游。
     // 命中折入 buddy 源（final_model/effort/冷却链路复用），buddy_intl_only 标记
     // 随源携带：Buddy(CN) 池不得服务 Intl 专属模型（available 门控），buddy-ai 池正常取号
     let intl_hit = if super::wb_catalog::find(&catalog, &r.model).is_none() {
-        super::wb_catalog::find(super::wb_catalog::builtin_buddy_ai_cached(), &r.model)
-            .or_else(|| super::wb_catalog::find(super::wb_catalog::builtin_buddy_ai_cached(), model))
+        super::wb_catalog::find(&intl_catalog, &r.model)
+            .or_else(|| super::wb_catalog::find(&intl_catalog, model))
             .map(|m| (m.id.clone(), None))
     } else {
         None

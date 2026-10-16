@@ -11,6 +11,11 @@ import {
   PowerOff,
   Pencil,
   Download,
+  CircleHelp,
+  FolderCog,
+  Tags,
+  Copy,
+  Package,
 } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
@@ -19,7 +24,11 @@ import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { BuddyAiAccountView, GroupView, WbOauthDone, WbOauthProgress } from '../../types';
+import { GroupsModal } from '../accounts/GroupsModal';
+import { TagChips } from '../accounts/TagSelect';
+import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
+import { BuddyAiHelpModal } from './HelpModal';
+import type { BuddyAiAccountView, GroupView, TagView, WbCheckinRecord, WbOauthDone, WbOauthProgress } from '../../types';
 
 /**
  * BuddyAI（buddy-ai 国际版）账号管理页（P3 对齐国内 Buddy 账号管理）。
@@ -68,16 +77,44 @@ export default function BuddyAiAccounts() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
   const [exportBusy, setExportBusy] = useState(false);
+  // 帮助 / 分组管理 / 标签管理弹框（对齐国内 BuddyAccounts）
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
+  const [tagMap, setTagMap] = useState<Record<string, string[]>>({});
+  const [tagEditTarget, setTagEditTarget] = useState<BuddyAiAccountView | null>(null);
+  // 积分包明细弹窗（对齐国内「积分包」列内弹窗；数据源 credits_packages 池快照）
+  const [pkgTarget, setPkgTarget] = useState<BuddyAiAccountView | null>(null);
+  // 今日打卡状态（签到状态列；对齐国内「今日已签」徽标列）
+  const [todayStatus, setTodayStatus] = useState<Map<string, WbCheckinRecord>>(new Map());
+
+  const reloadTags = useCallback(async () => {
+    try {
+      const [defs, map] = await Promise.all([api.tags.list(), api.tags.map()]);
+      setTagDefs(defs);
+      setTagMap(map);
+    } catch {
+      // 标签为增强面：失败不阻塞账号列表（静默保留旧值）
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [accs, gs] = await Promise.all([
+      const [accs, gs, recs] = await Promise.all([
         api.buddyai.accountsList(),
         api.groups.sharedList().catch(() => [] as GroupView[]),
+        api.buddyai.checkinResults(7).catch(() => [] as WbCheckinRecord[]),
       ]);
       setAccounts(accs);
       setGroups(gs);
+      // 签到状态列（对齐国内「今日已签」）：records.user_id = 池账号 id
+      const today = new Date();
+      const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      const m = new Map<string, WbCheckinRecord>();
+      for (const r of recs) if (r.date === todayStr) m.set(r.user_id, r);
+      setTodayStatus(m);
       // FH-4 配套：selected 裁剪到现存账号（他端增删后全选框判定不失真）
       setSelected((prev) => {
         const ids = new Set(accs.map((a) => a.id));
@@ -91,6 +128,10 @@ export default function BuddyAiAccounts() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    void reloadTags();
+  }, [reloadTags]);
 
   useEffect(() => {
     void refresh();
@@ -339,6 +380,15 @@ export default function BuddyAiAccounts() {
             >
               <Download size={14} /> 导出账号
             </button>
+            <button className="btn-outline inline-flex items-center gap-1.5" onClick={() => setGroupOpen(true)} title="新建 / 重命名 / 换色 / 删除分组">
+              <FolderCog size={14} /> 分组管理
+            </button>
+            <button className="btn-outline inline-flex items-center gap-1.5" onClick={() => setTagsOpen(true)} title="共享标签管理（三池通用）">
+              <Tags size={14} /> 标签管理
+            </button>
+            <button className="btn-outline inline-flex items-center gap-1.5" onClick={() => setHelpOpen(true)} title="使用帮助">
+              <CircleHelp size={14} /> 帮助
+            </button>
             {selected.size > 0 && (
               <button
                 className="btn-secondary inline-flex items-center gap-1.5 text-red-500"
@@ -367,7 +417,7 @@ export default function BuddyAiAccounts() {
             hint="点击「扫码登录」走 workbuddy.ai OAuth，或「导入凭证」手工导入国际账号 token（须为 .workbuddy.ai 域）"
           />
         ) : (
-          <table className="w-full min-w-[900px] text-sm">
+          <table className="w-full min-w-[1080px] text-sm">
             <thead>
               <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
                 <th className="py-2 pl-1 pr-2">
@@ -379,7 +429,9 @@ export default function BuddyAiAccounts() {
                 </th>
                 <th className="py-2 pr-3 font-medium">账号</th>
                 <th className="py-2 pr-3 font-medium">分组</th>
+                <th className="py-2 pr-3 font-medium">标签</th>
                 <th className="py-2 pr-3 font-medium">积分</th>
+                <th className="py-2 pr-3 font-medium">签到</th>
                 <th className="py-2 pr-3 font-medium">TOKEN 到期</th>
                 <th className="py-2 pr-3 font-medium">凭证状态</th>
                 <th className="py-2 pr-3 font-medium">状态</th>
@@ -413,8 +465,41 @@ export default function BuddyAiAccounts() {
                       ))}
                     </select>
                   </td>
+                  <td className="py-2.5 pr-3">
+                    <TagChips tagIds={tagMap[a.id] ?? []} allTags={tagDefs} onEdit={() => setTagEditTarget(a)} />
+                  </td>
                   <td className="py-2.5 pr-3 tabular-nums">
-                    {a.credits_balance != null ? a.credits_balance.toFixed(2) : <span className="text-xs text-slate-400">—</span>}
+                    {a.credits_balance != null ? (
+                      <button
+                        className="inline-flex items-center gap-1 hover:text-brand-500"
+                        title="查看积分包明细"
+                        onClick={() => setPkgTarget(a)}
+                      >
+                        {a.credits_balance.toFixed(2)}
+                        {(a.credits_packages?.length ?? 0) > 0 ? (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">
+                            <Package size={10} /> {a.credits_packages!.length} 包
+                          </span>
+                        ) : null}
+                      </button>
+                    ) : (
+                      <span className="text-xs text-slate-400">—</span>
+                    )}
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    {(() => {
+                      const rec = todayStatus.get(a.id);
+                      if (a.disabled) return <Badge tone="slate">已停用</Badge>;
+                      if (!rec) return <Badge tone="slate">待打卡</Badge>;
+                      if (rec.status === 'success')
+                        return (
+                          <Badge tone="green" title={rec.message}>
+                            今日已签{rec.reward != null ? ` +${rec.reward}` : ''}
+                          </Badge>
+                        );
+                      if (rec.status === 'already') return <Badge tone="blue" title={rec.message}>已完成</Badge>;
+                      return <Badge tone="red" title={rec.message}>失败</Badge>;
+                    })()}
                   </td>
                   <td className="py-2.5 pr-3 text-xs tabular-nums text-slate-500">{expText(a.access_token_expires_at)}</td>
                   <td className="py-2.5 pr-3">
@@ -503,9 +588,23 @@ export default function BuddyAiAccounts() {
           </div>
           <p className="text-slate-500 dark:text-zinc-400">{oauthMessage}</p>
           {oauthAuthUrl ? (
-            <a href={oauthAuthUrl} target="_blank" rel="noreferrer" className="btn-primary inline-flex w-full items-center justify-center gap-2">
-              打开登录页（workbuddy.ai）
-            </a>
+            <>
+              <a href={oauthAuthUrl} target="_blank" rel="noreferrer" className="btn-primary inline-flex w-full items-center justify-center gap-2">
+                打开登录页（workbuddy.ai）
+              </a>
+              {/* 浏览器未自动打开时的兜底（对齐国内「复制完整链接」） */}
+              <button
+                className="btn-outline inline-flex w-full items-center justify-center gap-2"
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(oauthAuthUrl)
+                    .then(() => pushToast('success', '登录链接已复制，请勿泄露'))
+                    .catch(() => pushToast('error', '复制失败，请手动选中地址栏链接复制'));
+                }}
+              >
+                <Copy size={14} /> 复制完整链接
+              </button>
+            </>
           ) : null}
           <p className="text-[11px] leading-4 text-slate-400">
             登录流程：浏览器完成 workbuddy.ai 授权后，网关自动轮询拿票并国际账号入池（最长 300 秒）。
@@ -648,6 +747,161 @@ export default function BuddyAiAccounts() {
           </div>
         ) : null}
       </Modal>
+
+      {/* 积分包明细弹窗（对齐国内积分包列内弹窗；数据源 get-user-resource 分包快照） */}
+      <Modal open={pkgTarget !== null} onClose={() => setPkgTarget(null)} title={`积分包明细 · ${pkgTarget?.nickname || pkgTarget?.id || ''}`} widthClass="max-w-lg">
+        {pkgTarget ? (
+          <div className="space-y-3 text-sm">
+            {(pkgTarget.credits_packages?.length ?? 0) === 0 ? (
+              <p className="py-4 text-center text-xs text-slate-400">无积分包数据，请先到「积分看板」同步。</p>
+            ) : (
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-slate-400 dark:border-zinc-800">
+                    <th className="py-1.5 pr-2 font-medium">包名</th>
+                    <th className="py-1.5 pr-2 text-right font-medium">剩余 / 总额</th>
+                    <th className="py-1.5 text-right font-medium">到期时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(pkgTarget.credits_packages ?? []).map((p, i) => {
+                    const soon = p.expire_secs != null && p.expire_secs <= Math.floor(Date.now() / 1000) + 7 * 86400;
+                    return (
+                      <tr key={i} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
+                        <td className="py-1.5 pr-2">
+                          {p.name || p.code}
+                          {soon && p.remain > 0 ? <Badge tone="amber">7 日内到期</Badge> : null}
+                        </td>
+                        <td className="py-1.5 pr-2 text-right tabular-nums">
+                          {p.remain.toFixed(2)} / {p.size.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 text-right tabular-nums text-slate-500">
+                          {p.expire_secs ? new Date(p.expire_secs * 1000).toLocaleDateString() : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+            <div className="flex justify-end">
+              <button className="btn-secondary" onClick={() => setPkgTarget(null)}>关闭</button>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
+
+      {/* 分组管理弹框（复用共享 GroupsModal；buddy-ai 分组走共享分组体系） */}
+      <GroupsModal
+        open={groupOpen}
+        onClose={() => setGroupOpen(false)}
+        groups={groups}
+        onCreate={async (name, color) => {
+          try {
+            await api.groups.create(name, color);
+            await refresh();
+          } catch (err) {
+            pushToast('error', `新建分组失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.groups.update(id, { name });
+            await refresh();
+          } catch (err) {
+            pushToast('error', `重命名分组失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.groups.update(id, { color });
+            await refresh();
+          } catch (err) {
+            pushToast('error', `修改分组颜色失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.groups.remove(id);
+            await refresh();
+            pushToast('success', '分组已删除，组内账号回落未分组');
+          } catch (err) {
+            pushToast('error', `删除分组失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+
+      {/* 共享标签管理 + 账号标签编辑（三池通用组件复用） */}
+      <TagsModal
+        open={tagsOpen}
+        onClose={() => setTagsOpen(false)}
+        tags={tagDefs}
+        onCreate={async (name, color) => {
+          try {
+            await api.tags.create(name, color);
+            await reloadTags();
+          } catch (err) {
+            pushToast('error', `创建标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.tags.update(id, { name });
+            pushToast('success', `标签已重命名为「${name}」`);
+            await reloadTags();
+          } catch (err) {
+            pushToast('error', `重命名标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.tags.update(id, { color });
+            pushToast('success', '标签颜色已更新');
+            await reloadTags();
+          } catch (err) {
+            pushToast('error', `修改标签颜色失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.tags.remove(id);
+            await reloadTags();
+            await refresh();
+            pushToast('success', '标签已删除，引用已清理');
+          } catch (err) {
+            pushToast('error', `删除标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+      <AccountTagsEditModal
+        open={tagEditTarget != null}
+        onClose={() => setTagEditTarget(null)}
+        accountName={tagEditTarget?.nickname || tagEditTarget?.id || ''}
+        tags={tagDefs}
+        selected={tagEditTarget ? (tagMap[tagEditTarget.id] ?? []) : []}
+        onSave={async (ids) => {
+          if (!tagEditTarget) return;
+          try {
+            await api.tags.setAccountTags(tagEditTarget.id, ids);
+            await reloadTags();
+            pushToast('success', '标签已更新');
+          } catch (err) {
+            pushToast('error', `标签保存失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+
+      {/* 使用帮助弹框（国际版口径） */}
+      <BuddyAiHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }

@@ -228,6 +228,20 @@ pub struct Settings {
     /// buddy-ai 打卡多账号间隔秒（默认 3s，0 = 关闭；复用 effective_checkin_gap）
     #[serde(default)]
     pub buddy_ai_checkin_gap_secs: Option<u64>,
+    // ── Buddy 国际版定时同步/续期（2026-10-16 六页对齐批 3，对齐国内任务配置口径） ──
+    /// buddy-ai 积分数据每日定时同步开关（默认开——对齐国内看板同步口径；
+    /// 仅同步 buddy-ai 池内账号，空池静默跳过）
+    #[serde(default = "default_true")]
+    pub buddy_ai_credits_sync_enabled: bool,
+    /// buddy-ai 积分同步触发时刻 HH:MM（默认 23:45，错峰 wb 23:30 / trae 23:40）
+    #[serde(default = "default_buddy_ai_credits_sync_hhmm")]
+    pub buddy_ai_credits_sync_hhmm: String,
+    /// buddy-ai 凭证兜底续期开关（默认开；lazy 48h——AT 到期前 48h 内才真正刷新）
+    #[serde(default = "default_true")]
+    pub buddy_ai_renew_enabled: bool,
+    /// buddy-ai 模型目录每日同步开关（默认开；/v3/config 直连拉取，无账号静默跳过）
+    #[serde(default = "default_true")]
+    pub buddy_ai_catalog_sync_enabled: bool,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
     /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认）
     #[serde(default = "default_credits_sync_mode")]
@@ -425,6 +439,10 @@ fn default_wb_checkin_hhmm() -> String {
 /// buddy-ai 打卡调度默认 09:20（§4.5 补篇：对齐外部项目 scheduler 口径）
 fn default_buddy_ai_checkin_hhmm() -> String {
     "09:20".into()
+}
+/// buddy-ai 积分同步默认 23:45（错峰 wb 23:30 / trae 23:40 / qoder 23:40）
+fn default_buddy_ai_credits_sync_hhmm() -> String {
+    "23:45".into()
 }
 /// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
 fn default_qoder_checkin_hhmm() -> String {

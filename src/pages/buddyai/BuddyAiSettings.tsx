@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ExternalLink, Loader2, MonitorCheck, MonitorX } from 'lucide-react';
+import { ExternalLink, FolderOpen, Loader2, MonitorCheck, MonitorX } from 'lucide-react';
 import { Badge } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
@@ -19,6 +19,7 @@ export default function BuddyAiSettings() {
   const setView = useAppStore((s) => s.setView);
   const settings = useAppStore((s) => s.settings);
   const refreshSettings = useAppStore((s) => s.refreshSettings);
+  const proxy = useAppStore((s) => s.proxy);
   const [visible, setVisible] = useState(false);
   const [savingVisible, setSavingVisible] = useState(false);
   const [wbLocate, setWbLocate] = useState<AppLocate | null>(null);
@@ -63,8 +64,10 @@ export default function BuddyAiSettings() {
     const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy AI';
     setLaunching(which);
     try {
-      if (which === 'wb') await api.env.openWorkbuddyAiApp();
-      else await api.env.openCodebuddyAiApp();
+      // 代理运行中时注入 --proxy-server：客户端流量必走本地 MITM 代理（workbuddy.ai 抓包）
+      const port = proxy.running ? proxy.port : undefined;
+      if (which === 'wb') await api.env.openWorkbuddyAiApp(port);
+      else await api.env.openCodebuddyAiApp(port);
       pushToast('success', `已启动 ${label}`);
     } catch (err) {
       const msg = String(err);
@@ -117,9 +120,18 @@ export default function BuddyAiSettings() {
               )}
               <span className="text-xs text-slate-400">国际版客户端（Programs\WorkBuddyAI，登录 workbuddy.ai，与国内 WorkBuddy 为不同安装）</span>
             </div>
-            <button className="btn-outline inline-flex items-center gap-1.5 text-xs" onClick={() => void launchApp('wb')} disabled={launching != null}>
-              {launching === 'wb' ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />} 打开
-            </button>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <button
+                className="btn-outline inline-flex items-center gap-1.5 text-xs"
+                onClick={() => void api.buddyai.openDataDir().catch((e) => pushToast('error', `打开数据目录失败：${String(e)}`))}
+                title="打开 .workbuddy-ai 数据目录"
+              >
+                <FolderOpen size={13} /> 数据目录
+              </button>
+              <button className="btn-outline inline-flex items-center gap-1.5 text-xs" onClick={() => void launchApp('wb')} disabled={launching != null}>
+                {launching === 'wb' ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />} 打开
+              </button>
+            </div>
           </div>
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">

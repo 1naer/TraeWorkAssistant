@@ -20,6 +20,11 @@ export default function BuddyAiApiService() {
   const [pool, setPool] = useState<ApiPoolFile | null>(null);
   const [accounts, setAccounts] = useState<BuddyAiAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
+  const [catalogSyncing, setCatalogSyncing] = useState(false);
+  const refreshCatalog = useCallback(async () => {
+    const cat = await api.apiServer.buddyAiCatalogList().catch(() => [] as WbModelInfo[]);
+    setCatalog(cat);
+  }, []);
   const [flags, setFlags] = useState<{
     buddyAiEnabled: boolean;
     buddyAiStickyEnabled: boolean;
@@ -170,7 +175,7 @@ export default function BuddyAiApiService() {
           hint={flags.buddyAiEnabled ? '国际档已启用' : '国际档未启用'}
           tone={flags.buddyAiEnabled ? 'green' : 'slate'}
         />
-        <StatCard label="今日启用" value={dispatchable.length} hint="当前可取号账号数" tone="brand" />
+        <StatCard label="可取号" value={dispatchable.length} hint="健康且未停用，当前可参与调度取号" tone="brand" />
         <StatCard label="池内账号" value={accounts.length} hint={`停用 ${accounts.filter((a) => a.disabled).length} · 需重登 ${accounts.filter((a) => a.needs_relogin).length}`} tone="slate" />
         <div className="card p-4">
           <div className="flex items-center justify-between gap-3">
@@ -297,11 +302,30 @@ export default function BuddyAiApiService() {
         </div>
       </div>
 
-      {/* 国际档模型目录（对齐国内「同步官网模型」表格；静态配置原则） */}
+      {/* 国际档模型目录（对齐国内「同步官网模型」表格；动态抓取优先/静态兜底） */}
       <div className="card mt-4 overflow-x-auto p-4">
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium">国际档模型目录</span>
-          <span className="text-[11px] text-slate-400">静态配置（§4.4）· 倍率占位待官网核对回填</span>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-slate-400">启动时直连官网 /v3/config 动态刷新 · 失败回落静态兜底</span>
+            <button
+              className="btn-outline inline-flex items-center gap-1 px-2 py-1 text-xs"
+              disabled={catalogSyncing}
+              onClick={() => {
+                setCatalogSyncing(true);
+                api.buddyai
+                  .catalogSync()
+                  .then((n) => pushToast('success', `Intl 模型目录已同步（${n} 个模型）`))
+                  .catch((e) => pushToast('error', `目录同步失败：${String(e).slice(0, 140)}`))
+                  .finally(() => {
+                    setCatalogSyncing(false);
+                    void refreshCatalog();
+                  });
+              }}
+            >
+              <RefreshCw size={12} className={catalogSyncing ? 'animate-spin' : ''} /> 同步目录
+            </button>
+          </div>
         </div>
         {catalog.length === 0 ? (
           <p className="py-4 text-center text-xs text-slate-400">目录未加载</p>

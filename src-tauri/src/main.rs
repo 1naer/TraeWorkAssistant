@@ -364,6 +364,8 @@ fn main() {
             commands::workbuddy::buddy_ai_accounts_export,
             commands::workbuddy::buddy_ai_request_usage,
             commands::workbuddy::buddy_ai_credits_fetch,
+            commands::workbuddy::buddy_ai_open_data_dir,
+            commands::workbuddy::buddy_ai_catalog_sync,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,

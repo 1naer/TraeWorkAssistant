@@ -308,8 +308,32 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                     }
                 }
             }
+            // buddy-ai（国际版）目录动态抓取（2026-10-15）：GET /v3/config（R-5 锚点，
+            // UA 自带 CLI 段下发全量），取 buddy-ai 池任一账号 Bearer 直连——不依赖
+            // 客户端/抓包代理。同款 best effort：失败保持内置静态表；池未启用跳过
+            if state.buddy_ai_enabled.load(Ordering::Relaxed) {
+                if let Some(p) = state.buddy_ai_pool.pick_excluding_constrained(
+                    &std::collections::HashSet::new(),
+                    None,
+                    None,
+                ) {
+                    match wb_catalog::buddy_ai_fetch_and_replace(&state.data_dir, &p.uid, &p.jwt) {
+                        Ok(n) => {
+                            crate::fs_utils::app_log(
+                                &state.data_dir,
+                                &format!("BuddyAI Intl 模型目录动态替换成功: {} 个模型", n),
+                            );
+                        }
+                        Err(e) => {
+                            crate::fs_utils::app_log(
+                                &state.data_dir,
+                                &format!("BuddyAI Intl 模型目录动态替换失败（保持静态兜底）: {}", e),
+                            );
+                        }
+                    }
+                }
+            }
         }
-        // 探测目标：WB 上游对话主域名（CN）的轻量 GET 路径
         const PROBE_URL: &str =
             concat!("https://copilot.tencent.com", "/console/enterprises/personal/models");
         loop {

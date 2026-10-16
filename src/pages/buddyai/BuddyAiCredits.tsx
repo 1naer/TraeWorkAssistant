@@ -9,12 +9,12 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { StatCard } from '../../components/ui';
+import { StatCard, Badge } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { BuddyAiAccountView, UsageDayView, WbCheckinRecord } from '../../types';
+import type { BuddyAiAccountView, GroupView, UsageDayView, WbCheckinRecord } from '../../types';
 
 /** P8 积分快照行（buddy_ai_credits_history 表） */
 interface CreditSnap {
@@ -60,18 +60,24 @@ export default function BuddyAiCredits() {
     }>;
   } | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
+  // 全局筛选（对齐国内看板顶部分组/账号筛选：联动 KPI 卡 / 积分包明细 / 明细表）
+  const [groups, setGroups] = useState<GroupView[]>([]);
+  const [groupFilter, setGroupFilter] = useState('');
+  const [acctFilter, setAcctFilter] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [accs, recs, usg, hist] = await Promise.all([
+      const [accs, recs, usg, hist, gs] = await Promise.all([
         api.buddyai.accountsList(),
         api.buddyai.checkinResults(90).catch(() => [] as WbCheckinRecord[]),
         api.apiServer.buddyAiUsageStats(30).catch(() => [] as UsageDayView[]),
         api.buddyai.creditsHistory(90).catch(() => [] as CreditSnap[]),
+        api.groups.sharedList().catch(() => [] as GroupView[]),
       ]);
       setAccounts(accs);
       setRecords(recs);
+      setGroups(gs);
       setUsage(usg);
       setHistory(hist);
     } catch (err) {
@@ -101,13 +107,23 @@ export default function BuddyAiCredits() {
   };
 
   const list = accounts ?? [];
-  const withBalance = list.filter((a) => a.credits_balance != null);
+  // 全局筛选（国内看板同款：分组 → 账号级联，联动下方 KPI / 包明细 / 明细表）
+  const groupFiltered = useMemo(() => {
+    if (groupFilter === '') return list;
+    if (groupFilter === '__ungrouped__') return list.filter((a) => !a.group_id);
+    return list.filter((a) => a.group_id === groupFilter);
+  }, [list, groupFilter]);
+  const listF = useMemo(
+    () => (acctFilter === '' ? groupFiltered : groupFiltered.filter((a) => a.id === acctFilter)),
+    [groupFiltered, acctFilter],
+  );
+  const withBalance = listF.filter((a) => a.credits_balance != null);
   const total = withBalance.reduce((s, a) => s + (a.credits_balance ?? 0), 0);
   const nowSec = Math.floor(Date.now() / 1000);
   const expiredCount = withBalance.filter(
     (a) => (a.credits_expire_at ?? Infinity) <= nowSec,
   ).length;
-  const neverFetched = list.length - withBalance.length;
+  const neverFetched = listF.length - withBalance.length;
   const localDateStr = (dt: Date) =>
     `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
   const today = localDateStr(new Date());
@@ -140,17 +156,21 @@ export default function BuddyAiCredits() {
       .slice(0, 8);
   }, [usage]);
   const rankMax = modelRank[0]?.requests ?? 0;
-  // 积分包明细聚合（P9：各账号 credits_packages 拍平）
+  // 积分包明细聚合（P9：各账号 credits_packages 拍平；按到期升序——对齐国内「积分到期」Tab 逐包到期口径，7 日内到期徽标）
   const pkgList = useMemo(
     () =>
-      list.flatMap((a) =>
-        (a.credits_packages ?? []).map((p) => ({
-          acct: a.nickname || a.id,
-          ...p,
-        })),
-      ),
-    [list],
+      listF
+        .flatMap((a) =>
+          (a.credits_packages ?? []).map((p) => ({
+            acct: a.nickname || a.id,
+            ...p,
+          })),
+        )
+        .sort((x, y) => (x.expire_secs ?? Infinity) - (y.expire_secs ?? Infinity)),
+    [listF],
   );
+  const pkgSoon = (expire: number | null | undefined) =>
+    expire != null && expire > nowSec && expire <= nowSec + 7 * 86400;
   // 请求明细拉取（P9：官网分页接口）。
   // FH-3 审查修复：递增序号守卫——慢响应后到会覆盖新筛选条件的结果（张冠李戴）
   const usageSeq = useRef(0);
@@ -214,9 +234,56 @@ export default function BuddyAiCredits() {
         }
       />
 
-      {/* 顶部统计卡（P5 口径对齐国内积分看板七卡的国际可用子集） */}
+      {/* 全局筛选（对齐国内看板：分组 → 账号级联，联动 KPI / 包明细 / 明细表） */}
+      <div className="card mt-4 flex flex-wrap items-center gap-2 p-3">
+        <span className="text-xs font-medium text-slate-500">筛选</span>
+        <select
+          className="rounded-md border border-slate-200 bg-transparent px-2 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+          value={groupFilter}
+          onChange={(e) => {
+            setGroupFilter(e.target.value);
+            setAcctFilter('');
+          }}
+        >
+          <option value="">全部分组</option>
+          <option value="__ungrouped__">未分组</option>
+          {groups.map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.name}
+            </option>
+          ))}
+        </select>
+        <select
+          className="rounded-md border border-slate-200 bg-transparent px-2 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+          value={acctFilter}
+          onChange={(e) => setAcctFilter(e.target.value)}
+        >
+          <option value="">全部账号</option>
+          {groupFiltered.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.nickname || a.id}
+            </option>
+          ))}
+        </select>
+        {acctFilter || groupFilter ? (
+          <button
+            className="btn-ghost text-xs text-slate-400"
+            onClick={() => {
+              setGroupFilter('');
+              setAcctFilter('');
+            }}
+          >
+            清除筛选
+          </button>
+        ) : null}
+        <span className="text-[11px] text-slate-400">
+          {listF.length}/{list.length} 个账号
+        </span>
+      </div>
+
+      {/* 顶部统计卡（P5 口径对齐国内积分看板七卡的国际可用子集；随筛选联动） */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
-        <StatCard label="账号总数" value={list.length} hint={`${withBalance.length} 个已取数`} tone="brand" />
+        <StatCard label="账号总数" value={listF.length} hint={`${withBalance.length} 个已取数`} tone="brand" />
         <StatCard
           label="可用总积分"
           value={withBalance.length ? total.toFixed(2) : '—'}
@@ -286,7 +353,10 @@ export default function BuddyAiCredits() {
               {pkgList.map((p, i) => (
                 <tr key={`${p.acct}-${p.code}-${i}`} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
                   <td className="py-2 pr-3 text-xs">{p.acct}</td>
-                  <td className="py-2 pr-3 text-xs">{p.name || p.code || '—'}</td>
+                  <td className="py-2 pr-3 text-xs">
+                    {p.name || p.code || '—'}
+                    {pkgSoon(p.expire_secs) && p.remain > 0 ? <Badge tone="amber">7 日内到期</Badge> : null}
+                  </td>
                   <td className="py-2 pr-3 text-xs tabular-nums text-emerald-600 dark:text-emerald-400">{p.remain.toFixed(2)}</td>
                   <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">{p.size.toFixed(0)}</td>
                   <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">
@@ -338,9 +408,9 @@ export default function BuddyAiCredits() {
       <div className="card mt-4 overflow-x-auto p-4">
         {loading && accounts === null ? (
           <div className="py-10 text-center text-sm text-slate-400">加载中…</div>
-        ) : list.length === 0 ? (
+        ) : listF.length === 0 ? (
           <div className="flex h-40 items-center justify-center text-sm text-slate-400">
-            暂无国际账号，先到「账号管理」扫码登录或导入凭证。
+            {list.length === 0 ? '暂无国际账号，先到「账号管理」扫码登录或导入凭证。' : '当前筛选条件下无账号。'}
           </div>
         ) : (
           <table className="w-full min-w-[680px] text-sm">
@@ -353,7 +423,7 @@ export default function BuddyAiCredits() {
               </tr>
             </thead>
             <tbody>
-              {list.map((a) => {
+              {listF.map((a) => {
                 const expired = a.credits_expire_at != null && a.credits_expire_at <= nowSec;
                 return (
                   <tr key={a.id} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">

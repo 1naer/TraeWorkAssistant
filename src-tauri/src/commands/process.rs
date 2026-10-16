@@ -93,6 +93,9 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
         "Doubao" => vec!["Doubao.exe"],
         // WorkBuddy 桌面版（批次3 会话备份/恢复前置关闭）
         "WorkBuddy" => vec!["WorkBuddy.exe"],
+        // WorkBuddy AI 国际版客户端（buddy-ai 抓包代理注入前置关闭；仅 AI 形态映像，
+        // 不含国内 WorkBuddy.exe——两客户端可并存，注入国际版不得误杀国内实例）
+        "WorkBuddy AI" => vec!["WorkBuddyAI.exe", "WorkBuddy AI.exe"],
         // CodeBuddy 桌面版（安装形态含 CN 后缀，与 trae-switch-bridge.ps1 ProcNames 对齐；
         // 此前缺失导致 Rust 侧 graceful_kill_app 杀不掉 CodeBuddy，与桥行为不一致存竞态）
         "CodeBuddy" => vec!["CodeBuddy.exe", "CodeBuddy CN.exe"],

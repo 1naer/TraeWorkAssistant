@@ -73,6 +73,7 @@ function aggregateTrends(records: WbCheckinRecord[]): TrendPoint[] {
 export default function BuddyOverview() {
   const pushToast = useAppStore((s) => s.pushToast);
   const setView = useAppStore((s) => s.setView);
+  const proxy = useAppStore((s) => s.proxy);
   const isDark = useIsDark();
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
   const [codebuddyEnv, setCodebuddyEnv] = useState<CodeBuddyEnvCheck | null>(null);
@@ -236,7 +237,8 @@ export default function BuddyOverview() {
   const openClient = () => {
     setOpeningClient(true);
     api.env
-      .openWorkbuddyApp()
+      // 代理运行中注入 --proxy-server：客户端流量走本地 MITM 代理（国内 Buddy 域抓包）
+      .openWorkbuddyApp(proxy.running ? proxy.port : undefined)
       .then(() => pushToast('success', '已启动 WorkBuddy'))
       .catch((e) => pushToast('error', `打开客户端失败：${String(e)}`))
       .finally(() => setOpeningClient(false));

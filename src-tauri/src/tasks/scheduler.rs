@@ -74,6 +74,12 @@ const TASKS: &[SchedTask] = &[
     // → completed 后服务端自动入账 30/50 积分（无 claim 端点）；默认 09:20 可改
     //（settings.buddy_ai_checkin_hhmm）；开关独立（buddy_ai_checkin_enabled，默认关）
     SchedTask { key: "buddy-ai-checkin", name: "Buddy 国际版每日活跃打卡", hhmm: "09:20", kind: "fix" },
+    // Buddy 国际版凭证兜底续期（2026-10-16 六页对齐批 3，对齐国内 wb-renew）：
+    // lazy 48h——AT 到期前 48h 内才真正刷新；开关独立（默认开，环境配置页可关）
+    SchedTask { key: "buddy-ai-renew", name: "Buddy 国际版凭证兜底续期", hhmm: "10:35", kind: "fix" },
+    // Buddy 国际版积分数据每日同步（对齐国内看板同步口径）：get-user-resource 全池
+    // 取数 → 池三键回写 + 当日快照落库（趋势曲线数据源）；默认 23:45 错峰
+    SchedTask { key: "buddy-ai-credits-sync", name: "Buddy 国际版积分数据同步", hhmm: "23:45", kind: "fix" },
     // 看板数据同步（原快照任务升级为可配置频率：每日 HH:MM / 每小时 / 关闭）：
     // wb 侧含积分 fresh 拉取+池回写+快照、Token 统计重扫与官方用量刷新；
     // 排到晚間接近日末，差分口径最准；此前无定时写入是近 7 日消耗缺天的根因
@@ -103,6 +109,9 @@ const TASKS: &[SchedTask] = &[
     // 替换 CN 区缓存；开关/时刻独立（settings.qoder_catalog_sync_enabled /
     // qoder_catalog_sync_hhmm，均默认开，环境配置页可改；空池/无凭证静默跳过不计失败）
     SchedTask { key: "qoder-catalog-sync", name: "Qoder 模型目录同步", hhmm: "05:50", kind: "models" },
+    // Buddy 国际版模型目录同步（2026-10-16）：/v3/config 直连拉取（动态目录替换，
+    // 与 API 服务启动挂点互补）；开关/时刻独立（默认开，05:55 错峰）
+    SchedTask { key: "buddy-ai-catalog-sync", name: "Buddy 国际版模型目录同步", hhmm: "05:55", kind: "models" },
 ];
 
 /// 启动调度线程（main.rs setup 调用；启动 90s 后首跑，避开启动高峰）
@@ -338,6 +347,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
         "qoder-checkin" => Some(st.settings().qoder_checkin_hhmm),
         "buddy-ai-checkin" => Some(st.settings().buddy_ai_checkin_hhmm),
+        "buddy-ai-credits-sync" => Some(st.settings().buddy_ai_credits_sync_hhmm),
         "qoder-credits-snapshot" => Some(st.settings().qoder_credits_sync_hhmm),
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
@@ -380,6 +390,9 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
         // Buddy 国际版每日活跃打卡（阶段 3b）：独立开关（默认关，国际档显式开启制）
         "buddy-ai-checkin" => crate::commands::workbuddy::buddy_ai_checkin_enabled(st),
+        // Buddy 国际版凭证兜底续期 / 积分数据同步（2026-10-16，默认开，任务配置页可关）
+        "buddy-ai-renew" => st.settings().buddy_ai_renew_enabled,
+        "buddy-ai-credits-sync" => st.settings().buddy_ai_credits_sync_enabled,
         // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
         // Qoder 会话流水定时合并（环境配置页可关；默认开，每日 04:30）
@@ -390,6 +403,7 @@ fn enabled(st: &AppState, key: &str) -> bool {
         }
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
         "wb-catalog-sync" => st.settings().wb_catalog_sync_enabled,
+        "buddy-ai-catalog-sync" => st.settings().buddy_ai_catalog_sync_enabled,
         "trae-models-sync" => st.settings().trae_models_sync_enabled,
         "qoder-catalog-sync" => st.settings().qoder_catalog_sync_enabled,
         // 其余任务幂等且低风险，恒开（Trae 签到 run_round 自带状态核验）
@@ -596,6 +610,29 @@ fn run_task(
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => super::qoder_catalog::run_task(st),
+        // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试
+        "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(st),
+        // Buddy 国际版积分数据同步（get-user-resource 全池取数 → 池回写 + 快照）：
+        // 空池自然空转；runtime 传网关运行态（运行池三键拨新，issue #109 同类）
+        "buddy-ai-credits-sync" => {
+            crate::commands::workbuddy::buddy_ai_credits_sync_impl(st, runtime).map(|v| {
+                json!({
+                    "ok": true,
+                    "accounts": v.len(),
+                    "fetched": v.iter().filter(|a| a.get("credits_balance").map(|b| !b.is_null()).unwrap_or(false)).count(),
+                })
+            })
+        }
+        // Buddy 国际版模型目录同步（/v3/config 直连 → 动态替换）：空池/无凭证静默跳过
+        "buddy-ai-catalog-sync" => {
+            let pool = crate::commands::workbuddy::buddy_ai_pool_size(st);
+            if pool == 0 {
+                Ok(json!({ "ok": true, "skipped": "无 buddy-ai 账号" }))
+            } else {
+                crate::commands::workbuddy::buddy_ai_catalog_sync_impl(st)
+                    .map(|n| json!({ "ok": true, "models": n }))
+            }
+        }
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
         "doubao-keepalive" => {
             let sink = crate::switcher::CliSink::new(&st.data_dir);

@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, CheckCircle2, Circle, ChevronRight, Coins } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight, Coins, ExternalLink, Loader2 } from 'lucide-react';
 import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
+  LabelList,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -13,13 +15,14 @@ import { Badge, Spinner, StatCard } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { BuddyAiAccountView, ViewKey, WbCheckinRecord, WbModelInfo } from '../../types';
+import { useIsDark } from '../../lib/useIsDark';
+import type { AppLocate, BuddyAiAccountView, ViewKey, WbCheckinRecord, WbModelInfo } from '../../types';
 
 /**
  * BuddyAI · 概述页（六页子导航对齐国内 Buddy「概述」形态）。
  *
  * 顶部统计卡（账号 / 积分 / 打卡调度 / 凭证告警）+ 配置导航（导入账号 → 开启打卡 →
- * 同步积分 → 开启国际档调度）+ 国际档模型目录（§4.4 静态配置）+ 隔离说明。
+ * 同步积分 → 开启国际档调度）+ 国际档模型目录（动态抓取优先/静态兜底）+ 隔离说明。
  * 数据全部复用 buddy_ai_* 独立池命令，与国内 Buddy 概述零数据共享。
  */
 
@@ -37,11 +40,16 @@ export default function BuddyAiOverview() {
   const pushToast = useAppStore((s) => s.pushToast);
   const setView = useAppStore((s) => s.setView);
   const settings = useAppStore((s) => s.settings);
+  const proxy = useAppStore((s) => s.proxy);
+  const isDark = useIsDark();
   const [accounts, setAccounts] = useState<BuddyAiAccountView[]>([]);
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   const [intlEnabled, setIntlEnabled] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [wbLocate, setWbLocate] = useState<AppLocate | null>(null);
+  const [openingClient, setOpeningClient] = useState(false);
+  const [catalogSyncing, setCatalogSyncing] = useState(false);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -70,24 +78,52 @@ export default function BuddyAiOverview() {
 
   useEffect(() => {
     void refresh();
+    api.env.locate('workbuddy_ai').then((r) => setWbLocate(r)).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 打开国际客户端（对齐国内概述「打开客户端」：代理运行中注入 --proxy-server）
+  const openClientAi = () => {
+    setOpeningClient(true);
+    api.env
+      .openWorkbuddyAiApp(proxy.running ? proxy.port : undefined)
+      .then(() => pushToast('success', '已启动 WorkBuddy AI'))
+      .catch((e) => pushToast('error', `打开客户端失败：${String(e)}`))
+      .finally(() => setOpeningClient(false));
+  };
 
   const total = accounts.length;
   const usable = accounts.filter((a) => a.has_credential && !a.needs_relogin).length;
   const withBalance = accounts.filter((a) => a.credits_balance != null);
   const totalBalance = withBalance.reduce((s, a) => s + (a.credits_balance ?? 0), 0);
-  // 凭证告警：需重新登录 / 无凭证 / token 24h 内将过期（含已过期）
+  // 凭证告警：需重新登录 / 无凭证 / token 24h 内将过期（含已过期）+ 积分包 7 日内将过期包数（仍有剩余，镜像国内口径）
   const nowSec = Math.floor(Date.now() / 1000);
   const tokenSoon = accounts.filter(
     (a) => a.has_credential && a.access_token_expires_at != null && a.access_token_expires_at <= nowSec + 86400,
   ).length;
-  const alertCount = accounts.filter((a) => !a.has_credential || a.needs_relogin).length + tokenSoon;
+  const pkgSoon = accounts.reduce(
+    (n, a) =>
+      n +
+      (a.credits_packages ?? []).filter(
+        (p) => p.expire_secs != null && p.expire_secs <= nowSec + 7 * 86400 && p.remain > 0,
+      ).length,
+    0,
+  );
+  const alertCount =
+    accounts.filter((a) => !a.has_credential || a.needs_relogin).length + tokenSoon + pkgSoon;
   const checkinEnabled = settings?.buddy_ai_checkin_enabled === true;
   const creditsFetched = withBalance.length > 0;
 
-  // 配置导航（步骤完成态实时判定）
+  // 配置导航（步骤完成态实时判定；对齐国内第一步「安装客户端」含打开动作）
   const steps: Step[] = [
+    {
+      key: 'client',
+      title: '安装国际客户端',
+      desc: '主客户端 WorkBuddy AI（Programs\\WorkBuddyAI）：打卡 / 积分 / 调度全功能，路径未识别时到「环境配置」处理。',
+      done: !!wbLocate?.exe,
+      actionLabel: wbLocate?.exe ? '打开客户端' : '去配置',
+      view: 'buddyai-settings',
+    },
     {
       key: 'account',
       title: '导入国际账号',
@@ -145,16 +181,16 @@ export default function BuddyAiOverview() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [records]);
 
-  // 积分榜 Top（可用积分降序 Top 5，镜像国内积分榜口径）
+  // 积分榜 Top（按余额降序 Top 10，对齐国内纵向柱图 + 数值标签口径）
   const topCredits = useMemo(
     () =>
       accounts
-        .filter((a) => a.credits_balance != null)
+        .filter((a) => a.credits_balance != null && (a.credits_balance ?? 0) > 0)
         .sort((x, y) => (y.credits_balance ?? 0) - (x.credits_balance ?? 0))
-        .slice(0, 5)
+        .slice(0, 10)
         .map((a) => ({
-          name: (a.nickname || a.id).slice(0, 14),
-          可用积分: Number((a.credits_balance ?? 0).toFixed(2)),
+          name: (a.nickname || a.id).slice(0, 10),
+          credits: Number((a.credits_balance ?? 0).toFixed(2)),
         })),
     [accounts],
   );
@@ -201,7 +237,7 @@ export default function BuddyAiOverview() {
         <StatCard
           label="凭证告警"
           value={alertCount}
-          hint={`需重登/无凭证 ${accounts.filter((a) => !a.has_credential || a.needs_relogin).length} · token 24h 内过期 ${tokenSoon}`}
+          hint={`需重登/无凭证 ${accounts.filter((a) => !a.has_credential || a.needs_relogin).length} · token 24h 内过期 ${tokenSoon} · 积分包 7 日内过期 ${pkgSoon}`}
           tone={alertCount > 0 ? 'red' : 'slate'}
         />
       </div>
@@ -231,23 +267,46 @@ export default function BuddyAiOverview() {
         </div>
       </div>
 
-      {/* 积分榜 Top（可用积分降序，镜像国内积分榜） */}
+      {/* 积分榜 Top 榜（对齐国内：纵向柱图 Top10 + 数值标签 + 前三高亮） */}
       <div className="card mt-5 p-4">
         <div className="mb-3 flex items-center justify-between">
-          <span className="text-sm font-medium">积分榜 Top</span>
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">积分榜 Top 榜</span>
+            {topCredits.length > 0 && (
+              <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                Top {topCredits.length}
+              </span>
+            )}
+          </div>
           <span className="text-[11px] text-slate-400">按可用积分排序</span>
         </div>
         {topCredits.length === 0 ? (
           <p className="py-6 text-center text-xs text-slate-400">暂无积分数据，先到「积分看板」同步。</p>
         ) : (
-          <div className="h-44">
+          <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={topCredits} layout="vertical" margin={{ top: 0, right: 24, bottom: 0, left: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#8884" horizontal={false} />
-                <XAxis type="number" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
-                <YAxis type="category" dataKey="name" width={110} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+              <BarChart data={topCredits} margin={{ top: 16, right: 8, bottom: 0, left: -16 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#8884" vertical={false} />
+                <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={50} tickLine={false} axisLine={false} />
+                <YAxis allowDecimals={false} tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
                 <Tooltip cursor={{ fill: '#8881' }} contentStyle={{ fontSize: 12, borderRadius: 8 }} />
-                <Bar dataKey="可用积分" fill="#10b981" radius={[0, 3, 3, 0]} barSize={18} />
+                <Bar dataKey="credits" name="可用积分" radius={[8, 8, 0, 0]} maxBarSize={44}>
+                  {topCredits.map((_, i) => {
+                    const colors = isDark
+                      ? ['#fafafa', '#e4e4e7', '#d4d4d8']
+                      : ['#27272a', '#3f3f46', '#52525b'];
+                    const fill = i < 3 ? colors[i] : isDark
+                      ? `rgba(212,212,216,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`
+                      : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
+                    return <Cell key={i} fill={fill} />;
+                  })}
+                  <LabelList
+                    dataKey="credits"
+                    position="top"
+                    formatter={(v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0))}
+                    style={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8', fontWeight: 500 }}
+                  />
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -282,7 +341,13 @@ export default function BuddyAiOverview() {
                   已完成
                 </span>
               ) : (
-                <button onClick={() => setView(step.view)} className="btn-outline shrink-0">
+                <button
+                  onClick={() => (step.key === 'client' && wbLocate?.exe ? openClientAi() : setView(step.view))}
+                  className="btn-outline shrink-0"
+                  disabled={step.key === 'client' && openingClient}
+                >
+                  {step.key === 'client' && openingClient ? <Loader2 size={14} className="animate-spin" /> : null}
+                  {step.key === 'client' && wbLocate?.exe ? <ExternalLink size={14} /> : null}
                   {step.actionLabel}
                   <ChevronRight size={14} />
                 </button>
@@ -297,12 +362,29 @@ export default function BuddyAiOverview() {
         )}
       </div>
 
-      {/* 国际档模型目录（§4.4 首版静态配置） */}
+      {/* 国际档模型目录（动态抓取优先 / 静态兜底） */}
       <div className="card mt-5 p-4">
-        <div className="mb-2 flex items-center gap-2">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
           <Coins size={15} className="text-brand-500" />
           <span className="text-sm font-medium">国际档模型目录</span>
-          <span className="text-xs text-slate-400">静态配置（§4.4）· 倍率占位待官网核对回填</span>
+          <span className="text-xs text-slate-400">API 服务启动时直连官网 /v3/config 动态刷新 · 失败回落静态兜底</span>
+          <button
+            className="btn-outline ml-auto inline-flex items-center gap-1 px-2 py-1 text-xs"
+            disabled={catalogSyncing}
+            onClick={() => {
+              setCatalogSyncing(true);
+              api.buddyai
+                .catalogSync()
+                .then((n) => pushToast('success', `Intl 模型目录已同步（${n} 个模型）`))
+                .catch((e) => pushToast('error', `目录同步失败：${String(e).slice(0, 140)}`))
+                .finally(() => {
+                  setCatalogSyncing(false);
+                  void refresh();
+                });
+            }}
+          >
+            <RefreshCw size={12} className={catalogSyncing ? 'animate-spin' : ''} /> 同步目录
+          </button>
         </div>
         {catalog.length === 0 ? (
           <p className="py-2 text-xs text-slate-400">目录未加载</p>

@@ -108,15 +108,17 @@ fn resolve_wb_target(
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    // 审查修复：CN 目录未命中并查 Intl 静态目录（/v1/responses 同 dispatch 源判定，
+    // Intl 目录动态化（2026-10-15）：动态抓取结果优先，缺失回落内置静态表
+    let intl_catalog = wb_catalog::buddy_ai_load(&state.data_dir);
+    // 审查修复：CN 目录未命中并查 Intl 目录（/v1/responses 同 dispatch 源判定，
     // Intl 专属 id 如 deepseek-v4.1-flash 不得 404）；Intl 专属命中跳过 CN 目录降级
     //（降级候选发往 buddy-ai 池上游不存在）
     let intl_only = wb_catalog::find(&catalog, &r.model).is_none()
-        && (wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), &r.model).is_some()
-            || wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), model).is_some());
+        && (wb_catalog::find(&intl_catalog, &r.model).is_some()
+            || wb_catalog::find(&intl_catalog, model).is_some());
     if wb_catalog::find(&catalog, &r.model).is_none()
-        && wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), &r.model).is_none()
-        && wb_catalog::find(wb_catalog::builtin_buddy_ai_cached(), model).is_none()
+        && wb_catalog::find(&intl_catalog, &r.model).is_none()
+        && wb_catalog::find(&intl_catalog, model).is_none()
     {
         return None;
     }

@@ -167,14 +167,14 @@ export const api = {
     locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
-    /** Buddy 双应用：打开 WorkBuddy 桌面客户端（分离启动，不注入代理） */
-    openWorkbuddyApp: () => invoke('open_workbuddy_app'),
-    /** Buddy 双应用：打开 CodeBuddy 桌面客户端（分离启动，不注入代理） */
-    openCodebuddyApp: () => invoke('open_codebuddy_app'),
-    /** BuddyAI 国际客户端：打开 WorkBuddy AI（Programs\WorkBuddyAI，独立探测档案） */
-    openWorkbuddyAiApp: () => invoke('open_workbuddy_ai_app'),
-    /** BuddyAI 国际客户端：打开 CodeBuddy AI（Programs\CodeBuddy） */
-    openCodebuddyAiApp: () => invoke('open_codebuddy_ai_app'),
+    /** Buddy 双应用：打开 WorkBuddy 桌面客户端（代理运行中传端口注入 --proxy-server 抓包） */
+    openWorkbuddyApp: (proxyPort?: number) => invoke('open_workbuddy_app', { proxyPort }),
+    /** Buddy 双应用：打开 CodeBuddy 桌面客户端（代理注入同上） */
+    openCodebuddyApp: (proxyPort?: number) => invoke('open_codebuddy_app', { proxyPort }),
+    /** BuddyAI 国际客户端：打开 WorkBuddy AI（Programs\WorkBuddyAI，独立探测档案；代理运行中传端口注入 --proxy-server 抓包） */
+    openWorkbuddyAiApp: (proxyPort?: number) => invoke('open_workbuddy_ai_app', { proxyPort }),
+    /** BuddyAI 国际客户端：打开 CodeBuddy AI（Programs\CodeBuddy；代理注入同上） */
+    openCodebuddyAiApp: (proxyPort?: number) => invoke('open_codebuddy_ai_app', { proxyPort }),
     /** CodeBuddy 桌面环境检测（exe/进程/auth uid；与 WorkBuddy 共享 auth 文件） */
     codebuddyEnvCheck: () => invoke<CodeBuddyEnvCheck>('codebuddy_env_check'),
   },
@@ -490,6 +490,10 @@ export const api = {
       invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
         includeCredentials: includeCredentials ?? null,
       }),
+    /** 打开 WorkBuddy AI 国际客户端数据目录（%USERPROFILE%\.workbuddy-ai） */
+    openDataDir: () => invoke<void>('buddy_ai_open_data_dir'),
+    /** 手动同步 Intl 模型目录（/v3/config 直连 → 动态替换；返回替换模型数） */
+    catalogSync: () => invoke<number>('buddy_ai_catalog_sync'),
     /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
     creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
   },

@@ -359,42 +359,63 @@ pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Resul
 
 // ── Buddy 双应用（WorkBuddy / CodeBuddy）打开与环境检测 ────────────────────
 
-/// 打开 WorkBuddy 桌面版：复用 app_locate workbuddy 档案四级探测取 exe。
-/// 分离启动（spawn 不等待），不注入代理、不做三级关闭。
-#[tauri::command(async)]
-pub fn open_workbuddy_app(state: State<AppState>) -> Result<(), String> {
-    open_buddy_app(&state, "workbuddy", "WorkBuddy")
-}
-
-/// 打开 CodeBuddy 桌面版：复用 app_locate codebuddy 档案四级探测取 exe。
-/// 分离启动（spawn 不等待），不注入代理、不做三级关闭。
-#[tauri::command(async)]
-pub fn open_codebuddy_app(state: State<AppState>) -> Result<(), String> {
-    open_buddy_app(&state, "codebuddy", "CodeBuddy")
-}
-
 /// 打开 WorkBuddy AI 国际版客户端（buddy-ai 应用顶栏/环境配置，P1 审查修复）：
 /// 走 workbuddy_ai 独立档案探测（Programs\WorkBuddyAI），不再误开国内 WorkBuddy。
+/// 代理运行中传 proxy_port 以 `--proxy-server` 启动（对齐 Trae/豆包同款注入，
+/// workbuddy.ai 流量必走本地 MITM 代理——模型目录 /v3/config 等官网请求可抓）。
 #[tauri::command(async)]
-pub fn open_workbuddy_ai_app(state: State<AppState>) -> Result<(), String> {
-    open_buddy_app(&state, "workbuddy_ai", "WorkBuddy AI")
+pub fn open_workbuddy_ai_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "workbuddy_ai", "WorkBuddy AI", proxy_port, "WorkBuddy AI")
 }
 
 /// 打开 CodeBuddy AI 国际客户端（buddy-ai 应用上下文；探测同 codebuddy 目录）。
 #[tauri::command(async)]
-pub fn open_codebuddy_ai_app(state: State<AppState>) -> Result<(), String> {
-    open_buddy_app(&state, "codebuddy_ai", "CodeBuddy AI")
+pub fn open_codebuddy_ai_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "codebuddy_ai", "CodeBuddy AI", proxy_port, "CodeBuddy")
 }
 
-/// Buddy 双应用打开共用实现（open_doubao_app 的极简版：无代理注入、无进程关闭）
-fn open_buddy_app(state: &State<AppState>, app: &str, display: &str) -> Result<(), String> {
+/// 打开 WorkBuddy 桌面版：复用 app_locate workbuddy 档案四级探测取 exe。
+/// 代理运行中传 proxy_port 以 `--proxy-server` 启动（copilot.tencent.com/codebuddy.cn/
+/// workbuddy.cn 已入解密白名单，客户端侧流量可抓包观察）。
+#[tauri::command(async)]
+pub fn open_workbuddy_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "workbuddy", "WorkBuddy", proxy_port, "WorkBuddy")
+}
+
+/// 打开 CodeBuddy 桌面版：复用 app_locate codebuddy 档案四级探测取 exe。
+/// 代理注入同 open_workbuddy_app。
+#[tauri::command(async)]
+pub fn open_codebuddy_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "codebuddy", "CodeBuddy", proxy_port, "CodeBuddy")
+}
+
+/// Buddy 双应用打开共用实现。CN 双应用（open_workbuddy_app/open_codebuddy_app）
+/// 传 proxy_port=None 走极简路径；国际双应用代理运行中注入 `--proxy-server`
+/// （对齐 open_doubao_app：直开前清理残留系统代理；注入前三级关闭既有进程——
+/// Electron/Chromium 单实例会忽略新启动参数）。
+fn open_buddy_app(
+    state: &State<AppState>,
+    app: &str,
+    display: &str,
+    proxy_port: Option<u16>,
+    kill_kind: &str,
+) -> Result<(), String> {
     let loc = app_locate_inner(state, app);
     let exe = loc
         .exe
         .ok_or_else(|| format!("未检测到 {display} 客户端，请先安装或手动指定路径"))?;
-    Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("启动 {display} 失败: {e}"))?;
+    // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(state);
+    }
+    if proxy_port.is_some() {
+        crate::commands::process::graceful_kill_app(kill_kind)?;
+    }
+    let mut cmd = Command::new(&exe);
+    if let Some(port) = proxy_port {
+        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
+    }
+    cmd.spawn().map_err(|e| format!("启动 {display} 失败: {e}"))?;
     Ok(())
 }
 

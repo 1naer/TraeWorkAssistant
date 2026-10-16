@@ -26,7 +26,7 @@
 
 ### P1 顶栏/环境配置：国际客户端打开修复 ✅ 已完成（本轮）🐛
 - env.rs 新增 `workbuddy_ai` / `codebuddy_ai` 客户端档案（exe 候选含 `Programs\WorkBuddyAI\{WorkBuddyAI,WorkBuddy AI,WorkBuddy}.exe`、`Programs\CodeBuddy\CodeBuddy.exe`）
-- 新命令 `open_workbuddy_ai_app` / `open_codebuddy_ai_app`（复用 open_buddy_app 分离启动）
+- 新命令 `open_workbuddy_ai_app` / `open_codebuddy_ai_app`（复用 open_buddy_app 分离启动；2026-10-15 补代理注入——代理运行中先三级关闭既有实例再以 `--proxy-server` 启动，workbuddy.ai/codebuddy.ai 已入 device_proxy 解密白名单，客户端官网流量可抓包）
 - 前端：BuddyAI 顶栏与「环境配置」页改用新命令；徽标探测 `api.env.locate('workbuddy_ai' / 'codebuddy_ai')`
 
 ### P2 打卡记录落盘 + 概述页对齐 ✅ 已完成
@@ -47,7 +47,7 @@
 
 ### P5 积分看板对齐 ✅ 已完成（七卡口径 + 模型消耗排行；积分趋势快照任务顺延 P8）
 - 统计卡口径对齐国内 7 卡（账号数 / 可用总额 / 平均 / 打卡获得累计 / 今日获得 / 今日消耗 / 7 日内到期按积分包等效为账号到期）
-- 新调度任务「buddy-ai 积分定时快照」（每日 HH:MM，落 buddy_ai_credits_history）→ 积分趋势曲线
+- ~~新调度任务「buddy-ai 积分定时快照」~~ ✅ **已补齐（2026-10-16 对齐批 3）**：独立调度任务 `buddy-ai-credits-sync`（每日 23:45 错峰，settings.buddy_ai_credits_sync_enabled/hhmm 可改，默认开）——复用 buddy_ai_credits_sync_impl（含运行池三键拨新）；手动同步/打卡回写双挂点保留
 - 模型消耗排行（buddy_ai_days 按模型 tokens/积分聚合，近 30 天）
 - Token 统计 / 会话明细 → P8 可选
 
@@ -68,7 +68,7 @@
   打卡回写 / 手动同步双挂点落库；新命令 buddy_ai_credits_history；看板趋势折线图
 - ✅ 账号清单导出：buddy_ai_accounts_export（默认脱敏；附带凭证副本强确认）
 - ⏸ Token 统计 / 会话明细（网关请求流水 buddy-ai 切面）：待网关请求级流水落地后接入
-- ⏸ Intl 官网模型目录动态抓取（替换静态表倍率占位）：待上游公开接口
+- ✅ Intl 官网模型目录动态抓取（2026-10-15）：后端直连 `GET {BILLING_BASE_GLOBAL}/v3/config`（Bearer=池账号 token + REGION_GLOBAL.ua 自带 CLI 段，不依赖客户端/抓包代理）——`wb_catalog::buddy_ai_fetch_and_replace` 落盘 kv `buddy_ai_model_catalog`（与 CN 分键），API 服务启动时 buddy-ai 档启用即拉取（失败保持静态兜底）；dispatch//v1/responses Intl 源判定改走 `buddy_ai_load`（动态优先/静态兜底）；解析为多候选字段宽容式 + 全零质量守门。**首抓核对完成（2026-10-16 CLI `--task-run buddy-ai-catalog-sync` 实抓）**：真实结构为 `{"code":0,"data":{"agents":[{"description":"cli agent","models":["<id>",...]}]}}`——data 信封 + agents 数组（description 识别）+ **models 为纯 id 字符串数组（24 条，含 default/fast/balanced 路由槽位别名），接口不携带倍率/能力字段**；`parse_v3_config` 已按实抓修正（data 信封/数组识别/string 形态）+ `merge_static_fallback` 按 id 从内置静态表回填 display/rate/上下文（未命中 1.0 占位），实抓锚点单测固化。倍率如需真实值仍需官网人工核对或上游未来开放字段（对象形态解析已就位自动命中）。**2026-10-16 补齐**：每日定时同步任务 `buddy-ai-catalog-sync`（05:55，默认开）+ 概述页/资源调度页「同步目录」手动按钮（对齐国内 wb-catalog-sync 形态）；另补凭证兜底续期任务 `buddy-ai-renew`（lazy 48h，对齐国内 wb-renew）与积分每日同步任务 `buddy-ai-credits-sync`（23:45）
 
 ## 验收口径
 - 每阶段：`cargo test` 全绿 + `tsc --noEmit` 零错误 + 逐页与国内截图对照走查
