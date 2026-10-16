@@ -304,6 +304,8 @@ pub async fn do_start(
         qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_pool_sticky_ttl_secs,
         ),
+        // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，api_pool.json，serde default 兼容旧文件）
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(pool_file.qoder_flash_free_rate),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
@@ -943,6 +945,8 @@ fn merge_pool_set(
     qoder_enabled: Option<bool>,
     qoder_hedge_threshold_ms: Option<u64>,
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
@@ -1007,6 +1011,7 @@ fn merge_pool_set(
         qoder_hedge_threshold_ms: qoder_hedge_threshold_ms
             .unwrap_or(existing.qoder_hedge_threshold_ms),
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
+        qoder_flash_free_rate: qoder_flash_free_rate.unwrap_or(existing.qoder_flash_free_rate),
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
@@ -1059,6 +1064,8 @@ pub fn pool_set(
     qoder_hedge_threshold_ms: Option<u64>,
     // Qoder 会话粘性开关（F-80-余 v2）；None = 保留原值
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选；None = 保留原值
@@ -1106,6 +1113,7 @@ pub fn pool_set(
         qoder_enabled,
         qoder_hedge_threshold_ms,
         qoder_sticky_enabled,
+        qoder_flash_free_rate,
         qoder_uids,
         qoder_group_ids,
         qoder_strategy,
@@ -1210,6 +1218,11 @@ pub fn pool_set(
         );
         rt.shared.qoder_sticky_enabled.store(
             pool_file.qoder_sticky_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Qwen3.8-Flash 免费活动倍率覆盖热应用（issue #111）
+        rt.shared.qoder_flash_free_rate.store(
+            pool_file.qoder_flash_free_rate,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -1568,24 +1581,35 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
-        Some(rt) => {
-            let s = &rt.shared;
-            (
-                s.wb_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                s.qoder_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
-                s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                    && s.pool.has_selectable(),
-                s.wb_pool.has_selectable(),
-                s.qoder_pool.has_selectable(),
-            )
-        }
+    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok, qoder_flash_free) =
+        match safe_lock(&runtime).as_ref() {
+            Some(rt) => {
+                let s = &rt.shared;
+                (
+                    s.wb_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    s.qoder_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
+                    s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                        && s.pool.has_selectable(),
+                    s.wb_pool.has_selectable(),
+                    s.qoder_pool.has_selectable(),
+                    // Qwen3.8-Flash 免费活动覆盖（issue #111），与取号/排序同口径
+                    s.qoder_flash_free_rate
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            }
         None => {
             let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
+            (
+                pf.wb_enabled,
+                pf.qoder_enabled,
+                pf.trae_enabled,
+                true,
+                true,
+                pf.qoder_flash_free_rate,
+            )
         }
     };
     let data_dir = state.data_dir.clone();
@@ -1595,6 +1619,7 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        qoder_flash_free,
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -1915,6 +1940,7 @@ mod pool_merge_tests {
             qoder_enabled: true,
             qoder_hedge_threshold_ms: 4000,
             qoder_sticky_enabled: true,
+            qoder_flash_free_rate: true,
             qoder_account_concurrency_limit: 3,
             qoder_pool_sticky_ttl_secs: 900,
             qoder_sticky_ttl_secs: 3600,
@@ -1935,7 +1961,7 @@ mod pool_merge_tests {
             vec!["u2".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -1981,7 +2007,7 @@ mod pool_merge_tests {
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -2089,6 +2115,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -2177,6 +2204,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -2211,6 +2239,7 @@ mod pool_merge_tests {
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -2228,7 +2257,7 @@ mod pool_merge_tests {
             vec!["u1".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

@@ -458,6 +458,8 @@ fn race_qoder_first_byte(
     }
     let state2 = state.clone();
     let tried2 = tried.clone();
+    // issue #111：对冲取号与主路径同口径——免费模型豁免积分维度过滤
+    let free2 = qoder_upstream::entry_is_free(entry);
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let peek2 = peek.clone();
@@ -467,7 +469,7 @@ fn race_qoder_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
         let (picked2, ev) = state2
             .qoder_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), free2)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -661,6 +663,21 @@ fn run_qoder_stream(
         .and_then(Value::as_str)
         .unwrap_or("system")
         .to_string();
+    // issue #111：免费档模型（倍率 0）零消耗，取号豁免积分维度过滤
+    //（零积分/保留阈值/积分过期），账号级状态过滤保持不变。
+    // 免费活动覆盖（资源调度页开关）：在地区专属判定之后应用——
+    // entry_is_global_only 比较原始条目相等性，提前改写会破坏判定
+    let entry = {
+        let mut e = entry;
+        qoder_upstream::apply_flash_free_override(
+            &mut e,
+            state
+                .qoder_flash_free_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        e
+    };
+    let free_model = qoder_upstream::entry_is_free(&entry);
 
     // F-35 子 Key 约束（qoder 池作用域；匿名/无约束 Key 全空 → 走默认调度）
     let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
@@ -683,7 +700,7 @@ fn run_qoder_stream(
                 if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                     return None;
                 }
-                state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                state.qoder_pool.pick_by_uid(&b.uid, free_model).map(|_| b.uid)
             })
     } else {
         None
@@ -704,7 +721,7 @@ fn run_qoder_stream(
     let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
         state
             .qoder_pool
-            .pick_sticky_yield(u, allowed_set.as_ref())
+            .pick_sticky_yield(u, allowed_set.as_ref(), free_model)
             .map(|(p, ev)| {
                 if let Some(ev) = ev {
                     state.logger.log_sched_event(&ev);
@@ -733,7 +750,7 @@ fn run_qoder_stream(
             Some(p) => p,
             None => match state
                 .qoder_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), free_model)
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -748,7 +765,7 @@ fn run_qoder_stream(
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
                     // code 保持 no_healthy_account（客户端兼容）
-                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
@@ -933,6 +950,13 @@ fn run_qoder_stream(
                     // M4：缓存读 tokens 同源宽口径提取，终态旁路记账（0 值不入账）
                     let cached = usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0);
                     let (credits, original_credits) = extract_billing(usage.as_ref());
+                    // issue #111：免费档调度（免费活动覆盖开启或目录价 0）消耗按 0
+                    // 落账——上游 billable=false 实际不扣分，名义值照记会虚增用量
+                    let (credits, original_credits) = if free_model {
+                        (Some(0.0), Some(0.0))
+                    } else {
+                        (credits, original_credits)
+                    };
                     // 审查修复（中等项）：流式记账对齐非流式「每请求一行」口径——
                     // 不再逐尝试记账（原每次尝试记一条，换号重试致 requests/errors
                     // 虚高）；usage 仅在请求终局（成功/就地收尾/冷却终止/Fatal/取号
@@ -1279,6 +1303,19 @@ pub async fn qoder_aggregate_chat(
             .and_then(Value::as_str)
             .unwrap_or("system")
             .to_string();
+        // issue #111：免费档模型（倍率 0）零消耗，取号豁免积分维度过滤，同流式路径。
+        // 免费活动覆盖（资源调度页开关）在地区专属判定之后应用（同流式注释）
+        let entry = {
+            let mut e = entry;
+            qoder_upstream::apply_flash_free_override(
+                &mut e,
+                state
+                    .qoder_flash_free_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            e
+        };
+        let free_model = qoder_upstream::entry_is_free(&entry);
 
         let (allowed_set, dedicated) =
             super::api_keys::constraints_for(&state.data_dir, &key_id)
@@ -1298,7 +1335,7 @@ pub async fn qoder_aggregate_chat(
                     if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                         return None;
                     }
-                    state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                    state.qoder_pool.pick_by_uid(&b.uid, free_model).map(|_| b.uid)
                 })
         } else {
             None
@@ -1313,7 +1350,7 @@ pub async fn qoder_aggregate_chat(
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .qoder_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield(u, allowed_set.as_ref(), free_model)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -1333,6 +1370,7 @@ pub async fn qoder_aggregate_chat(
                     &tried,
                     allowed_set.as_ref(),
                     dedicated.as_deref(),
+                    free_model,
                 ) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
@@ -1356,7 +1394,7 @@ pub async fn qoder_aggregate_chat(
                             &session_ctx(&peek),
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
@@ -1486,6 +1524,12 @@ pub async fn qoder_aggregate_chat(
                                 let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
                                 let (credits, original_credits) =
                                     extract_billing(r.get("usage"));
+                                // issue #111：免费档调度消耗按 0 落账（同流式路径注释）
+                                let (credits, original_credits) = if free_model {
+                                    (Some(0.0), Some(0.0))
+                                } else {
+                                    (credits, original_credits)
+                                };
                                 // M4：缓存读 tokens 旁路记账（成功终局，0 值不入账）
                                 state.record_usage_cached(
                                     super::usage::UsageBucket::Qoder,

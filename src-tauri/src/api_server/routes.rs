@@ -373,7 +373,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
-    let (healthy_total, _) = pool_ref.selectable_stats_in(None);
+    let (healthy_total, _) = pool_ref.selectable_stats_in(None, false);
     let base = format!(
         "no healthy account available (pool={} healthy={healthy_total})",
         pool.as_str(),
@@ -387,7 +387,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     match rk.pool_constraints(pool.as_str()) {
         None => format!("{base} key={name} bind={bind} constraint=none"),
         Some(c) => {
-            let (_, healthy_scope) = pool_ref.selectable_stats_in(c.allowed.as_ref());
+            let (_, healthy_scope) = pool_ref.selectable_stats_in(c.allowed.as_ref(), false);
             let wl = match &c.allowed {
                 None => "none".to_string(),
                 Some(s) => s.len().to_string(),
@@ -611,6 +611,10 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
+    // Qwen3.8-Flash 免费活动覆盖（issue #111）：目录展示与取号/排序同口径
+    let qoder_flash_free = state
+        .qoder_flash_free_rate
+        .load(std::sync::atomic::Ordering::Relaxed);
     let data_dir = state.data_dir.clone();
     // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
     // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
@@ -624,6 +628,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             trae_ok,
             buddy_ok,
             Some((qoder_enabled, qoder_ok)),
+            qoder_flash_free,
         )
     })
     .await
@@ -1379,7 +1384,7 @@ async fn images_entry(
         let tried = HashSet::new();
         state
             .wb_pool
-            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false)
             .map(|(p, ev)| {
                 // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                 if let Some(ev) = ev {
@@ -1523,7 +1528,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     if trae_allowed.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                         return None;
                     }
-                    state.pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                    state.pool.pick_by_uid(&b.uid, false).map(|_| b.uid)
                 })
         } else {
             None
@@ -1534,7 +1539,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .pool
-                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .pick_sticky_yield(u, trae_allowed.as_ref(), false)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -1945,7 +1950,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 所有账号不可用（空完成主导 → 明示渠道指纹拦截语义，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
-        let (healthy_total, _) = state.pool.selectable_stats_in(None);
+        let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (exhaust_msg, exhaust_tag) = exhaust_message(empty_hits, tried.len(), healthy_total);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
@@ -2070,7 +2075,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     if trae_allowed.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                         return None;
                     }
-                    state.pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                    state.pool.pick_by_uid(&b.uid, false).map(|_| b.uid)
                 })
         } else {
             None
@@ -2080,7 +2085,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .pool
-                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .pick_sticky_yield(u, trae_allowed.as_ref(), false)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -2397,7 +2402,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
-        let (healthy_total, _) = state.pool.selectable_stats_in(None);
+        let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (exhaust_msg, exhaust_tag) = exhaust_message(empty_hits, tried.len(), healthy_total);
         let diag = state.pool.diagnose();
         // 用量记账（所有账号不可用）
@@ -2549,7 +2554,7 @@ fn race_trae_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, TraeHedgeLease)> {
         let (picked2, ev) = state2
             .pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), false)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -3070,6 +3075,7 @@ mod tests {
             trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),

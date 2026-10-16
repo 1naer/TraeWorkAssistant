@@ -774,6 +774,13 @@ pub struct ApiPoolFile {
     /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
     #[serde(default = "default_sticky_ttl_secs")]
     pub qoder_sticky_ttl_secs: u64,
+    /// Qwen3.8-Flash 免费活动倍率覆盖（资源调度页模型目录开关，默认开）：
+    /// 开启时该模型目录/兜底倍率按 0 处理——/v1/models 展示 0× + 取号豁免
+    /// 零积分过滤（issue #111：上游免费活动期 billable=false 不扣分，但
+    /// model/list 目录价随低峰折扣漂移 0.1/0.08，不反映免费，需此覆盖）。
+    /// 上游活动结束后关闭即恢复官方同步倍率
+    #[serde(default = "default_true")]
+    pub qoder_flash_free_rate: bool,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -832,6 +839,7 @@ impl Default for ApiPoolFile {
             qoder_account_concurrency_limit: default_account_concurrency_limit(),
             qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
+            qoder_flash_free_rate: true,
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),
             qoder_group_ids: Vec::new(),

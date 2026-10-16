@@ -248,20 +248,23 @@ pub fn unified_models_whitelisted(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, false)
 }
 
 /// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
-/// Qoder 目录（p3-3：HTTP /v1/models 端点传入，管理端/测试传 None）
+/// Qoder 目录（p3-3：HTTP /v1/models 端点传入，管理端/测试传 None）。
+/// `qoder_flash_free`：Qwen3.8-Flash 免费活动覆盖开关（issue #111，与取号/
+/// 排序同口径，旧签名包装传 false 测试零变化）
 pub fn unified_models_whitelisted_ex(
     data_dir: &Path,
     wb_enabled: bool,
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    qoder_flash_free: bool,
 ) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder, qoder_flash_free)
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
         .collect()
@@ -384,17 +387,19 @@ pub fn unified_models(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, false)
 }
 
 /// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
-/// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康
+/// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康。
+/// `qoder_flash_free`：Qwen3.8-Flash 免费活动覆盖（issue #111，旧签名包装传 false）
 pub fn unified_models_ex(
     data_dir: &Path,
     wb_enabled: bool,
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    qoder_flash_free: bool,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
     // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
@@ -606,7 +611,9 @@ pub fn unified_models_ex(
     //（旧签名包装传 None：测试面与既有调用方零变化）。双源/三源同 canonical
     // 条目仅追加来源标记（倍率取 credits 文本解析值）
     if let Some((_qoder_enabled, _qoder_ok)) = qoder {
-        for m in crate::tasks::qoder_upstream::list() {
+        // 免费活动覆盖（issue #111）：与取号/排序同口径，开关开启时
+        // Qwen3.8-Flash 目录倍率展示为 0×
+        for m in crate::tasks::qoder_upstream::list_overridden(qoder_flash_free) {
             let Some(id) = m.get("id").and_then(Value::as_str) else {
                 continue;
             };

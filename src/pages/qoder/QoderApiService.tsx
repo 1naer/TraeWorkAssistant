@@ -38,6 +38,10 @@ export default function QoderApiService() {
   // F-80-余 v2：竞速对冲阈值（0 = 关闭）+ 会话粘性开关（默认关）
   const [qoderHedgeThresholdMs, setQoderHedgeThresholdMs] = useState(8_000);
   const [qoderStickyEnabled, setQoderStickyEnabled] = useState(false);
+  // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 +
+  // 取号豁免零积分过滤；上游活动结束后关闭恢复官方同步倍率
+  const [flashFreeRate, setFlashFreeRate] = useState(true);
+  const [savingFlashFree, setSavingFlashFree] = useState(false);
   // per-pool 调度参数（Qoder 池专属，与 Trae/Buddy 互不共享）：并发 0 = 不限、池粘性 0 = 关
   const [qoderAccountConcurrencyLimit, setQoderAccountConcurrencyLimit] = useState(1);
   const [qoderPoolStickyTtlSecs, setQoderPoolStickyTtlSecs] = useState(300);
@@ -98,6 +102,8 @@ export default function QoderApiService() {
         // F-80-余 v2 参数回显（缺省对齐后端 serde default：对冲 8s / 粘性关）
         setQoderHedgeThresholdMs(pf.qoder_hedge_threshold_ms ?? 8_000);
         setQoderStickyEnabled(pf.qoder_sticky_enabled ?? false);
+        // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，缺省对齐后端 serde default：开）
+        setFlashFreeRate(pf.qoder_flash_free_rate ?? true);
         // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s / 会话粘性 1800s）
         setQoderAccountConcurrencyLimit(pf.qoder_account_concurrency_limit ?? 1);
         setQoderPoolStickyTtlSecs(pf.qoder_pool_sticky_ttl_secs ?? 300);
@@ -191,6 +197,34 @@ export default function QoderApiService() {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  // Qwen3.8-Flash 免费活动倍率覆盖保存（issue #111）：只传本字段，其余 pool_set
+  // 字段 null = 保留原值（uids 回传池快照防清空 Trae 池白名单，同 saveFlags 防护）
+  const saveFlashFree = async () => {
+    if (!pool) {
+      pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
+      return;
+    }
+    setSavingFlashFree(true);
+    try {
+      await withMinDelay(
+        api.apiServer.poolSet(pool.enabled_uids, pool.strategy, pool.group_ids, {
+          qoderFlashFreeRate: flashFreeRate,
+        }),
+        400,
+      );
+      pushToast(
+        'success',
+        flashFreeRate
+          ? '已开启：Qwen3.8-Flash 倍率按 0 处理，零积分账号可参与该模型调度'
+          : '已关闭：Qwen3.8-Flash 恢复官方同步倍率',
+      );
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSavingFlashFree(false);
     }
   };
 
@@ -729,6 +763,32 @@ export default function QoderApiService() {
                 {catSync.enabled
                   ? `应用运行期间每天 ${catSync.hhmm || '05:50'} 自动同步（无账号时静默跳过）`
                   : '已关闭定时同步，仅手动同步'}
+              </span>
+            </div>
+            {/* Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：上游免费活动期
+                usage.billable=false 实际不扣分，但 model/list 目录价随低峰折扣漂移
+               （0.1/0.08）不反映免费——开启时该模型倍率按 0 处理（展示 0× + 零积分
+                账号豁免参与调度），上游活动结束后关闭恢复官方同步倍率 */}
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 p-2.5 text-xs dark:border-zinc-800">
+              <label className="flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={flashFreeRate}
+                  onChange={(e) => setFlashFreeRate(e.target.checked)}
+                />
+                Qwen3.8-Flash 免费（0 倍率）
+              </label>
+              <button
+                className="btn-outline !px-2 !py-1"
+                disabled={savingFlashFree}
+                onClick={() => void saveFlashFree()}
+              >
+                {savingFlashFree ? <Spinner /> : <Save size={13} />} 保存
+              </button>
+              <span className="text-slate-400 dark:text-zinc-500">
+                {flashFreeRate
+                  ? '免费活动期倍率按 0 处理（零积分账号可调度该模型）；活动结束后请关闭'
+                  : '使用官方同步倍率（低峰折扣价，零积分账号不参与该模型调度）'}
               </span>
             </div>
             {models.length === 0 ? (

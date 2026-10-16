@@ -724,6 +724,8 @@ export const api = {
         qoderHedgeThresholdMs?: number;
         /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
         qoderStickyEnabled?: boolean;
+        /** Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；null/未传 = 保留原值 */
+        qoderFlashFreeRate?: boolean;
         /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
         /** Qoder 池分组筛选；null/未传 = 保留原值 */
@@ -766,6 +768,7 @@ export const api = {
         qoderEnabled: wbFlags?.qoderEnabled ?? null,
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
         qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
+        qoderFlashFreeRate: wbFlags?.qoderFlashFreeRate ?? null,
         qoderUids: wbFlags?.qoderUids ?? null,
         qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
         qoderStrategy: wbFlags?.qoderStrategy ?? null,

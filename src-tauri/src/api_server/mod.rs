@@ -79,6 +79,10 @@ pub struct ApiSharedState {
     pub wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// Qoder 池粘性 TTL 秒（per-pool，默认 300）
     pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
+    /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
+    /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
+    pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
@@ -750,6 +754,7 @@ mod inflight_tests {
             trae_pool_sticky_ttl_secs: AtomicU64::new(0),
             wb_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
+            qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),

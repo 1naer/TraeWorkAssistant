@@ -319,7 +319,7 @@ fn race_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
             .wb_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), false)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -524,7 +524,7 @@ fn run_wb_stream(
             }
             state
                 .wb_pool
-                .pick_by_uid(&b.uid)
+                .pick_by_uid(&b.uid, false)
                 .map(|_| (b.uid, b.conv_id))
         });
     let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -538,7 +538,7 @@ fn run_wb_stream(
         .and_then(|(u, _)| {
             state
                 .wb_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield(u, allowed_set.as_ref(), false)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -546,7 +546,7 @@ fn run_wb_stream(
                     p
                 })
         })
-        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
+        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid, false)));
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
@@ -565,7 +565,7 @@ fn run_wb_stream(
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
                 Some((p, ev)) => {
                     // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                     if let Some(ev) = ev {
@@ -579,7 +579,7 @@ fn run_wb_stream(
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
@@ -956,7 +956,7 @@ pub async fn wb_aggregate_chat(
                 }
                 state
                     .wb_pool
-                    .pick_by_uid(&b.uid)
+                    .pick_by_uid(&b.uid, false)
                     .map(|_| (b.uid, b.conv_id))
             });
         let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -969,7 +969,7 @@ pub async fn wb_aggregate_chat(
             .and_then(|(u, _)| {
                 state
                     .wb_pool
-                    .pick_sticky_yield(u, allowed_set.as_ref())
+                    .pick_sticky_yield(u, allowed_set.as_ref(), false)
                     .map(|(p, ev)| {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -977,7 +977,7 @@ pub async fn wb_aggregate_chat(
                         p
                     })
             })
-            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
+            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid, false)));
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
@@ -987,7 +987,7 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -998,7 +998,7 @@ pub async fn wb_aggregate_chat(
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
@@ -1380,7 +1380,7 @@ pub async fn wb_tool_exec_chat(
         'accounts: loop {
             let picked = match state
                 .wb_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false)
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -1692,7 +1692,7 @@ pub async fn wb_tool_exec_chat(
                 );
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
