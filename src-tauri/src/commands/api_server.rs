@@ -435,9 +435,9 @@ pub async fn do_start(
     // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
     // 自动恢复生效。三池口径：
     //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
-    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
-    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
-    //     路径，陈旧快照会一直 fail-open）；
+    //   WB 池：wb_credits_snapshot_task 快照后经 write_back_pool_balances 内部
+    //     runtime 句柄 update_credits_snapshot 三键拨新（issue #109 同类：
+    //     credits/expire/fetched_at，ok=true 账号，失败账号保留旧值）；
     //   Qoder 池（issue #102）：run_snapshot_task 快照后按 ok 行经
     //     update_credits_snapshot 三键拨新（credits/expire_at/fetched_at）——
     //     selectable 零积分与到期过滤均无新鲜度自愈，装配时 Some(0.0)/已过期的
@@ -475,33 +475,28 @@ pub async fn do_start(
                 }
             }
             if wb_stale {
-                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                // 拨新在 wb_credits_snapshot_task 内部经 runtime 完成（ok 行三键拨新，
+                // 对齐下方 Qoder 池口径）
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2, Some(rt_state.inner()))
+                {
                     Ok(parsed) => {
-                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
-                        //（对齐 write_back_pool_balances 的到期回写口径）
-                        let mut m: std::collections::HashMap<String, f64> =
-                            std::collections::HashMap::new();
-                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
-                            for acc in accounts {
-                                let ok = acc
-                                    .get("ok")
-                                    .and_then(serde_json::Value::as_bool)
-                                    .unwrap_or(true);
-                                if !ok {
-                                    continue;
-                                }
-                                if let (Some(uid), Some(bal)) = (
-                                    acc.get("user_id").and_then(|v| v.as_str()),
-                                    acc.get("balance").and_then(|v| v.as_f64()),
-                                ) {
-                                    m.insert(uid.to_string(), bal);
-                                }
-                            }
-                        }
-                        shared.wb_pool.update_credits(&m);
+                        // 计 ok=true 且 balance 可解析（实际拨新）账号，对齐
+                        // write_back_pool_balances 的 snapshot 收集口径（Trae(ok_count)/Qoder(ok 行)）
+                        let n = parsed
+                            .get("accounts")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|x| {
+                                        x.get("ok").and_then(|v| v.as_bool()).unwrap_or(true)
+                                            && x.get("balance").and_then(|v| v.as_f64()).is_some()
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
                         fs_utils::app_log(
                             &st2.data_dir,
-                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", n),
                         );
                     }
                     Err(e) => fs_utils::app_log(
@@ -889,7 +884,7 @@ pub fn reload_pools_if_running(
 /// 网关运行中回写 Trae 池积分快照（issue #67）：refresh_remaining_credits 刷新后
 /// 调用，让 expire_first 等策略基于最新积分选号。此前刷新只写库不回写池，秃号
 /// 内存中 credits>0 永远 selectable、粘性/策略持续命中同一账号。服务未运行时
-/// no-op；仅回写 Trae 池（WB 池积分随 sync_from_wb 走另一数据链，不适用）。
+/// no-op；仅回写 Trae 池（WB 池经 write_back_pool_balances 独立链路运行期拨新）。
 pub fn push_credits_if_running(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
@@ -898,16 +893,30 @@ pub fn push_credits_if_running(
     let Some(rt) = guard.as_ref() else { return };
     let credits_file: RemainingCreditsFile =
         crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
-    // 池积分语义与 apply_pool_snapshot 一致：优先 general 表，回退旧总积分表
-    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+    // 三键拨新（issue #109）：此前只拨余额两键，credits_expire_at 钉死在装配时刻——
+    // 网关启动后新登录/新刷新的账号池内 expire=None，被 expire_first
+    // 「有过期时间者优先」恒压（调度持续命中带旧到期信息的老账号，新会话同样命中）；
+    // 充值续期后的新到期也进不了池，旧值已过期的账号甚至被 selectable 整体排除。
+    // 积分与到期均对齐 apply_pool_snapshot 装配口径：优先 general 表，到期用
+    // merge_pool_expire_times（general 优先、混合口径兜底），池状态与重启后一致
+    let expire_times = merge_pool_expire_times(&credits_file);
+    let pool_snapshot: std::collections::HashMap<String, (f64, Option<i64>)> = credits_file
         .credits
         .iter()
-        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .map(|(uid, c)| {
+            (
+                uid.clone(),
+                (
+                    credits_file.general.get(uid).copied().unwrap_or(*c),
+                    expire_times.get(uid).copied(),
+                ),
+            )
+        })
         .collect();
-    rt.shared.pool.update_credits(&pool_credits);
+    rt.shared.pool.update_credits_snapshot(&pool_snapshot);
     fs_utils::app_log(
         &state.data_dir,
-        &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
+        &format!("API服务池积分回写(运行期): n={}", pool_snapshot.len()),
     );
 }
 

@@ -583,7 +583,8 @@ fn run_task(
         // （看板 Dashboard 唯一消费源 workbuddy_usage_official_all_cache，force 跳过 10min
         // 缓存；原单账号缓存分支前端无调用方，属刷错目标，issue #61 同类缺口一并修复）
         "wb-credits-snapshot" => {
-            let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st)?;
+            // runtime 句柄：网关运行池三键拨新（issue #109 同类，CLI 进程 runtime=None 跳过）
+            let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st, runtime)?;
             // token 统计同步沿用结果级缓存（fresh=false，2026-10-07 性能优化）：
             // 原传 true 会绕过 10 分钟结果缓存，每天（hourly 档）强制一次全量
             // walk+stat；当日数据本就有 10 分钟 TTL 兜底，无需强制重扫。
