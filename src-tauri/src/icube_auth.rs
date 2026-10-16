@@ -98,7 +98,8 @@ pub fn tc_decrypt(b64: &str, private_mode: bool) -> Result<String, String> {
 /// 设备凭证：deviceId（数字串，与 storage.json 键内嵌一致）+ EC P-256 私钥 PEM
 /// + machineId（同 storage.json telemetry.machineId，DeviceInfo 构造用）
 /// + appVersion（安装目录 package.json version，DeviceInfo.ClientVersion 用）
-#[derive(Clone, Debug)]
+/// Serialize/Deserialize 供 per-uid synthetic 身份持久化（kv oauth_synthetic_device:{uid}）
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCredential {
     pub device_id: String,
     pub private_key_pem: String,
@@ -107,6 +108,66 @@ pub struct DeviceCredential {
     /// 来源客户端（恒 Trae CN，双应用合并后唯一客户端），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
+}
+
+/// 宽容解析持久化的凭证 JSON（kv oauth_synthetic_device:{uid} / :pending；
+/// 字段缺失/类型不符/空串返回 None）
+pub fn device_credential_from_json(v: &serde_json::Value) -> Option<DeviceCredential> {
+    let obj = v.as_object()?;
+    let s = |k: &str| -> Option<&str> { obj.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()) };
+    Some(DeviceCredential {
+        device_id: s("device_id")?.to_string(),
+        private_key_pem: s("private_key_pem")?.to_string(),
+        machine_id: s("machine_id")?.to_string(),
+        app_version: obj
+            .get("app_version")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        source_app: obj
+            .get("source_app")
+            .and_then(|x| x.as_str())
+            .unwrap_or("synthetic")
+            .to_string(),
+    })
+}
+
+/// 生成合成设备凭证（本机无 Trae 客户端凭证，或全部真实凭证已绑定账号时的
+/// 登录身份，issue #110）：随机 EC P-256 密钥对 + 15 位数字 deviceId + 32 hex
+/// machineId——与全新安装 IDE 的自生成身份等价（IDE 首启同样本地生成密钥对并经
+/// DeviceInfo.DevicePublicKey 自声明，无预注册 API）。私钥由调用方按 uid 持久化
+///（服务端自有身份，与 token 同信任域；不进日志不落事件）。
+/// 私钥种子走 CSPRNG（random_hex_result→BCryptGenRandom）：不可用上抛 Err，不静默降级
+pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceCredential, String> {
+    use p256::pkcs8::EncodePrivateKey;
+
+    let seed_hex = crate::commands::oauth::random_hex_result(64)?;
+    let mut secret = [0u8; 32];
+    for (i, b) in secret.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&seed_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("合成设备随机种子解码失败: {e}"))?;
+    }
+    let signing = p256::ecdsa::SigningKey::from_bytes(&secret.into())
+        .map_err(|e| format!("合成设备密钥生成失败: {e}"))?;
+    let pem = signing
+        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+        .map_err(|e| format!("合成设备私钥 PEM 编码失败: {e}"))?;
+    // deviceId 形态对齐真实客户端：15 位数字串（与 load_or_create_oauth_device
+    // 原随机逻辑同口径，仅需唯一性非密码学均匀）
+    let device_id: String = (0..15)
+        .map(|_| {
+            let n = (crate::commands::oauth::random_hex(2).chars().next().unwrap_or('0') as u8)
+                .wrapping_rem(10);
+            (b'0' + n) as char
+        })
+        .collect();
+    Ok(DeviceCredential {
+        device_id,
+        private_key_pem: pem.to_string(),
+        machine_id: crate::commands::oauth::random_hex(32),
+        app_version: app_version.to_string(),
+        source_app: "synthetic".to_string(),
+    })
 }
 
 /// 扫描本机 Trae 客户端（双应用合并后唯一客户端）storage.json 提取设备凭证。
@@ -273,5 +334,45 @@ mod tests {
     fn tc_decrypt_rejects_bad_magic() {
         let bad = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
         assert!(tc_decrypt(&bad, false).is_err());
+    }
+
+    /// 合成设备生成：deviceId 15 位数字、私钥可解析、machineId 32 hex
+    #[test]
+    fn generate_synthetic_device_produces_valid_credential() {
+        let cred = generate_synthetic_device_credential("9.9.9-test").unwrap();
+        assert_eq!(cred.device_id.len(), 15);
+        assert!(cred.device_id.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(cred.machine_id.len(), 32);
+        assert!(cred.machine_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(cred.private_key_pem.contains("BEGIN PRIVATE KEY"));
+        // 私钥可被 DeviceProof 签名链路解析（与真实凭证同一消费口径）
+        use p256::pkcs8::DecodePrivateKey;
+        p256::ecdsa::SigningKey::from_pkcs8_pem(&cred.private_key_pem)
+            .expect("合成私钥必须可解析");
+        assert_eq!(cred.source_app, "synthetic");
+    }
+
+    /// 持久化往返：serialize → from_json 还原一致；公钥推导可用（刷新链路前置）
+    #[test]
+    fn synthetic_credential_json_roundtrip() {
+        let cred = generate_synthetic_device_credential("9.9.9-test").unwrap();
+        let json = serde_json::to_value(&cred).unwrap();
+        let parsed = device_credential_from_json(&json).unwrap();
+        assert_eq!(parsed.device_id, cred.device_id);
+        assert_eq!(parsed.private_key_pem, cred.private_key_pem);
+        assert_eq!(parsed.machine_id, cred.machine_id);
+        assert!(device_public_key_pem(&parsed).is_ok());
+    }
+
+    /// 宽容解析：空对象 / 缺关键字段 / 空串字段均返回 None
+    #[test]
+    fn device_credential_from_json_rejects_incomplete() {
+        assert!(device_credential_from_json(&serde_json::json!({})).is_none());
+        assert!(device_credential_from_json(&serde_json::json!({"device_id": "123"})).is_none());
+        assert!(device_credential_from_json(&serde_json::json!(
+            {"device_id": "", "private_key_pem": "x", "machine_id": "m"}
+        ))
+        .is_none());
+        assert!(device_credential_from_json(&serde_json::json!(null)).is_none());
     }
 }

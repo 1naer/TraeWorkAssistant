@@ -666,11 +666,10 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(&state, &user_id);
 
-    // 设备指纹随账号生命周期删除（移植 docker_main PR #101）：清 device_map 条目。
-    // 孤儿条目会污染 load_or_create_oauth_device 的兜底设备基准（取字典序最小条目），
-    // 且重新导入同 uid 账号会静默复用已删账号的旧设备绑定；删除后重新 OAuth 即按
-    // 轮转规则得到全新设备。与 docker_main 口径对齐（main 无 per-account synthetic
-    // 键，仅清 device_map）。
+    // 设备指纹随账号生命周期删除（移植 docker_main PR #101）：清 device_map 条目
+    // 与 per-uid synthetic 身份（issue #110）。孤儿条目会污染 load_or_create_oauth_device
+    // 的兜底设备基准（取字典序最小条目），且重新导入同 uid 账号会静默复用已删账号
+    // 的旧设备绑定；删除后重新 OAuth 即按轮转规则得到全新设备。
     {
         let store = crate::store::db(&state.data_dir);
         // C3（审查）：整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——与签到
@@ -690,6 +689,9 @@ pub fn account_delete(
             }
         }
     }
+    // per-uid synthetic 身份同步删除（失败静默：device_map 条目已删后孤儿键
+    // 永远不会被反查命中，仅占存储）
+    crate::commands::oauth::remove_account_synthetic_device(&state, &user_id);
 
     // 持 group_defs_lock：membership RMW（load→改→save）与并发分组增删/导入
     // 互斥防丢更新；invalidate 在锁 drop 后执行

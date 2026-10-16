@@ -104,7 +104,7 @@ ai-work-assistant/
 | 代理 | `proxy_start(port)` / `proxy_stop()` / `proxy_status()` | ProxyStatus：`running/port/captured/started_at` |
 | 账号 | `accounts_list` → `AccountView[]` | 聚合 JWT / 分组 / 设备 / 积分 / 今日 |
 | 账号 | `account_add_manual(name, jwt, groupId?)` | 解析 JWT → userId 入库 |
-| 账号 | `account_delete(userId, deleteProfile)` | 同时清分组与 `device_map` 设备指纹条目（移植 docker_main PR #101，持 `DEVICE_MAP_LOCK`）；`deleteProfile=true` 删 profiles/<uid> |
+| 账号 | `account_delete(userId, deleteProfile)` | 同时清分组与 `device_map` 设备指纹条目（移植 docker_main PR #101，持 `DEVICE_MAP_LOCK`）及 per-uid synthetic 设备身份 kv `oauth_synthetic_device:{uid}`（issue #110）；`deleteProfile=true` 删 profiles/<uid> |
 | 账号 | `account_update(...)` / `accounts_export_raw()` / `accounts_import(...)` | 编辑账号 / 原始 JSON 导出 / 导入 |
 | 账号 | `account_get_jwt(userId)` | 按需获取完整 JWT——列表接口 `AccountView.jwt` 已掩码下发（前4+****+后4），完整值仅供「查看/复制 JWT」弹窗按需拉取 |
 | 积分 | `fetch_remaining_credits` / `fetch_credit_detail` / `refresh_remaining_credits` | 剩余积分查询 / 明细 / 刷新 |
@@ -332,6 +332,7 @@ ai-work-assistant/
 - **数据目录**：固定 `%APPDATA%\AIWorkAssistant`（state.rs，无环境变量注入；主进程内部模块直接持有 AppState 内存路径）。`--task-run <name>` CLI 任务模式由 schtasks 以 `主exe --task-run <name>` **直调主 exe**（issue #112：release 主 exe 为 GUI 子系统，直调不分配控制台不弹黑框；旧 `cmd /c set` 包裹层已删）。
 - **NDJSON**：`--task-run` 签到任务与 `workbuddy_checkin_start` 事件流输出 `{"type":"start"|"account"|"done",...}` 单行 JSON（wb-checkin-progress 事件）。
 - **稳定设备 ID**：`device_map.json` 缺条目时由 `commands/accounts.rs::derive_device(uid)` 确定性派生（seeded_stream，与原 Python `rand_digits(n, seed=user_id)` 算法兼容，测试 `test_derive_device_matches_python` 锁定）。
+- **OAuth 登录设备混合轮转（issue #76 + #110）**：登录选设备 = 绑定数 0 的本机真实客户端凭证优先（issue #76 轮转）；全部真实凭证已绑定或本机无凭证时，为本次登录会话生成全新 synthetic 设备身份（kv `oauth_synthetic_device:pending` 暂存，oauth_login 成功解析 uid 后转正为 per-uid `oauth_synthetic_device:{uid}`）——多账号全绑同一台设备时服务端签到按 `x-device-id` 每日去重，除首个账号外全部撞「设备当日已签」，每设备 1 账号即根因解。凭证查找 `find_cred_by_device` 三级匹配（pending → 真实凭证 → device_map 反查 uid → per-uid synthetic）供 AuthCode 交换与刷新签 DeviceProof 同源；同 uid 重新 OAuth 即换新设备（覆盖旧键），删除账号同步清理（`account_delete`）。刷新/交换未命中凭证**不再兜底首个凭证**（防设备漂移），走无凭证变体如实报错。
 - **上游代理链（v2.4.3）**：`device_proxy/` 读取 `ProxyConfig.upstream`（由 `proxy_start` 直传），上游认证读 `UPSTREAM_PROXY_USER` / `UPSTREAM_PROXY_PASS`，支持 `http://host:port` 与 `socks5://host:port` 两种形态。**非 Trae 域名**的 CONNECT 隧道（`tunnel_raw`）与明文 HTTP 转发优先经上游出站，上游不可用时回退直连；Trae 域名仍走本地 MITM 解密以捕获 JWT。
 - **动态叶子证书 AKI（2026-09-09）**：`leaf_cert` 签发的叶子证书必须带 Authority Key Identifier（OpenSSL 3.2+/Python 3.13 客户端缺 AKI 即拒：`MISSING_AUTHORITY_KEY_IDENTIFIER`）；AKI 取 CA 的 SKI，无则由 CA 公钥派生。**只补叶子、不改 CA**——CA 已被用户安装信任，改 CA 内容会使其失效（须重装证书）。
 - **工具自身出站请求不走代理**：doubao_session.renew_probe（Rust ureq agent 禁用代理）/ doubao_quota.query_account 显式绕过系统代理直连——巡检无需 MITM，且系统代理开启时会撞上动态证书兼容性问题（本轮 SSL 报错根因）。
