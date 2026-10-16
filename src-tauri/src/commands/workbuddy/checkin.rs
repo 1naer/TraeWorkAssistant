@@ -158,20 +158,16 @@ pub fn workbuddy_checkin_results(state: State<AppState>, days: Option<i64>) -> R
 }
 
 /// 每日签到定时任务（F-16 双时段：每个时间一个任务，后缀 _HHMM）
-const WB_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_WorkBuddyCheckin";
-const WB_RENEW_TASK_NAME: &str = "AIWorkAssistant_WorkBuddyRenew";
+pub(crate) const WB_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_WorkBuddyCheckin";
+pub(crate) const WB_RENEW_TASK_NAME: &str = "AIWorkAssistant_WorkBuddyRenew";
 
-/// 构造 WorkBuddy 计划任务 /TR：主 exe 直调 CLI 任务模式（--task-run，见 tasks::run_cli_task），
-/// 不再依赖 python 运行时；schtasks 不继承进程环境变量，cmd /c 内显式 set AIWORKDATA_DIR。
-fn build_wb_task_tr(state: &AppState, task: &str) -> Result<String, String> {
+/// 构造 WorkBuddy 计划任务 /TR：主 exe 直调 CLI 任务模式（--task-run，见 tasks::run_cli_task）。
+/// issue #112：release 主 exe 为 GUI 子系统，直调不分配控制台 → 触发不弹黑框；
+/// 旧 `cmd /c set AIWORKDATA_DIR=…` 包裹已删（该变量全仓只写不读，且 cmd.exe
+/// 正是黑框根源）。与 misc::build_task_tr 同款形态。
+fn build_wb_task_tr(task: &str) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-    let data_dir = state.data_dir.to_string_lossy().to_string();
-    Ok(format!(
-        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" --task-run {}",
-        data_dir,
-        exe.to_string_lossy(),
-        task
-    ))
+    Ok(format!("\"{}\" --task-run {task}", exe.to_string_lossy()))
 }
 
 fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
@@ -182,39 +178,10 @@ fn task_exists(name: &str) -> bool {
     run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"]).map(|(ok, _, _)| ok).unwrap_or(false)
 }
 
-/// 枚举当前用户可见的计划任务名（审查 P2）：`schtasks /Query /FO CSV /NH`。
-/// 注意：CSV 列序**不跨机固定**——部分系统为 HostName,TaskName,…（TaskName 第 2 列），
-/// 部分系统仅 TaskName,NextRunTime,Status（TaskName 第 1 列，实测 2026-09-24 Win11）。
-/// 不按固定下标取列，改为扫描各行字段：TaskName 字段带引号且以 `\` 开头
-/// （根目录任务形如 `\AIWorkAssistant_WorkBuddyCheckin_0900`），取末段 `\` 之后为任务名；
-/// 本仓任务名不含逗号，按逗号切分安全。
-fn list_task_names() -> Vec<String> {
-    let Ok((_, stdout, _)) = run_schtasks(&["/Query", "/FO", "CSV", "/NH"]) else {
-        return vec![];
-    };
-    parse_task_names_from_csv(&stdout)
-}
-
-/// 从 schtasks CSV 输出提取任务名（纯函数，便于单测覆盖两种列序）。
-fn parse_task_names_from_csv(stdout: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        for field in line.split(',') {
-            let f = field.trim().trim_matches('"');
-            let Some(name) = f.strip_prefix('\\') else { continue };
-            let name = name.rsplit('\\').next().unwrap_or(name);
-            if !name.is_empty() {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
-}
-
 /// 按任务名前缀枚举本功能全部签到任务（兼容任意 _HHMM 后缀，不再硬编码 _0900/_2100/_1200）
 fn wb_checkin_task_names() -> Vec<String> {
     let prefix = format!("{WB_CHECKIN_TASK_PREFIX}_");
-    list_task_names()
+    crate::commands::misc::list_task_names()
         .into_iter()
         .filter(|n| n.starts_with(&prefix))
         .collect()
@@ -229,7 +196,7 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
     for t in &times {
         crate::commands::misc::validate_hhmm(t)?;
     }
-    let tr = build_wb_task_tr(&state, "wb-checkin")?;
+    let tr = build_wb_task_tr("wb-checkin")?;
     // 先清理旧实例（按任务名前缀枚举，兼容历史任意 HHMM 后缀），保证重注册幂等
     for name in wb_checkin_task_names() {
         let _ = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
@@ -289,7 +256,7 @@ pub fn workbuddy_renew_task_register(state: State<AppState>, day: String, time: 
     let t = time.trim();
     let t = if t.is_empty() { "10:30" } else { t };
     crate::commands::misc::validate_hhmm(t)?;
-    let tr = build_wb_task_tr(&state, "wb-renew")?;
+    let tr = build_wb_task_tr("wb-renew")?;
     let (ok, _, stderr) = run_schtasks(&[
         "/Create", "/TN", WB_RENEW_TASK_NAME, "/TR", &tr, "/SC", "WEEKLY", "/D", &d, "/ST", t, "/F",
     ])?;
@@ -438,7 +405,7 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_task_names_from_csv;
+    use crate::commands::misc::parse_task_names_from_csv;
 
     #[test]
     fn csv_解析_三列无主机名_本机实测列序() {

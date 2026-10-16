@@ -329,7 +329,7 @@ ai-work-assistant/
 
 ## 9. Rust 后台任务与代理约定
 
-- **数据目录**：`AIWORKDATA_DIR` 环境变量决定数据根目录；主进程内部模块直接持有 AppState 内存路径。`--task-run <name>` CLI 任务模式由 schtasks 以 `cmd /c set AIWORKDATA_DIR=... && 主exe --task-run <name>` 注入（state.rs 亦有缺省回退）。
+- **数据目录**：固定 `%APPDATA%\AIWorkAssistant`（state.rs，无环境变量注入；主进程内部模块直接持有 AppState 内存路径）。`--task-run <name>` CLI 任务模式由 schtasks 以 `主exe --task-run <name>` **直调主 exe**（issue #112：release 主 exe 为 GUI 子系统，直调不分配控制台不弹黑框；旧 `cmd /c set` 包裹层已删）。
 - **NDJSON**：`--task-run` 签到任务与 `workbuddy_checkin_start` 事件流输出 `{"type":"start"|"account"|"done",...}` 单行 JSON（wb-checkin-progress 事件）。
 - **稳定设备 ID**：`device_map.json` 缺条目时由 `commands/accounts.rs::derive_device(uid)` 确定性派生（seeded_stream，与原 Python `rand_digits(n, seed=user_id)` 算法兼容，测试 `test_derive_device_matches_python` 锁定）。
 - **上游代理链（v2.4.3）**：`device_proxy/` 读取 `ProxyConfig.upstream`（由 `proxy_start` 直传），上游认证读 `UPSTREAM_PROXY_USER` / `UPSTREAM_PROXY_PASS`，支持 `http://host:port` 与 `socks5://host:port` 两种形态。**非 Trae 域名**的 CONNECT 隧道（`tunnel_raw`）与明文 HTTP 转发优先经上游出站，上游不可用时回退直连；Trae 域名仍走本地 MITM 解密以捕获 JWT。

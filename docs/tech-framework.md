@@ -151,7 +151,7 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 
 ### 5.2 `device_proxy/`（MITM 代理模块）
 
-- 配置：`AIWORKDATA_DIR` 决定数据根目录；端口经 `proxy_start(port)` 直传（默认 8899）；上游代理经 `ProxyConfig.upstream` 直传（http/socks5，含认证字段）；`AUTO_CAPTURE_JWT=1` 语义由模块内常量承接。
+- 配置：数据根目录固定 `%APPDATA%\AIWorkAssistant`（state.rs，无环境变量注入）；端口经 `proxy_start(port)` 直传（默认 8899）；上游代理经 `ProxyConfig.upstream` 直传（http/socks5，含认证字段）；`AUTO_CAPTURE_JWT=1` 语义由模块内常量承接。
 - MITM 捕获 `trae.cn`/`trae.com.cn` 带 `Cloud-IDE-JWT` 的请求写回账号库（exp 防降级）；`mchost.guru` 解密记录对话摘要；WebSocket 隧道转发不记录内容。
 - 结构化日志 `logs/proxy_req_YYYY-MM-DD.log` 供 `proxy_logs_list/detail` 查询。
 - 同时承担豆包凭证抓包（doubao.com Cookie sessionid/sid_guard/ttwid 落盘供回写）。

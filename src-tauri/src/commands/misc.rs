@@ -1033,39 +1033,22 @@ pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), Stri
     Ok((out.status.success(), stdout, stderr))
 }
 
-/// 把计划任务的长命令写入数据目录的 .cmd 启动器，返回启动器路径。
-/// 公共实现（自 doubao.rs 提升，签到任务与豆包续期/额度任务共用）：
-/// 背景（实测 2026-09-09）：schtasks /TR 参数上限 **261 字符**，dev 构建的
-/// python/脚本绝对路径拼出的命令达 273 字符 → schtasks 报参数错误，注册失败，
-/// 而错误 toast 仅显示 4 秒，被用户感知为「点击注册没有反应」。改用启动器后
-/// /TR 只需 ~74 字符。
-pub(crate) fn write_task_launcher(
-    state: &AppState,
-    name: &str,
-    body: String,
-) -> Result<String, String> {
-    let path = state.data_dir.join(format!("task_{name}.cmd"));
-    std::fs::write(&path, format!("@echo off\r\n{body}\r\n"))
-        .map_err(|e| format!("写入任务启动器脚本失败: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
-}
-
 /// 构造每日签到计划任务的 /TR：主 exe 直调 CLI 任务模式（--task-run checkin，
-/// 见 tasks::run_cli_task），不再依赖 python 运行时；schtasks 不继承进程环境变量，
-/// cmd /c 内显式 set AIWORKDATA_DIR（与 WorkBuddy 任务注册同款模式）。
-fn build_task_tr(state: &AppState) -> Result<String, String> {
+/// 见 tasks::run_cli_task）。
+/// issue #112：release 主 exe 为 GUI 子系统（main.rs `windows_subsystem = "windows"`），
+/// Task Scheduler 直调不分配控制台 → 触发时不再弹黑框。旧 `cmd /c set
+/// AIWORKDATA_DIR=… &&` 包裹层已删除：该环境变量全仓只写不读（state.rs 固定
+/// %APPDATA%\AIWorkAssistant），而 cmd.exe 是控制台程序，正是黑框的根源；
+/// 当年引入 .cmd 启动器的 /TR 261 字符上限问题也随 python 运行时移除而消失
+/// （本形态 ~74 字符）。
+fn build_task_tr() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-    let data_dir = state.data_dir.to_string_lossy().to_string();
-    Ok(format!(
-        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" --task-run checkin",
-        data_dir,
-        exe.to_string_lossy()
-    ))
+    Ok(format!("\"{}\" --task-run checkin", exe.to_string_lossy()))
 }
 
 /// 注册每日签到任务（新任务名），供命令与旧任务迁移共用
-fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
-    let tr = build_task_tr(state)?;
+fn register_daily_task(time: &str) -> Result<(), String> {
+    let tr = build_task_tr()?;
     let (ok, _stdout, stderr) = run_schtasks(&[
         "/Create",
         "/TN",
@@ -1094,9 +1077,8 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
                  解决方法（任选其一）：\n\
                  1. 右键 AI Work 助手 →「以管理员身份运行」后重新点击「注册任务」\n\
                  2. 打开「管理员命令提示符」手动执行：\n\
-                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set \\\"AIWORKDATA_DIR={}\\\" && \\\"{}\\\" --task-run checkin\" /SC DAILY /ST {time} /F\n\
+                    schtasks /Create /TN {TASK_NAME} /TR \"\\\"{}\\\" --task-run checkin\" /SC DAILY /ST {time} /F\n\
                  3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",
-                state.data_dir.to_string_lossy(),
                 exe
             ));
         }
@@ -1107,9 +1089,9 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
 
 // 计划任务命令含 schtasks 子进程调用（可达数秒），标记 async 派发到线程池执行，避免阻塞 UI
 #[tauri::command(async)]
-pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
+pub fn task_register(time: String) -> Result<(), String> {
     validate_hhmm(&time)?;
-    register_daily_task(&state, &time)?;
+    register_daily_task(&time)?;
     // 注册成功后清理旧版计划任务（品牌迁移），失败不影响本次注册
     let _ = run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]);
     Ok(())
@@ -1125,55 +1107,16 @@ fn task_exists(name: &str) -> bool {
 }
 
 /// 导出计划任务 XML 并解析每日触发时间（HH:MM）。
-/// schtasks /XML 输出为 UTF-16LE（带 BOM），需按 UTF-16 解码；解析失败返回 None。
+/// schtasks /XML 输出为 UTF-16LE（带 BOM），解码见 query_task_xml；解析失败返回 None。
 fn legacy_task_start_time(name: &str) -> Option<String> {
-    let out = Command::new("cmd")
-        .args([
-            "/c",
-            "chcp",
-            "65001",
-            ">nul",
-            "&&",
-            "schtasks",
-            "/Query",
-            "/TN",
-            name,
-            "/XML",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let xml = if out.stdout.starts_with(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = out.stdout[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
-    let start = xml
-        .split("<StartBoundary>")
-        .nth(1)?
-        .split("</StartBoundary>")
-        .next()?;
-    // 形如 2026-09-07T09:30:00 → 取 T 后的 HH:MM
-    let time = start.split('T').nth(1)?;
-    let hh_mm = time.get(0..5)?;
-    let ok = hh_mm.len() == 5
-        && hh_mm.as_bytes()[2] == b':'
-        && hh_mm.chars().all(|c| c.is_ascii_digit() || c == ':');
-    if ok { Some(hh_mm.to_string()) } else { None }
+    xml_start_hhmm(&query_task_xml(name)?)
 }
 
 /// 旧版计划任务自动迁移（品牌迁移，**并存语义**）：
 /// 检测到 TraeWorkAssistant_DailyCheckin（指向旧 exe/旧数据目录）时，
 /// 按其原触发时间重建 AIWorkAssistant_DailyCheckin；**旧任务始终保留**，
 /// 供老应用继续使用（两版并存，各自独立签到）。任何一步失败都静默跳过。
-pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
+pub fn try_migrate_legacy_task() -> Option<String> {
     let legacy = task_exists(LEGACY_TASK_NAME);
     if !legacy {
         return None;
@@ -1193,7 +1136,7 @@ pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
             )
         }
     };
-    match register_daily_task(state, &time) {
+    match register_daily_task(&time) {
         Ok(()) => Some(format!(
             "任务迁移：已按旧任务触发时间创建新任务 {TASK_NAME}（每日 {time}）；旧任务保留供老应用继续使用"
         )),
@@ -1204,7 +1147,7 @@ pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
 }
 
 #[tauri::command(async)]
-pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, String> {
+pub fn task_status(_app: AppHandle) -> Result<String, String> {
     let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
     if !ok {
         let detail = if !stderr.trim().is_empty() {
@@ -1220,7 +1163,7 @@ pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, St
             || detail.contains("系统找不到")
         {
             // 尝试顺带迁移旧任务；迁移成功则再次查询
-            if try_migrate_legacy_task(&state).is_some() && task_exists(TASK_NAME) {
+            if try_migrate_legacy_task().is_some() && task_exists(TASK_NAME) {
                 let (ok2, stdout2, _e2) =
                     run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
                 if ok2 {
@@ -1262,6 +1205,240 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
         return Err(last_detail);
     }
     Ok(())
+}
+
+// ── 旧形态 /TR 迁移（issue #112：cmd 包裹触发弹黑框）─────────────────────────
+
+/// 从 schtasks CSV 输出提取任务名（纯函数，便于单测覆盖两种列序）。
+/// 注意：CSV 列序**不跨机固定**——部分系统为 HostName,TaskName,…（TaskName 第 2 列），
+/// 部分系统仅 TaskName,NextRunTime,Status（TaskName 第 1 列，实测 2026-09-24 Win11）。
+/// 不按固定下标取列，改为扫描各行字段：TaskName 字段带引号且以 `\` 开头
+/// （根目录任务形如 `\AIWorkAssistant_WorkBuddyCheckin_0900`），取末段 `\` 之后为任务名；
+/// 本仓任务名不含逗号，按逗号切分安全。
+pub(crate) fn parse_task_names_from_csv(stdout: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        for field in line.split(',') {
+            let f = field.trim().trim_matches('"');
+            let Some(name) = f.strip_prefix('\\') else { continue };
+            let name = name.rsplit('\\').next().unwrap_or(name);
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 枚举当前用户可见的计划任务名（`schtasks /Query /FO CSV /NH`，失败返回空表）
+pub(crate) fn list_task_names() -> Vec<String> {
+    let Ok((_, stdout, _)) = run_schtasks(&["/Query", "/FO", "CSV", "/NH"]) else {
+        return vec![];
+    };
+    parse_task_names_from_csv(&stdout)
+}
+
+/// 查询计划任务定义 XML（schtasks /Query /TN <name> /XML）。
+/// 输出为 UTF-16LE（带 BOM），需按 UTF-16 解码；失败返回 None。
+fn query_task_xml(name: &str) -> Option<String> {
+    let out = Command::new("cmd")
+        .args(["/c", "chcp", "65001", ">nul", "&&", "schtasks", "/Query", "/TN", name, "/XML"])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    if out.stdout.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = out.stdout[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units))
+    } else {
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+
+/// XML 取首个标签文本（简单平铺匹配，本仓任务 XML 均无嵌套同名标签）
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    xml.split(&format!("<{tag}>"))
+        .nth(1)?
+        .split(&format!("</{tag}>"))
+        .next()
+        .map(str::to_string)
+}
+
+/// 从任务 XML 提取 StartBoundary 的 HH:MM（形如 2026-09-07T09:30:00）。
+/// 严格 HH:MM 数字校验（畸形串交由 schtasks /Create 兜底拒绝）
+fn xml_start_hhmm(xml: &str) -> Option<String> {
+    let time = xml_tag_text(xml, "StartBoundary")?;
+    let time = time.split('T').nth(1)?;
+    let hh_mm = time.get(0..5)?;
+    let ok = hh_mm.len() == 5
+        && hh_mm.as_bytes()[2] == b':'
+        && hh_mm.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        && hh_mm.as_bytes()[3..].iter().all(u8::is_ascii_digit);
+    ok.then(|| hh_mm.to_string())
+}
+
+/// 触发计划：每日 / 每周（星期列表，schtasks /D 取值 MON..SUN）
+#[derive(Debug, PartialEq, Eq)]
+enum TaskSchedule {
+    Daily,
+    Weekly(Vec<String>),
+}
+
+/// 从任务 XML 解析触发计划：ScheduleByDay → Daily；ScheduleByWeek → Weekly(days)。
+/// WeeksInterval > 1 的双周计划无法用 /SC WEEKLY 无损重建，返回 None（跳过迁移）。
+fn parse_task_schedule(xml: &str) -> Option<TaskSchedule> {
+    if xml.contains("<ScheduleByDay>") {
+        return Some(TaskSchedule::Daily);
+    }
+    let week = xml.split("<ScheduleByWeek>").nth(1)?.split("</ScheduleByWeek>").next()?;
+    if let Some(interval) = xml_tag_text(week, "WeeksInterval") {
+        if interval.trim() != "1" {
+            return None;
+        }
+    }
+    const DAYS: [(&str, &str); 7] = [
+        ("Monday", "MON"), ("Tuesday", "TUE"), ("Wednesday", "WED"), ("Thursday", "THU"),
+        ("Friday", "FRI"), ("Saturday", "SAT"), ("Sunday", "SUN"),
+    ];
+    // 真实 schtasks XML 自闭合标签为 `<Sunday />`（斜杠前带空格，2026-10-16 实测
+    // Win11），归一化空白后匹配，同时兼容 `<Sunday/>` 紧凑形态
+    let week_norm = week.replace(' ', "");
+    let days: Vec<String> = DAYS
+        .iter()
+        .filter(|(tag, _)| week_norm.contains(&format!("<{tag}/>")))
+        .map(|(_, v)| v.to_string())
+        .collect();
+    (!days.is_empty()).then_some(TaskSchedule::Weekly(days))
+}
+
+/// 任务 Command 是否为旧形态：`cmd /c …` 包裹（Command=cmd / cmd.exe）或 .cmd 启动器脚本
+fn is_legacy_tr_command(command: &str) -> bool {
+    let c = command.trim().trim_matches('"');
+    let lower = c.to_ascii_lowercase();
+    lower == "cmd" || lower == "cmd.exe" || lower.ends_with(".cmd")
+}
+
+/// 任务名 → CLI 任务参数（--task-run <arg>）；非本仓任务返回 None
+fn task_cli_arg(name: &str) -> Option<&'static str> {
+    match name {
+        TASK_NAME => Some("checkin"),
+        DOUBAO_TASK_NAME => Some("doubao-keepalive"),
+        DOUBAO_QUOTA_TASK_NAME => Some("doubao-quota"),
+        crate::commands::workbuddy::checkin::WB_RENEW_TASK_NAME => Some("wb-renew"),
+        n if n.starts_with(crate::commands::workbuddy::checkin::WB_CHECKIN_TASK_PREFIX) => {
+            Some("wb-checkin")
+        }
+        n if n.starts_with(crate::commands::qoder::checkin::QODER_CHECKIN_TASK_PREFIX) => {
+            Some("qoder-checkin")
+        }
+        _ => None,
+    }
+}
+
+/// 计划任务 /TR 现代化迁移（issue #112）：历史版本注册的 /TR 为
+/// `cmd /c set AIWORKDATA_DIR=… && 主exe --task-run <name>`（豆包为 .cmd 启动器脚本），
+/// cmd.exe 是控制台程序，Task Scheduler 交互会话触发时必弹黑框。检测到旧形态任务时，
+/// 按其原触发计划（每日 / 每周+星期+时刻，解析自任务 XML）重建为 GUI 子系统 exe 直调
+/// （release 主程序 windows_subsystem="windows"，无控制台窗口）。
+/// 幂等：仅迁移 Command 为旧形态的任务，迁移后再次运行自动跳过；
+/// 任一任务迁移失败则不落一次性完成标记，下次启动重试。
+/// main.rs 启动期后台线程调用（CSV 枚举 + 逐任务 XML 查询可达数秒，不阻塞启动）。
+pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<String> {
+    // 一次性完成标记：全量迁移成功后置位，跳过后续启动的枚举扫描
+    let done: serde_json::Value =
+        crate::store::db(data_dir).kv_get("schtasks_direct_tr_migrated");
+    if done.as_bool() == Some(true) {
+        return None;
+    }
+    let prefix_wb = format!("{}_", crate::commands::workbuddy::checkin::WB_CHECKIN_TASK_PREFIX);
+    let prefix_qoder = format!("{}_", crate::commands::qoder::checkin::QODER_CHECKIN_TASK_PREFIX);
+    let targets: Vec<String> = list_task_names()
+        .into_iter()
+        .filter(|n| {
+            n == TASK_NAME
+                || n == DOUBAO_TASK_NAME
+                || n == DOUBAO_QUOTA_TASK_NAME
+                || n == crate::commands::workbuddy::checkin::WB_RENEW_TASK_NAME
+                || n.starts_with(&prefix_wb)
+                || n.starts_with(&prefix_qoder)
+        })
+        .collect();
+    let exe = std::env::current_exe().ok()?;
+    let mut migrated = 0usize;
+    let mut failed = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+    for name in targets {
+        let Some(arg) = task_cli_arg(&name) else { continue };
+        let Some(xml) = query_task_xml(&name) else {
+            // 计入 failed：进摘要落日志留痕，且不置完成标记 → 下次启动重试
+            failed += 1;
+            notes.push(format!("任务迁移失败 {name}：查询任务定义失败"));
+            continue;
+        };
+        let Some(command) = xml_tag_text(&xml, "Command") else { continue };
+        if !is_legacy_tr_command(&command) {
+            continue; // 已是直调形态（新版本注册），幂等跳过
+        }
+        let (Some(hhmm), Some(schedule)) = (xml_start_hhmm(&xml), parse_task_schedule(&xml)) else {
+            failed += 1;
+            notes.push(format!("任务迁移跳过 {name}：无法解析触发计划（保留旧任务继续工作）"));
+            continue;
+        };
+        let tr = format!("\"{}\" --task-run {arg}", exe.to_string_lossy());
+        let mut args: Vec<&str> =
+            vec!["/Create", "/TN", name.as_str(), "/TR", tr.as_str()];
+        let days;
+        match &schedule {
+            TaskSchedule::Daily => args.extend(["/SC", "DAILY"]),
+            TaskSchedule::Weekly(d) => {
+                days = d.join(",");
+                args.extend(["/SC", "WEEKLY", "/D", days.as_str()]);
+            }
+        }
+        args.extend(["/ST", hhmm.as_str(), "/F"]);
+        let when = match &schedule {
+            TaskSchedule::Daily => format!("每日 {hhmm}"),
+            TaskSchedule::Weekly(d) => format!("每周{} {hhmm}", d.join("/")),
+        };
+        match run_schtasks(&args) {
+            Ok((true, _, _)) => {
+                migrated += 1;
+                notes.push(format!("任务迁移完成 {name} → 主 exe 直调（{when}），不再弹黑框"));
+            }
+            Ok((false, _, stderr)) => {
+                failed += 1;
+                notes.push(format!("任务迁移失败 {name}：{}", stderr.trim()));
+            }
+            Err(e) => {
+                failed += 1;
+                notes.push(format!("任务迁移失败 {name}：{e}"));
+            }
+        }
+    }
+    if migrated == 0 && failed == 0 {
+        // 无旧形态任务，无事可做（下轮启动再扫：CSV 枚举 + 存在目标任务时
+        // 的逐任务 XML 查询；全部迁移成功置位标记后不再进入本路径）
+        return None;
+    }
+    if failed == 0 {
+        // 全部成功：清掉豆包遗留 .cmd 启动器（其 schtasks 条目已改为直调），
+        // 置一次性完成标记；标记落库失败仅影响下次启动多扫一轮，不重试
+        for f in ["task_doubao_renew.cmd", "task_doubao_quota.cmd"] {
+            let _ = std::fs::remove_file(data_dir.join(f));
+        }
+        let _ = crate::store::db(data_dir)
+            .kv_set("schtasks_direct_tr_migrated", &serde_json::json!(true));
+    }
+    let summary = format!(
+        "[计划任务迁移] issue #112 旧形态 /TR 重建：{migrated} 成功 / {failed} 失败：{}",
+        notes.join("；")
+    );
+    Some(summary)
 }
 
 #[cfg(test)]
@@ -1611,5 +1788,169 @@ mod tests {
         assert!(proxy_log_shard_key("proxy_req_2026-10-02.log.0").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- 计划任务 /TR 直调化（issue #112）----------------
+
+    /// /TR 新形态：引号包 exe + --task-run，不含 cmd 包裹与环境变量注入
+    #[test]
+    fn build_task_tr_direct_exe_form() {
+        let tr = build_task_tr().unwrap();
+        assert!(tr.starts_with('"'), "应以引号包 exe 开头: {tr}");
+        assert!(tr.ends_with("\" --task-run checkin"), "实际: {tr}");
+        assert!(!tr.contains("cmd /c"), "不得含 cmd 包裹: {tr}");
+        assert!(!tr.contains("AIWORKDATA_DIR"), "不得含死代码环境变量: {tr}");
+    }
+
+    const LEGACY_CMD_WRAPPED_TASK_XML: &str = r#"<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-07T09:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd</Command>
+      <Arguments>/c set "AIWORKDATA_DIR=C:\Users\u\AppData\Roaming\AIWorkAssistant" &amp;&amp; "C:\Program Files\AIWorkAssistant\AI Work Assistant.exe" --task-run checkin</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    const LEGACY_CMD_LAUNCHER_TASK_XML: &str = r#"<Task version="1.2">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-08T08:30:00</StartBoundary>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\u\AppData\Roaming\AIWorkAssistant\task_doubao_renew.cmd</Command>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    const DIRECT_EXE_TASK_XML: &str = r#"<Task version="1.2">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-07T10:15:00</StartBoundary>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Program Files\AIWorkAssistant\AI Work Assistant.exe</Command>
+      <Arguments>--task-run qoder-checkin</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    const WEEKLY_RENEW_TASK_XML: &str = r#"<Task version="1.2">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-07T10:30:00</StartBoundary>
+      <ScheduleByWeek>
+        <DaysOfWeek><Sunday /></DaysOfWeek>
+        <WeeksInterval>1</WeeksInterval>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd</Command>
+      <Arguments>/c set "AIWORKDATA_DIR=C:\d" &amp;&amp; "C:\app\ai.exe" --task-run wb-renew</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    #[test]
+    fn legacy_tr_command_识别两种旧形态() {
+        assert!(is_legacy_tr_command("cmd"));
+        assert!(is_legacy_tr_command("CMD"));
+        assert!(is_legacy_tr_command("cmd.exe"));
+        assert!(is_legacy_tr_command(
+            r#""C:\Users\u\AppData\Roaming\AIWorkAssistant\task_doubao_renew.cmd""#
+        ));
+        assert!(is_legacy_tr_command("C:\\d\\task_x.CMD"));
+        // 新形态：exe 直调（含空格路径）不是旧形态
+        assert!(!is_legacy_tr_command(
+            r#""C:\Program Files\AIWorkAssistant\AI Work Assistant.exe""#
+        ));
+        assert!(!is_legacy_tr_command("C:\\app\\ai.exe"));
+    }
+
+    #[test]
+    fn task_cli_arg_覆盖六族任务名() {
+        assert_eq!(task_cli_arg(TASK_NAME), Some("checkin"));
+        assert_eq!(task_cli_arg(DOUBAO_TASK_NAME), Some("doubao-keepalive"));
+        assert_eq!(task_cli_arg(DOUBAO_QUOTA_TASK_NAME), Some("doubao-quota"));
+        assert_eq!(
+            task_cli_arg(crate::commands::workbuddy::checkin::WB_RENEW_TASK_NAME),
+            Some("wb-renew")
+        );
+        assert_eq!(
+            task_cli_arg("AIWorkAssistant_WorkBuddyCheckin_0900"),
+            Some("wb-checkin")
+        );
+        assert_eq!(
+            task_cli_arg("AIWorkAssistant_QoderCheckin_1015"),
+            Some("qoder-checkin")
+        );
+        // 非本仓任务与旧品牌任务不迁移
+        assert_eq!(task_cli_arg("MicrosoftEdgeUpdateTaskMachineCore"), None);
+        assert_eq!(task_cli_arg(LEGACY_TASK_NAME), None);
+    }
+
+    #[test]
+    fn xml_解析_每日计划与新旧形态判定() {
+        // 旧形态 cmd 包裹：每日 09:00
+        assert_eq!(
+            xml_start_hhmm(LEGACY_CMD_WRAPPED_TASK_XML).as_deref(),
+            Some("09:00")
+        );
+        assert_eq!(parse_task_schedule(LEGACY_CMD_WRAPPED_TASK_XML), Some(TaskSchedule::Daily));
+        // 旧形态 .cmd 启动器
+        assert_eq!(xml_start_hhmm(LEGACY_CMD_LAUNCHER_TASK_XML).as_deref(), Some("08:30"));
+        // 新形态直调：不再迁移
+        assert!(!is_legacy_tr_command(
+            &xml_tag_text(DIRECT_EXE_TASK_XML, "Command").unwrap()
+        ));
+    }
+
+    #[test]
+    fn xml_解析_每周计划与双周防护() {
+        assert_eq!(
+            parse_task_schedule(WEEKLY_RENEW_TASK_XML),
+            Some(TaskSchedule::Weekly(vec!["SUN".to_string()]))
+        );
+        // 双周计划（WeeksInterval != 1）无法用 /SC WEEKLY 无损重建 → None 跳过迁移
+        let biweekly = WEEKLY_RENEW_TASK_XML.replace("<WeeksInterval>1</WeeksInterval>", "<WeeksInterval>2</WeeksInterval>");
+        assert_eq!(parse_task_schedule(&biweekly), None);
+        // 多星期（如 MON+FRI）：真实带空格形态 `<Sunday />`（fixture 主形态）与
+        // 紧凑形态 `<Monday/><Friday/>` 均需命中（回归：2026-10-16 实测 Win11
+        // schtasks XML 自闭合标签斜杠前带空格，无空格匹配曾致每周任务迁移静默失败）
+        let multi = WEEKLY_RENEW_TASK_XML.replace("<Sunday />", "<Monday /><Friday />");
+        assert_eq!(
+            parse_task_schedule(&multi),
+            Some(TaskSchedule::Weekly(vec!["MON".to_string(), "FRI".to_string()]))
+        );
+        let multi_compact =
+            WEEKLY_RENEW_TASK_XML.replace("<Sunday />", "<Monday/><Friday/>");
+        assert_eq!(
+            parse_task_schedule(&multi_compact),
+            Some(TaskSchedule::Weekly(vec!["MON".to_string(), "FRI".to_string()]))
+        );
+        // 既非每日也非每周（如登录触发）→ None
+        assert_eq!(parse_task_schedule(&DIRECT_EXE_TASK_XML.replace("<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>", "")), None);
+    }
+
+    #[test]
+    fn xml_解析_边界与畸形输入() {
+        assert_eq!(xml_start_hhmm("<StartBoundary>2026-09-07T9:00:00</StartBoundary>"), None);
+        assert_eq!(xml_start_hhmm("<StartBoundary>bad</StartBoundary>"), None);
+        assert_eq!(xml_start_hhmm("no trigger"), None);
+        assert_eq!(xml_tag_text("no tag", "Command"), None);
     }
 }

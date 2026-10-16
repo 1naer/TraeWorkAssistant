@@ -99,13 +99,20 @@ fn main() {
 
     // 旧版计划任务迁移（并存语义）：按旧任务触发时间重建 AIWorkAssistant_DailyCheckin，
     // 旧任务保留供老应用继续使用；任何一步失败都静默跳过
-    if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
+    if let Some(note) = commands::misc::try_migrate_legacy_task() {
         fs_utils::app_log(&state.data_dir, &note);
     }
-    // PS 桥 KeepAlive 启动器一次性迁移：旧 task_doubao_renew.cmd 引用
-    // trae-switch-bridge.ps1 → 原地改写为 --task-run doubao-keepalive（幂等，失败静默）
-    if let Some(note) = commands::doubao::try_migrate_keepalive_launcher(&state) {
-        fs_utils::app_log(&state.data_dir, &note);
+    // 计划任务 /TR 现代化迁移（issue #112）：历史 `cmd /c set … &&` 包裹与豆包 .cmd
+    // 启动器在 Task Scheduler 触发时必弹黑框（cmd.exe 是控制台程序），后台线程一次性
+    // 重建为主 exe 直调（GUI 子系统，无控制台）。部分失败不置位完成标记，下次启动重试。
+    // 后台执行：任务枚举 + 逐任务 XML 查询可达数秒，不阻塞启动（取代原 PS 桥启动器迁移）
+    {
+        let data_dir = state.data_dir.clone();
+        std::thread::spawn(move || {
+            if let Some(note) = commands::misc::try_migrate_cmd_wrapped_tasks(&data_dir) {
+                fs_utils::app_log(&data_dir, &note);
+            }
+        });
     }
     // OAuth 代理直连豁免崩溃残留清理（F-78 批次 2/缺陷13）：上次进程异常退出
     // 未还原 ProxyOverride 时，按标记文件只移除本软件追加的条目（无标记幂等空操作）
