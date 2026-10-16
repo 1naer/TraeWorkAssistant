@@ -24,6 +24,7 @@ const COOLDOWN_LABELS: Record<string, string> = {
   Server: '服务端错误',
   Client: '客户端错误',
   BusinessError: '业务错误',
+  DeviceSigned: '设备已签',
 };
 
 function MiniCooldownBadge({ type, until }: { type: string; until: number | null }) {

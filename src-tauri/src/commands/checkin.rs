@@ -362,7 +362,7 @@ fn run_checkin_worker(
         .map(|u| (u.clone(), "fail"))
         .collect();
     let outcome = execute_round(app, state, &accounts, retry, &log_path);
-    // 跨轮失败类型登记（重试轮覆盖旧值），供重试筛选排除 SessionDead 等永久失效账号
+    // 跨轮失败类型登记（重试轮覆盖旧值），供重试筛选排除 SessionDead/DeviceSigned 等当日不可恢复账号
     let mut round_error_types: std::collections::HashMap<String, String> = outcome.error_types;
     for (uid, st) in outcome.statuses {
         final_status.insert(uid, st);
@@ -374,8 +374,14 @@ fn run_checkin_worker(
         let mut failed_uids: Vec<String> = final_status
             .iter()
             .filter(|(_, st)| **st == "fail")
-            // SessionDead（JWT 被服务端吊销）为永久失效：重试必然再次 401，跳过以免白等
-            .filter(|(uid, _)| round_error_types.get(*uid).map(|e| e.as_str()) != Some("SessionDead"))
+            .filter(|(uid, _)| {
+                match round_error_types.get(*uid).map(|e| e.as_str()) {
+                    // SessionDead=JWT 被服务端吊销（永久）；DeviceSigned=服务端按设备
+                    // 当日去重（issue #110，次日 0 点自动解除）——重试必然同样失败，跳过以免白等
+                    Some("SessionDead") | Some("DeviceSigned") => false,
+                    _ => true,
+                }
+            })
             .map(|(uid, _)| uid.clone())
             .collect();
         if failed_uids.is_empty() {
