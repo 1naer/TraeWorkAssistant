@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, Globe, Activity, Save, Gauge, Check, X } from 'lucide-react';
 import { Badge, Spinner, StatCard } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
@@ -69,6 +69,9 @@ export default function BuddyAiApiService() {
   const [refreshing, setRefreshing] = useState(false);
   // 账号池本地编辑态（desired enabled；保存时统一提交 diff，对齐国内「右上角保存」模式）
   const [pendingEnabled, setPendingEnabled] = useState<Record<string, boolean>>({});
+  // 调度参数最近一次落库值（审查修复 P3 同源：onBlur 未改动不重复保存——原实现每次
+  // 失焦都触发 poolSet + 「已保存」toast，用户仅点击路过输入框也会弹保存噪音）
+  const savedParamsRef = useRef<Record<string, number>>({});
 
   const refreshCatalog = useCallback(async () => {
     const [cat, unified] = await Promise.all([
@@ -117,6 +120,12 @@ export default function BuddyAiApiService() {
         setAiConcurrency(pf.buddy_ai_account_concurrency_limit ?? 1);
         setAiSessionTtl(pf.buddy_ai_sticky_ttl_secs ?? 1800);
         setAiHedgeMs(pf.buddy_ai_hedge_threshold_ms ?? 8000);
+        savedParamsRef.current = {
+          concurrency: pf.buddy_ai_account_concurrency_limit ?? 1,
+          poolTtl: pf.buddy_ai_pool_sticky_ttl_secs ?? 0,
+          sessionTtl: pf.buddy_ai_sticky_ttl_secs ?? 1800,
+          hedge: pf.buddy_ai_hedge_threshold_ms ?? 8000,
+        };
       }
     } finally {
       setLoading(false);
@@ -150,7 +159,7 @@ export default function BuddyAiApiService() {
   }) => {
     if (!pool) {
       pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
-      return;
+      return false;
     }
     setSaving(true);
     // 乐观更新（审查 P2：原在 await 之后 setFlags，保存进行中（≥400ms）再点
@@ -166,6 +175,7 @@ export default function BuddyAiApiService() {
         'success',
         next.buddyAiEnabled ? 'buddy-ai 国际档已开启（独立池参与调度）' : '已保存 buddy-ai 调度配置',
       );
+      return true;
     } catch (err) {
       // 按本次 patch 字段回滚（审查修复）：整份回滚到调用时快照会连带抹掉
       // 并发已成功落库的其他字段（连续保存时第二次失败回滚覆盖第一次成功值）
@@ -175,6 +185,7 @@ export default function BuddyAiApiService() {
       }
       setFlags(revert);
       pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -536,7 +547,8 @@ export default function BuddyAiApiService() {
                 <span className="min-w-0">
                   <span className="block text-xs text-slate-700 dark:text-zinc-200">启用 buddy-ai 国际档</span>
                   <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                    开启后「buddy-ai」档参与调度（与国内 Buddy 档平级、独立账号池/粘性/记账）；需先在 BuddyAI 页登录国际账号
+                    {/* 审查修复（M9 同款）：登录入口实名是「账号管理」页（原「BuddyAI 页」非页面名，用户无法定位） */}
+                    开启后「buddy-ai」档参与调度（与国内 Buddy 档平级、独立账号池/粘性/记账）；需先在「账号管理」页登录国际账号
                   </span>
                 </span>
               </label>
@@ -569,6 +581,7 @@ export default function BuddyAiApiService() {
                 {(
                   [
                     {
+                      key: 'concurrency',
                       label: '账号并发上限',
                       unit: '并发',
                       min: 0,
@@ -579,6 +592,7 @@ export default function BuddyAiApiService() {
                       save: (v: number) => ({ buddyAiAccountConcurrencyLimit: v }),
                     },
                     {
+                      key: 'poolTtl',
                       label: '池粘性 TTL',
                       unit: '秒',
                       min: 0,
@@ -589,6 +603,7 @@ export default function BuddyAiApiService() {
                       save: (v: number) => ({ buddyAiPoolStickyTtlSecs: v }),
                     },
                     {
+                      key: 'sessionTtl',
                       label: '会话粘性 TTL',
                       unit: '秒',
                       min: 0,
@@ -599,6 +614,7 @@ export default function BuddyAiApiService() {
                       save: (v: number) => ({ buddyAiStickyTtlSecs: v }),
                     },
                     {
+                      key: 'hedge',
                       label: '宽渡对冲阈值',
                       unit: 'ms',
                       min: 0,
@@ -627,7 +643,13 @@ export default function BuddyAiApiService() {
                           onBlur={() => {
                             const clamped = Math.min(Math.max(Math.round(item.value || 0), item.min), item.max);
                             item.setValue(clamped);
-                            void saveFlags({ ...flags, ...item.save(clamped) });
+                            // 审查修复（P3 同源）：值未变（含夹取后与上次落库相同）不重复保存；
+                            // 保存成功才记入 ref，失败时下次失焦自动重试
+                            void (async () => {
+                              if (savedParamsRef.current[item.key] === clamped) return;
+                              const ok = await saveFlags({ ...flags, ...item.save(clamped) });
+                              if (ok) savedParamsRef.current[item.key] = clamped;
+                            })();
                           }}
                         />
                         <span className="w-8 shrink-0 text-[11px] text-slate-400">{item.unit}</span>

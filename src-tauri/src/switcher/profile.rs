@@ -31,6 +31,25 @@ impl Layout {
     }
 }
 
+/// 审查修复（M5/W5，2026-10-16 双客户端并存实测）：进程映像名 "CodeBuddy" 的
+/// 归属仲裁。该映像名被国际版（Programs\CodeBuddy\CodeBuddy.exe）与国内老单
+/// 安装（无 "CodeBuddy CN" 目录时代的 CodeBuddy.exe）共用，proc_names 精确
+/// 匹配无法区分归属。布尔等式 `is_self = marker.exists() == owner_is_self`：
+///   - 国内档案 owner_is_self=false：国际 exe 在盘 → "CodeBuddy" 属国际版 →
+///     跳过杀（防并存时误杀国际实例）；国际 exe 不在盘 → 老单布局 → 归国内
+///   - 国际档案 owner_is_self=true：国际 exe 在盘 → 归国际版 → 允许杀；
+///     不在盘 → 跳过（防误杀国内老单布局下的同名国内进程）
+#[derive(Clone, Debug)]
+pub struct ImageArk {
+    /// 归属标记路径（国际版 exe 存在性即「并存布局」的判据）
+    pub marker: PathBuf,
+    /// marker 存在时进程映像是否归本档案
+    pub owner_is_self: bool,
+    /// 受仲裁约束的歧义映像名（不带 .exe，精确匹配；白名单内其余无歧义名
+    /// 如 "CodeBuddy CN" 不受仲裁直通）
+    pub ambiguous: &'static [&'static str],
+}
+
 pub struct AppProfile {
     /// 应用显示名（PS $Script:AppName，进入全部进度文案）
     pub app_name: &'static str,
@@ -65,6 +84,9 @@ pub struct AppProfile {
     /// 客户端启动窗口类型取该键，缺省回落 Agent；快照冻结旧窗口类型会让恢复后
     /// 打开 IDE 窗口。2026-10-14 实测，见 switcher/icube.rs apply_agent_window_fixup）
     pub force_agent_window: bool,
+    /// 仅 CodeBuddy 系：共用映像名 "CodeBuddy" 的归属仲裁（None = 档案进程名
+    /// 无歧义，无需仲裁）
+    pub image_ark: Option<ImageArk>,
 }
 
 impl AppProfile {
@@ -114,6 +136,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: None,
             icube_items: super::icube::TRAE_ICUBE_ITEMS,
             force_agent_window: true,
+            image_ark: None,
         },
         TargetApp::Doubao => AppProfile {
             app_name: "豆包",
@@ -136,6 +159,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: None,
             icube_items: &[],
             force_agent_window: false,
+            image_ark: None,
         },
         TargetApp::WorkBuddy => AppProfile {
             app_name: "WorkBuddy",
@@ -158,6 +182,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: None,
             icube_items: &[],
             force_agent_window: false,
+            image_ark: None,
         },
         TargetApp::CodeBuddy => AppProfile {
             app_name: "CodeBuddy",
@@ -187,6 +212,13 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ))),
             icube_items: &[],
             force_agent_window: false,
+            // 审查修复（M5）：proc_names 含 "CodeBuddy"——并存布局下该映像属
+            // 国际版，必须跳过杀；国际 exe 不在盘（老单布局）才归国内
+            image_ark: Some(ImageArk {
+                marker: PathBuf::from(format!("{local}\\Programs\\CodeBuddy\\CodeBuddy.exe")),
+                owner_is_self: false,
+                ambiguous: &["CodeBuddy"],
+            }),
         },
         TargetApp::Qoder => AppProfile {
             // 【跨平台审查 2026-10-03】macOS 适配预留：Qoder 档案是 macOS 分支的
@@ -231,6 +263,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: None,
             icube_items: super::icube::QODER_IDE_ITEMS,
             force_agent_window: false,
+            image_ark: None,
         },
         // 2026-10-16：BuddyAI 国际版 WorkBuddy AI（authfile 布局变体）：
         // 数据目录 ~/.workbuddy-ai（与国内 .workbuddy 不同根）；auth 文件同目录
@@ -252,7 +285,11 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             graceful_wait_secs: 5,
             // 精确匹配国际客户端进程（"CodeBuddy"）；不得命中国内 "CodeBuddy CN"
             proc_names: &["CodeBuddy"],
-            proc_patterns: &["CodeBuddy AI*"],
+            // 审查修复（W5）：proc_patterns 是 exe 发现第 5 级（running_exe_of）
+            // 的通配组，sysinfo 映像名带 .exe——原 "CodeBuddy AI*" 匹配不到国际
+            // 客户端映像 "CodeBuddy.exe"，第 5 级发现恒失效。补精确 glob 项；
+            // 老单布局下它可能命中国内同名映像，由 image_ark 在消费点仲裁
+            proc_patterns: &["CodeBuddy.exe", "CodeBuddy AI*"],
             exe_names: &["CodeBuddy.exe"],
             lnk_patterns: &["CodeBuddy.lnk", "*CodeBuddy AI*"],
             reg_patterns: &["CodeBuddy"],
@@ -266,6 +303,13 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ))),
             icube_items: &[],
             force_agent_window: false,
+            // 审查修复（M5）：映像名 "CodeBuddy" 在老单布局下归国内，国际 exe
+            // 不在盘时必须跳过杀（防误杀国内老单实例）
+            image_ark: Some(ImageArk {
+                marker: PathBuf::from(format!("{local}\\Programs\\CodeBuddy\\CodeBuddy.exe")),
+                owner_is_self: true,
+                ambiguous: &["CodeBuddy"],
+            }),
         },
         TargetApp::WorkBuddyAI => AppProfile {
             app_name: "WorkBuddy AI",
@@ -287,6 +331,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: None,
             icube_items: &[],
             force_agent_window: false,
+            image_ark: None,
         },
         TargetApp::QoderWork => AppProfile {
             // 【跨平台审查 2026-10-03】macOS 适配预留：ElectronRoot 布局快照管线
@@ -321,6 +366,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: None,
             icube_items: &[],
             force_agent_window: false,
+            image_ark: None,
         },
     }
 }
@@ -350,6 +396,16 @@ mod tests {
         let cb = profile_for(TargetApp::CodeBuddy, &data);
         assert_eq!(cb.proc_names, &["CodeBuddy", "CodeBuddy CN"]);
         assert!(cb.cb_global_storage_dir.is_some());
+        // M5/W5（2026-10-16 双客户端并存实测）：CodeBuddy 系共用映像名 "CodeBuddy"
+        // 的归属仲裁——国内档案 owner_is_self=false（国际在盘时跳过）、国际档案
+        // owner_is_self=true（国际不在盘时跳过）；其余档案无仲裁
+        assert!(cb.image_ark.is_some());
+        assert!(!cb.image_ark.as_ref().unwrap().owner_is_self);
+        let cbai = profile_for(TargetApp::CodeBuddyAI, &data);
+        assert_eq!(cbai.proc_patterns, &["CodeBuddy.exe", "CodeBuddy AI*"]);
+        assert!(cbai.image_ark.is_some());
+        assert!(cbai.image_ark.as_ref().unwrap().owner_is_self);
+        assert!(db.image_ark.is_none());
 
         let trae = profile_for(TargetApp::Trae, &data);
         assert_eq!(trae.settings_path_key, "trae_cn_path");

@@ -12,7 +12,7 @@
 
 use std::os::windows::process::CommandExt;
 use std::process::Command;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -473,12 +473,17 @@ pub(super) fn oauth_login_async(
         return Err("已有 OAuth 扫码流程进行中".into());
     }
     let done_event = format!("{}-oauth-done", sink.event_prefix());
+    // 审查修复（M1）：复用主进程 manage 的 AppState 共享实例——其 wb_pool_lock /
+    // buddy_ai_pool_lock / jwt_refresh_lock 等 Arc 字段与命令、调度线程同源。
+    // 原 AppState::new() 在本线程构造全新实例，锁域互不相干 → OAuth 写池与
+    // 命令/调度写池并发时失去互斥，可能整池覆盖丢账号。
+    let st = app.state::<AppState>().inner().clone();
     std::thread::spawn(move || {
         // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
         //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
         // catch_unwind 确保复位 + 补发失败终态
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            AppState::new().and_then(|st| oauth_flow(&app, &st, ep, sink))
+            oauth_flow(&app, &st, ep, sink)
         }));
         let payload = match outcome {
             Ok(Ok((id, nickname))) => serde_json::json!({

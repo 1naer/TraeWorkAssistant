@@ -644,6 +644,10 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "accounts": buddy_ai_accounts,
             "model_cooldowns": buddy_ai_model_cooldowns,
             "sticky_sessions": state.buddy_ai_sticky.len(),
+            // 上游健康探针（G8 审查修复）：与 wb 块同口径对齐，前端/监控可按
+            // 池区分上游可达性；-1 未探测 / 0 不可达 / 1 在线
+            "probe_ok": state.buddy_ai_probe_ok.load(std::sync::atomic::Ordering::Relaxed),
+            "probe_ts_ms": state.buddy_ai_probe_ts_ms.load(std::sync::atomic::Ordering::Relaxed),
         },
     }))
 }
@@ -673,8 +677,8 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
         .load(std::sync::atomic::Ordering::Relaxed);
     let data_dir = state.data_dir.clone();
     // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
-    // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
-    // 客户端（如 CC Switch）可在同名模型间区分来源池（三家倍率与效果不同）
+    // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / buddy-ai/xxx
+    // / qoder/xxx），客户端（如 CC Switch）可在同名模型间区分来源池（各池倍率与效果不同）
     let source_labels = dispatch::load_policy(&data_dir).model_source_labels;
     let list = tokio::task::spawn_blocking(move || {
         // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
@@ -1027,8 +1031,9 @@ fn strip_bracket_1m(name: &str) -> Option<&str> {
     }
 }
 
-/// 三池可路由判定（Anthropic 入口兜底专用）：Custom 直达命中 /
-/// WB 路由解析命中目录且上游启用 / Trae 模型列表 canonical 命中
+/// 可路由判定（Anthropic 入口兜底专用）：Custom 直达命中 /
+/// WB 路由解析命中目录且上游启用 / buddy-ai Intl 目录命中且国际档启用 /
+/// Trae 模型列表 canonical 命中
 fn anthropic_model_servable(state: &ApiSharedState, model: &str) -> bool {
     if super::custom_models::find_enabled(&state.data_dir, model).is_some() {
         return true;
@@ -1040,6 +1045,22 @@ fn anthropic_model_servable(state: &ApiSharedState, model: &str) -> bool {
         && wb_catalog::find(&catalog, &r.model).is_some()
     {
         return true;
+    }
+    // G6 审查修复：buddy-ai 国际档对称判定——/v1/messages 经 dispatch 已可路由
+    // Intl 目录模型（TargetPool::BuddyAi），本判定原先只认 CN 目录，纯国际档
+    // 用户（wb 关、intl 开）被误判不可路由，分类器名一律回落默认模型。仅按
+    // 请求原名直查 Intl 目录：Intl 专属 id（如 deepseek-v4.1-flash）不经 CN
+    // 四段路由映射，原名即 dispatch 路由名。不可用 r.model（L1043 CN 目录
+    // resolve 结果，claude-* 系会被映射成 CN 模型名）查 Intl 目录——映射名
+    // 恰在 Intl 目录时会产生假阳性，分类器名被误判「可路由」而跳过回落
+    if state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let intl_catalog = wb_catalog::buddy_ai_load(&state.data_dir);
+        if wb_catalog::find(&intl_catalog, model).is_some() {
+            return true;
+        }
     }
     super::models_sync::load_models(&state.data_dir)
         .iter()
@@ -3178,6 +3199,8 @@ mod tests {
             usage_dirty: std::sync::Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
             trae_enabled: std::sync::atomic::AtomicBool::new(true),
             qoder_pool: super::super::pool::ApiPool::new(),
@@ -3313,6 +3336,26 @@ mod tests {
     async fn fallback_keeps_claude_when_wb_routes_it() {
         let f = wl_fixture("claude_wb"); // fixture 默认 wb_enabled=true，builtin 目录含 glm-5.3
         assert!(anthropic_model_fallback(&f.state, "claude-sonnet-5[1m]").is_none());
+    }
+
+    /// G6 审查修复：纯 buddy-ai 用户（wb 关、intl 开）——Intl 目录模型可路由，
+    /// 原样保留（原先 servable 只认 CN 目录被误判，Intl 专属 id 被迫回落默认模型）
+    #[tokio::test]
+    async fn servable_includes_buddy_ai_intl_catalog() {
+        let f = wl_fixture("claude_intl");
+        f.state
+            .wb_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        f.state
+            .buddy_ai_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Intl 专属 id（内置静态表兜底）：原名直查 Intl 目录命中
+        assert!(anthropic_model_servable(&f.state, "deepseek-v4.1-flash"));
+        // claude 系分类器名 Intl 目录无映射 → 仍回落默认模型（行为不变）
+        assert_eq!(
+            anthropic_model_fallback(&f.state, "claude-sonnet-5[1m]").as_deref(),
+            Some("deepseek-v4-flash")
+        );
     }
 
     /// 基名在目录（原名带 [1m] 不在）→ 剥标记用基名

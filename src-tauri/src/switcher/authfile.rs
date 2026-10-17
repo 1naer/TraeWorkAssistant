@@ -46,6 +46,15 @@ pub(crate) fn wb_ai_auth_file() -> PathBuf {
     wb_auth_dir().join("workbuddy-desktop-ai.info")
 }
 
+/// 国际版 CodeBuddy AI auth 文件（同目录异名推定：codebuddy-desktop-ai.info，
+/// 对齐 workbuddy → workbuddy-desktop-ai.info 命名惯例；国际客户端 auth 文件名
+/// 暂无实测证据，若推定名不存在，backup_authfile 已按 M7 将 CodeBuddy 系 L1
+/// 可选化——auth 文件缺失时跳过 L1、登录真源走 L3 vscdb，行为仍正确）。
+/// 由 Session::new 按 TargetApp::CodeBuddyAI 注入 sess.auth_file。
+pub(crate) fn cb_ai_auth_file() -> PathBuf {
+    wb_auth_dir().join("codebuddy-desktop-ai.info")
+}
+
 /// 快照槽内 auth 文件名（随会话目标而异：国内 / 国际异名共存，
 /// 备份与恢复按会话实际 auth 文件名对齐，勿再硬编码常量）
 fn slot_auth_name(sess: &Session) -> String {
@@ -119,7 +128,11 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     // 关闭客户端后先等 auth 文件静默（残留进程可能延迟回写旧登录，实测 3 秒后才落盘）
     wait_auth_file_quiet(&auth_file, sink);
     let dest = sess.prof.profiles_dir.join(slot);
-    if !auth_file.exists() {
+    // 审查修复（M7）：CodeBuddy 系（CN/AI）登录真源在 L3 vscdb，auth 文件缺失
+    // 不构成早退理由——原实现对 CodeBuddyAI 会话用国内共享 auth 文件做前置判断，
+    // 纯国际用户（无国内 WorkBuddy auth 文件）整体早退连 L3 一起跳过，切换空转
+    let is_codebuddy = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI");
+    if !auth_file.exists() && !is_codebuddy {
         // 前置早退：首次使用/从未登录场景（区别于复制失败）——不建槽、不写 meta、
         // 不动 .bak，整体返回
         sink.step(
@@ -134,11 +147,19 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     std::fs::create_dir_all(dest.join("auth")).map_err(|e| format!("创建快照目录失败: {e}"))?;
     let mut copied = 0usize;
 
-    // L1 必选：auth 文件
+    // L1：auth 文件（WorkBuddy 系必选；CodeBuddy 端隔离可选——F2-4：CodeBuddy
+    // 不消费共享 auth 文件、恢复侧跳过回写，文件缺失仅 Skip 不阻断）
     match std::fs::copy(&auth_file, dest.join("auth").join(slot_auth_name(sess))) {
         Ok(_) => {
             copied += 1;
             sink.step("backup", StepStatus::Ok, "L1 auth 文件已备份");
+        }
+        Err(_) if is_codebuddy && !auth_file.exists() => {
+            sink.step(
+                "backup",
+                StepStatus::Skip,
+                "L1 auth 文件不存在，跳过（CodeBuddy 登录真源在 vscdb，见 L3）",
+            );
         }
         Err(e) => {
             sink.step("backup", StepStatus::Error, &format!("auth 文件备份失败: {e}"));
@@ -147,7 +168,23 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     }
 
     // L2 体验：~\<app_data>\storage\user-<uid>* 目录
-    let uid = auth_file_uid(&auth_file);
+    let mut uid = auth_file_uid(&auth_file);
+    // 审查复审修复（M7 假警报）：CodeBuddy 系推定 auth 文件名未命中（国际版文件
+    // 不存在）时 auth_file_uid 返回 None → meta uid=null → confirm_switch 的
+    // expect_uid 回退到槽名（wb-<hash> 池 id），与信号④读到的 live storage.json
+    // genie.userId（真实 uuid）恒不等 → 每次健康切换都误报「已回退到其他账号」。
+    // CodeBuddy 登录真源在 vscdb（L3），此处从同源 storage.json 读 genie.userId
+    // 兜底落 meta uid（顺带让 L2 的 user-<uid>* 目录匹配也能命中）
+    if uid.is_none() && matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
+        if let Some(gs_dir) = &sess.prof.cb_global_storage_dir {
+            let raw = crate::fs_utils::read_json::<serde_json::Value>(&gs_dir.join("storage.json"));
+            if let Some(s) =
+                crate::fs_utils::dig(&raw, &["genie.userId"]).and_then(|v| v.as_str())
+            {
+                uid = Some(s.to_string());
+            }
+        }
+    }
     match &uid {
         Some(uid) => {
             let storage_dir = sess.prof.data_dir.join("storage");
@@ -195,7 +232,11 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
             sink.step(
                 "backup",
                 StepStatus::Warn,
-                "auth 文件中未能解析 uid（JSON 结构变化？），L2 跳过",
+                if auth_file.exists() {
+                    "auth 文件中未能解析 uid（JSON 结构变化？），L2 跳过"
+                } else {
+                    "auth 文件不存在，无法解析 uid，L2 跳过"
+                },
             );
         }
     }
@@ -329,7 +370,11 @@ pub fn restore_authfile(
     let auth_file = &sess.auth_file;
     let (src, _slot_label) = copy::resolve_slot(sess, slot, sink)?;
     let auth_src = src.join("auth").join(slot_auth_name(sess));
-    if !auth_src.exists() {
+    // 审查修复（M7）：CodeBuddy 系备份侧已允许 L1 auth 文件缺席（登录真源在
+    // vscdb，见 L3），恢复侧若仍强制要求，会把纯国际用户的合法快照（仅 vscdb、
+    // 无 auth 文件）误判「不完整」而中止恢复
+    let is_codebuddy = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI");
+    if !auth_src.exists() && !is_codebuddy {
         sink.step(
             "restore",
             StepStatus::Error,
@@ -343,8 +388,7 @@ pub fn restore_authfile(
     // CodeBuddy 不消费它（登录真源在自身 vscdb，见 L3）——切/存 CodeBuddy 时回写
     // 共享 auth 会把 WorkBuddy 的登录一并切走（实测「切 CodeBuddy 时 WorkBuddy
     // 伴随切换」根因）。CodeBuddy 恢复跳过 L1 回写，仅走 L3 vscdb；
-    // WorkBuddy 恢复保持原语义。
-    let is_codebuddy = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI");
+    //   WorkBuddy 恢复保持原语义。
     if is_codebuddy {
         sink.step(
             "restore",

@@ -600,7 +600,26 @@ fn import_wb_token_store(store: &Store, path: &Path) -> ImportStatus {
 fn import_api_usage(store: &Store, path: &Path) -> ImportStatus {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<crate::api_server::usage::UsageFile>(&text) {
-            Ok(f) => wrap(docs::api_usage_save(store, &f)),
+            // 审查修复（M8）：原实现直接 api_usage_save 全量替换（DELETE 后按 JSON
+            // 重插）——残留旧 JSON 重放迁移时（备份还原 data/ 等场景），JSON 缺失
+            // 的桶（如升级后新增的 buddy-ai）连同运行期新增天数会被整表清掉。
+            // 改为合并导入：仅补库中缺失的 (bucket, day)，库已有行保留
+            //（库为运行期新数据，优先于迁移源；首次迁移库为空时语义不变）
+            Ok(f) => {
+                let mut cur = docs::api_usage_load(store);
+                for (src, dst) in [
+                    (&f.days, &mut cur.days),
+                    (&f.wb_days, &mut cur.wb_days),
+                    (&f.custom_days, &mut cur.custom_days),
+                    (&f.qoder_days, &mut cur.qoder_days),
+                    (&f.buddy_ai_days, &mut cur.buddy_ai_days),
+                ] {
+                    for (day, stats) in src {
+                        dst.entry(day.clone()).or_insert_with(|| stats.clone());
+                    }
+                }
+                wrap(docs::api_usage_save(store, &cur))
+            }
             Err(e) => ImportStatus::Corrupt(e.to_string()),
         },
         Err(e) => ImportStatus::Error(e.to_string()),

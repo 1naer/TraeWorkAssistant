@@ -1,15 +1,26 @@
 /**
  * 资源总览（ResourceSummary）多池摘要指标的纯计算，抽出以便单测。
- * 池内成员口径：
+ * 池内成员口径（与后端 apply_pool_snapshot 装配语义一致）：
  * - Trae：enabled_uids（按 AccountView.user_id 匹配）；
- * - Buddy：wb_enabled_uids 非空按名单取（按 WorkBuddyAccountView.id 匹配，fail-open 冻结）；
- *   空/缺失 = fail-open，全部含凭证账号自动入池；
- * - Qoder：分组筛选（qoder_group_ids 非空时仅纳入所选分组的账号）∩ 白名单
- *   （qoder_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）。
+ * - Buddy：分组筛选（wb_group_ids）∩ 标签筛选（wb_tag_ids）→ 白名单
+ *   （wb_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）；
+ * - Qoder：分组筛选（qoder_group_ids）∩ 标签筛选（qoder_tag_ids）→ 白名单
+ *   （qoder_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）；
+ * - BuddyAI 国际：分组筛选（buddy_ai_group_ids）∩ 标签筛选（buddy_ai_tag_ids）；
+ *   无独立白名单字段 = fail-open 全部含凭证账号入池（已停用账号不入池，与后端一致）。
  * 积分口径：可用积分 = 池内账号积分之和；积分总余额 = 全部账号积分之和；
- * Buddy/Qoder 侧全部账号无余额数据（credits_balance 全 null）时返回 null（上层展示「未知」）。
+ * Buddy/Qoder/BuddyAI 侧全部账号无余额数据（credits_balance 全 null）时返回 null
+ * （上层展示「未知」）。
  */
-import type { AccountView, ApiPoolFile, CustomModel, QoderAccountView, WorkBuddyAccountView } from '../../types';
+import type {
+  AccountView,
+  ApiPoolFile,
+  BuddyAiAccountView,
+  CustomModel,
+  QoderAccountView,
+  TagView,
+  WorkBuddyAccountView,
+} from '../../types';
 
 export interface PoolMetrics {
   /** Trae 池内账号数（enabled_uids） */
@@ -22,7 +33,7 @@ export interface PoolMetrics {
   traeTotalCredits: number;
   /** Buddy 上游开关 */
   buddyEnabled: boolean;
-  /** Buddy 池内账号数（白名单或 fail-open 全量含凭证账号） */
+  /** Buddy 池内账号数（分组 ∩ 标签 → 白名单，白名单空 = fail-open） */
   buddyPoolCount: number;
   /** Buddy 池内账号积分之和；无任何余额数据 = null（展示「未知」） */
   buddyPoolCredits: number | null;
@@ -30,9 +41,19 @@ export interface PoolMetrics {
   buddyTotalCredits: number | null;
   /** Buddy 账号总数 */
   buddyAccountTotal: number;
+  /** BuddyAI 国际池上游开关 */
+  buddyAiEnabled: boolean;
+  /** BuddyAI 国际池内账号数（分组 ∩ 标签筛选，空 = fail-open 全部含凭证账号） */
+  buddyAiPoolCount: number;
+  /** BuddyAI 国际池内账号积分之和；无任何余额数据 = null（展示「未知」） */
+  buddyAiPoolCredits: number | null;
+  /** BuddyAI 国际全部含凭证账号积分之和；无任何余额数据 = null */
+  buddyAiTotalCredits: number | null;
+  /** BuddyAI 国际账号总数 */
+  buddyAiAccountTotal: number;
   /** Qoder 上游开关 */
   qoderEnabled: boolean;
-  /** Qoder 池内账号数（分组筛选 ∩ 白名单，白名单空 = fail-open 全部含凭证账号） */
+  /** Qoder 池内账号数（分组 ∩ 标签 → 白名单，白名单空 = fail-open） */
   qoderPoolCount: number;
   /** Qoder 池内账号积分之和；无任何余额数据 = null（展示「未知」） */
   qoderPoolCredits: number | null;
@@ -46,35 +67,77 @@ export interface PoolMetrics {
   customModelTotal: number;
 }
 
+/** 选中标签的账号 uid 并集；null = 未选标签（不限，fail-open） */
+function tagUidUnion(tagIds: string[], tags: TagView[]): Set<string> | null {
+  if (tagIds.length === 0) return null;
+  const s = new Set<string>();
+  for (const t of tags) {
+    if (!tagIds.includes(t.id)) continue;
+    for (const u of t.uids ?? []) s.add(u);
+  }
+  return s;
+}
+
+/** 分组 ∩ 标签双维过滤（tagSet null = 不限标签；groupId 为空串 = 未分组账号） */
+function inOrgScope(
+  groupId: string,
+  groupIds: string[],
+  uid: string,
+  tagSet: Set<string> | null,
+): boolean {
+  const groupOk = groupIds.length === 0 || groupIds.includes(groupId);
+  const tagOk = tagSet == null || tagSet.has(uid);
+  return groupOk && tagOk;
+}
+
 export function computePoolMetrics(
   pool: ApiPoolFile | null,
   accounts: AccountView[],
   wbAccounts: WorkBuddyAccountView[],
   customModels: CustomModel[],
   qoderAccounts: QoderAccountView[] = [],
+  buddyAiAccounts: BuddyAiAccountView[] = [],
+  tags: TagView[] = [],
 ): PoolMetrics {
   const traePoolUids = pool?.enabled_uids ?? [];
   const traePoolAccounts = accounts.filter((a) => traePoolUids.includes(a.user_id));
 
+  // Buddy 池内口径：分组 ∩ 标签过滤后，白名单非空按名单取（fail-open 冻结语义：
+  // 显式名单优先；空/缺失 = 过滤后全集自动入池）
   const credAccounts = wbAccounts.filter((a) => a.has_credential);
+  const wbGroupIds = pool?.wb_group_ids ?? [];
+  const wbTagSet = tagUidUnion(pool?.wb_tag_ids ?? [], tags);
+  const wbOrgScoped = credAccounts.filter((a) => inOrgScope(a.group_id, wbGroupIds, a.id, wbTagSet));
   const wbPoolIds = pool?.wb_enabled_uids ?? [];
-  const buddyPoolAccounts = wbPoolIds.length ? wbAccounts.filter((a) => wbPoolIds.includes(a.id)) : credAccounts;
+  const buddyPoolAccounts = wbPoolIds.length ? wbOrgScoped.filter((a) => wbPoolIds.includes(a.id)) : wbOrgScoped;
   const buddyPoolKnown = buddyPoolAccounts.some((a) => a.credits_balance != null);
   const buddyTotalKnown = credAccounts.some((a) => a.credits_balance != null);
 
-  // Qoder 池内口径（与后端 apply_pool_snapshot 装配语义一致）：分组筛选
-  // （qoder_group_ids 非空时仅纳入所选分组的账号，未分组账号不参与）∩ 白名单
-  // （qoder_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）
+  // Qoder 池内口径：分组 ∩ 标签 → 白名单（qoder_enabled_uids 非空按名单取，
+  // 空/缺失 = fail-open 全部含凭证账号入池）
   const qoderCredAccounts = qoderAccounts.filter((a) => a.has_credential);
   const qoderGroupIds = pool?.qoder_group_ids ?? [];
-  const qoderPoolIds = pool?.qoder_enabled_uids ?? [];
-  const qoderPoolAccounts = qoderCredAccounts.filter(
-    (a) =>
-      (qoderGroupIds.length === 0 || qoderGroupIds.includes(a.group_id)) &&
-      (qoderPoolIds.length === 0 || qoderPoolIds.includes(a.id)),
+  const qoderTagSet = tagUidUnion(pool?.qoder_tag_ids ?? [], tags);
+  const qoderOrgScoped = qoderCredAccounts.filter((a) =>
+    inOrgScope(a.group_id, qoderGroupIds, a.id, qoderTagSet),
   );
+  const qoderPoolIds = pool?.qoder_enabled_uids ?? [];
+  const qoderPoolAccounts = qoderPoolIds.length
+    ? qoderOrgScoped.filter((a) => qoderPoolIds.includes(a.id))
+    : qoderOrgScoped;
   const qoderKnown = qoderPoolAccounts.some((a) => a.credits_balance != null);
   const qoderTotalKnown = qoderCredAccounts.some((a) => a.credits_balance != null);
+
+  // BuddyAI 国际池内口径：分组 ∩ 标签（无独立白名单字段 = fail-open 全部含
+  // 凭证账号入池）；已停用（disabled）账号不入网关池，与后端装配一致不计入
+  const buddyAiCredAccounts = buddyAiAccounts.filter((a) => !a.disabled && a.has_credential);
+  const buddyAiGroupIds = pool?.buddy_ai_group_ids ?? [];
+  const buddyAiTagSet = tagUidUnion(pool?.buddy_ai_tag_ids ?? [], tags);
+  const buddyAiPoolAccounts = buddyAiCredAccounts.filter((a) =>
+    inOrgScope(a.group_id, buddyAiGroupIds, a.id, buddyAiTagSet),
+  );
+  const buddyAiPoolKnown = buddyAiPoolAccounts.some((a) => a.credits_balance != null);
+  const buddyAiTotalKnown = buddyAiCredAccounts.some((a) => a.credits_balance != null);
 
   return {
     traePoolCount: traePoolAccounts.length,
@@ -86,6 +149,15 @@ export function computePoolMetrics(
     buddyPoolCredits: buddyPoolKnown ? buddyPoolAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0) : null,
     buddyTotalCredits: buddyTotalKnown ? credAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0) : null,
     buddyAccountTotal: wbAccounts.length,
+    buddyAiEnabled: pool?.buddy_ai_enabled ?? false,
+    buddyAiPoolCount: buddyAiPoolAccounts.length,
+    buddyAiPoolCredits: buddyAiPoolKnown
+      ? buddyAiPoolAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0)
+      : null,
+    buddyAiTotalCredits: buddyAiTotalKnown
+      ? buddyAiCredAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0)
+      : null,
+    buddyAiAccountTotal: buddyAiAccounts.length,
     qoderEnabled: pool?.qoder_enabled ?? false,
     qoderPoolCount: qoderPoolAccounts.length,
     qoderPoolCredits: qoderKnown ? qoderPoolAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0) : null,

@@ -924,7 +924,7 @@ export default function BuddyAiCredits() {
         <div className="card mt-4 overflow-x-auto p-4">
           <div className="mb-3 flex items-center justify-between">
             <span className="text-sm font-medium">账号积分明细</span>
-            <span className="text-[11px] text-slate-400">积分包个数只计剩余 &gt; 0 的包（同步积分后刷新）</span>
+            <span className="text-[11px] text-slate-400">积分包个数只计剩余 &gt; 0 的包（刷新数据后更新）</span>
           </div>
           {acctExpiryRows.length === 0 ? (
             <p className="py-4 text-center text-xs text-slate-400">当前筛选条件下无账号。</p>
@@ -1311,7 +1311,11 @@ export default function BuddyAiCredits() {
           <div className="py-10 text-center text-sm text-slate-400">加载中…</div>
         ) : listF.length === 0 ? (
           <div className="flex h-40 items-center justify-center text-sm text-slate-400">
-            {list.length === 0 ? '暂无国际账号，先到「账号管理」扫码登录或导入凭证。' : '当前筛选条件下无账号。'}
+            {/* 审查修复（M9 同款）：引导文案与账号管理页实际按钮实名对齐
+                （「扫码登录/导入凭证」均非该页按钮名，用户照提示找不到入口） */}
+            {list.length === 0
+              ? '暂无国际账号，先到「账号管理」点「OAuth登录」授权入池，或「扫描本机账号」「导入账号」。'
+              : '当前筛选条件下无账号。'}
           </div>
         ) : (
           <table className="w-full min-w-[680px] text-sm">

@@ -98,9 +98,13 @@ pub(super) fn save_buddy_pool(state: &AppState, pool: &WbPool) -> Result<(), Str
 fn buddy_ai_credits_snapshot_save(state: &AppState, pool: &WbPool) {
     let db = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // 审查修复（H3）：明细与 total 同口径——原明细含停用账号而 total 过滤，前端
+    // 按明细求和与 total 不闭合。total 改从过滤后明细累加，结构上保证恒等
+    // （BL-7：停用账号不计入趋势口径，与花名册/网关池一致）
     let accounts: Vec<Value> = pool
         .accounts
         .iter()
+        .filter(|a| !a.disabled)
         .map(|a| {
             json!({
                 "id": a.id,
@@ -109,18 +113,73 @@ fn buddy_ai_credits_snapshot_save(state: &AppState, pool: &WbPool) {
             })
         })
         .collect();
-    let total: f64 = pool
-        .accounts
+    let total: f64 = accounts
         .iter()
-        .filter(|a| !a.disabled) // BL-7：停用账号不计入趋势口径（与花名册/网关池一致）
-        .filter_map(|a| a.credits_balance)
+        .filter_map(|a| a.get("balance").and_then(Value::as_f64))
         .sum();
+    // 审查修复（H4）：earned 改「较上一快照余额差分」（max(差分, 0)）——对齐国内
+    // credits.rs append_credits_snapshot 口径；buddy-ai 无签到 reward 日志（打卡为
+    // 每日活跃，不产生积分入账记录），差分是唯一可得口径。沿用国内 2026-10-06
+    // 账号集合可比性守卫：与上一快照集合不一致（增/删账号）时新账号余额会被误记
+    // 为「当日获得」，此时 earned 记 Null（前端趋势留空，不画 0）
+    let hist = crate::store::docs::buddy_ai_credits_history_load(&db);
+    let prev_snapshot = hist
+        .get("snapshots")
+        .and_then(Value::as_array)
+        .and_then(|snaps| {
+            snaps
+                .iter()
+                .filter(|s| s.get("date").and_then(Value::as_str).map(|d| d < today.as_str()).unwrap_or(false))
+                .filter(|s| s.get("total_balance").and_then(Value::as_f64).is_some())
+                .last()
+        });
+    let prev_total = prev_snapshot.and_then(|s| s.get("total_balance").and_then(Value::as_f64));
+    // 集合指纹（排序去重账号 id + 余额是否已观测标记；空明细 → None，视为不可判，
+    // 维持差分行为）。审查复审修复：仅比对 id 感知不到既有账号余额 None→Some 的
+    // 首次观测——该账号全部余额会被误记为当日 earned（虚增），纳入指纹后此类
+    // 首观测视为集合变化，当日 earned 记 Null 等待下一快照
+    fn fingerprint(accs: &[Value]) -> Option<Vec<String>> {
+        let mut ids: Vec<String> = accs
+            .iter()
+            .filter_map(|a| {
+                a.get("id").and_then(Value::as_str).map(|s| {
+                    format!(
+                        "{}:{}",
+                        s,
+                        a.get("balance").and_then(Value::as_f64).is_some()
+                    )
+                })
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() { None } else { Some(ids) }
+    }
+    let set_changed = match (
+        prev_snapshot
+            .and_then(|s| s.get("accounts"))
+            .and_then(Value::as_array)
+            .map(|v| v.as_slice())
+            .and_then(fingerprint),
+        fingerprint(&accounts),
+    ) {
+        (Some(p), Some(c)) => p != c,
+        _ => false,
+    };
+    let earned = if set_changed {
+        Value::Null
+    } else {
+        prev_total
+            .map(|prev| (total - prev).max(0.0))
+            .map(Value::from)
+            .unwrap_or(Value::Null)
+    };
     let snap = json!({
         "date": today,
         "ts": chrono::Utc::now().timestamp(),
         "total_balance": total,
         "accounts": accounts,
-        "earned": Value::Null,
+        "earned": earned,
     });
     if let Err(e) = crate::store::docs::buddy_ai_credits_history_upsert(&db, &snap) {
         fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 积分快照落库失败: {e}"));
@@ -202,7 +261,8 @@ pub fn buddy_ai_oauth_login(app: tauri::AppHandle) -> Result<(), String> {
 
 // ── 手工导入凭证（区域必选校验，§4.1）──────────────────────────────────────
 
-/// 手工导入国际账号凭证：access_token 必填，refresh_token 可选（无则不可自动续期）。
+/// 手工导入国际账号凭证：access_token 必填，refresh_token 可选——同 id 重导缺省时
+/// 回落旧值（BL-2 合并语义，见函数体），仅全新账号缺 rt 才不可自动续期。
 /// 区域校验（双重保险之一）：domain 显式传入时必须含 `.workbuddy.ai`，否则拒绝——
 /// buddy-ai 池不接受任何国内形态账号；缺省回落 `www.workbuddy.ai`。
 #[tauri::command(async)]
@@ -310,7 +370,74 @@ pub fn buddy_ai_account_import_creds(
 
 // ── 账号列表 / 移除 / 凭证续期（阶段 1 最小集）──────────────────────────────
 
-/// buddy-ai 账号列表（脱敏：不回传凭证，仅回传凭证存在性）
+/// 审查修复（H7）：账号视图统一装配——accounts_list 与 credits_sync 返回视图
+/// 原为两份手写字段表且已漂移（sync 版缺 is_current_* / has_snapshot_* 四键，
+/// 前端「直接替换列表」后徽标/快照存在性消失；domain 字面量与 INTL_DOMAIN
+/// 常量漂移）。单一装配点 + 上下文一次读取，杜绝两表漂移
+struct BuddyAiViewCtx {
+    ai_auth_uid: Option<String>,
+    cb_live_uid: Option<String>,
+    profiles_wb_ai: std::path::PathBuf,
+    profiles_cb: std::path::PathBuf,
+}
+
+impl BuddyAiViewCtx {
+    /// 切换/保存登录态上下文（对齐国内 is_current_* / has_snapshot_* 口径）：
+    /// WB 当前 = 国际 auth 文件 uid；CB 当前 = CodeBuddy live storage.json genie.uid
+    fn load(state: &AppState) -> Self {
+        Self {
+            ai_auth_uid: crate::switcher::authfile::auth_file_uid(
+                &crate::switcher::authfile::wb_ai_auth_file(),
+            ),
+            // CB 当前 = 国际版客户端 live uid（%APPDATA%\CodeBuddy；2026-10-16 修复：
+            // 原误读国内 CodeBuddy CN 的 roaming，徽标/切换目标全部错端）
+            cb_live_uid: super::accounts::codebuddy_ai_live_uid(),
+            profiles_wb_ai: state.data_dir.join("data").join("profiles_workbuddy_ai"),
+            profiles_cb: state.data_dir.join("data").join("profiles_codebuddy_ai"),
+        }
+    }
+}
+
+/// 单账号视图装配（脱敏：不回传凭证，仅回传凭证存在性；快照槽存在性 =
+/// 主槽或 .bak 回退槽）
+fn buddy_ai_account_view(a: &WorkBuddyAccount, rec: Option<&Value>, ctx: &BuddyAiViewCtx) -> Value {
+    let slot_exists = |dir: &std::path::Path, id: &str| {
+        dir.join(id).exists() || dir.join(format!("{id}.bak")).exists()
+    };
+    json!({
+        "id": a.id,
+        "uid": a.uid,
+        "nickname": a.nickname,
+        "note": a.note,
+        "group_id": a.group_id,
+        "access_token_expires_at": a.access_token_expires_at,
+        "refresh_token_expires_at": a.refresh_token_expires_at,
+        "auth_saved_at": a.auth_saved_at,
+        "needs_relogin": a.needs_relogin,
+        "relogin_reason": a.relogin_reason,
+        "disabled": a.disabled,
+        "credits_packages": a.credits_packages,
+        "credits_balance": a.credits_balance,
+        "credits_expire_at": a.credits_expire_at,
+        "credits_fetched_at": a.credits_fetched_at,
+        "has_credential": rec
+            .map(|r| {
+                as_str(fs_utils::dig(r, &["access_token"]))
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false),
+        "domain": rec
+            .and_then(|r| as_str(fs_utils::dig(r, &["domain"])))
+            .unwrap_or_else(|| INTL_DOMAIN.into()),
+        "is_current_workbuddy": ctx.ai_auth_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
+        "is_current_codebuddy": ctx.cb_live_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
+        "has_snapshot_workbuddy": slot_exists(&ctx.profiles_wb_ai, &a.id),
+        "has_snapshot_codebuddy": slot_exists(&ctx.profiles_cb, &a.id),
+    })
+}
+
+/// buddy-ai 账号列表（脱敏视图见 buddy_ai_account_view）
 #[tauri::command(async)]
 pub fn buddy_ai_accounts_list(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
     let pool = load_buddy_pool(&state);
@@ -319,53 +446,11 @@ pub fn buddy_ai_accounts_list(state: State<'_, AppState>) -> Result<Vec<Value>, 
         .and_then(|t| t.as_object())
         .cloned()
         .unwrap_or_default();
-    // 切换/保存登录态上下文（对齐国内 is_current_* / has_snapshot_* 口径）：
-    // WB 当前 = 国际 auth 文件 uid；CB 当前 = CodeBuddy live storage.json genie.uid；
-    // 快照槽存在性 = 主槽或 .bak 回退槽
-    let ai_auth_uid = crate::switcher::authfile::auth_file_uid(
-        &crate::switcher::authfile::wb_ai_auth_file(),
-    );
-    // CB 当前 = 国际版客户端 live uid（%APPDATA%\CodeBuddy；2026-10-16 修复：
-    // 原误读国内 CodeBuddy CN 的 roaming，徽标/切换目标全部错端）
-    let cb_live_uid = super::accounts::codebuddy_ai_live_uid();
-    let profiles_wb_ai = state.data_dir.join("data").join("profiles_workbuddy_ai");
-    let profiles_cb = state.data_dir.join("data").join("profiles_codebuddy_ai");
-    let slot_exists = |dir: &std::path::Path, id: &str| {
-        dir.join(id).exists() || dir.join(format!("{id}.bak")).exists()
-    };
+    let ctx = BuddyAiViewCtx::load(&state);
     Ok(pool
         .accounts
         .iter()
-        .map(|a| {
-            let rec = tokens.get(&a.id);
-            json!({
-                "id": a.id,
-                "uid": a.uid,
-                "nickname": a.nickname,
-                "note": a.note,
-                "group_id": a.group_id,
-                "access_token_expires_at": a.access_token_expires_at,
-                "refresh_token_expires_at": a.refresh_token_expires_at,
-                "auth_saved_at": a.auth_saved_at,
-                "needs_relogin": a.needs_relogin,
-                "relogin_reason": a.relogin_reason,
-                "disabled": a.disabled,
-                "credits_packages": a.credits_packages,
-                "credits_balance": a.credits_balance,
-                "credits_expire_at": a.credits_expire_at,
-                "credits_fetched_at": a.credits_fetched_at,
-                "has_credential": rec.map(|r| {
-                    as_str(fs_utils::dig(r, &["access_token"]))
-                        .map(|t| !t.is_empty())
-                        .unwrap_or(false)
-                }).unwrap_or(false),
-                "domain": rec.and_then(|r| as_str(fs_utils::dig(r, &["domain"]))).unwrap_or_else(|| INTL_DOMAIN.into()),
-                "is_current_workbuddy": ai_auth_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
-                "is_current_codebuddy": cb_live_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
-                "has_snapshot_workbuddy": slot_exists(&profiles_wb_ai, &a.id),
-                "has_snapshot_codebuddy": slot_exists(&profiles_cb, &a.id),
-            })
-        })
+        .map(|a| buddy_ai_account_view(a, tokens.get(&a.id), &ctx))
         .collect())
 }
 
@@ -401,11 +486,19 @@ pub fn buddy_ai_account_remove(
         return Err(format!("账号不在 buddy-ai 池中: {user_id}"));
     }
     save_buddy_pool(&state, &pool)?;
-    crate::store::docs::token_store_remove(
+    // 审查修复（H5）：三清失败不再整体上抛——原 token_store_remove 失败 `?` 直接
+    // 返回，池条目已删不可逆（重试必得「账号不在池中」），token 行 + vault 敏感值
+    // 永久残留为孤儿，且下方 drop/索引失效/网关热重载全被跳过（已删账号凭证仍可
+    // 被网关取号）。改为收集留痕，清理失败不阻断主流程（对齐下方标签清理仅日志
+    // 惯例）；vault ns_remove 无返回值、refresh_lock_remove 为内存态，均无需收集
+    let mut clean_errs: Vec<String> = Vec::new();
+    if let Err(e) = crate::store::docs::token_store_remove(
         &crate::store::db(&state.data_dir),
         crate::tasks::wb_common::BUDDY_AI_TOKEN_TABLE,
         &user_id,
-    )?;
+    ) {
+        clean_errs.push(format!("token store 行清理失败: {e}"));
+    }
     crate::vault::ns_remove(&state.data_dir, crate::tasks::wb_common::BUDDY_AI_VAULT_NS, &user_id);
     crate::tasks::wb_common::refresh_lock_remove(&user_id);
     fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 移除账号 {user_id}"));
@@ -413,6 +506,15 @@ pub fn buddy_ai_account_remove(
     // 此前不清 account_tags，幽灵绑定只能靠不含 buddy-ai 池的孤儿自愈清——永远清不掉）
     if let Err(e) = crate::store::docs::account_tags_remove_account(&crate::store::db(&state.data_dir), &user_id) {
         fs_utils::app_log(&state.data_dir, &format!("buddy-ai 账号 {user_id} 标签绑定清理失败: {e}"));
+    }
+    if !clean_errs.is_empty() {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "buddy-ai 账号 {user_id} 移除残留（敏感值需手工清理）: {}",
+                clean_errs.join("; ")
+            ),
+        );
     }
     drop(_guard);
     crate::api_server::org_index::invalidate(&state.data_dir);
@@ -779,7 +881,11 @@ pub fn buddy_ai_credits_sync_impl(
     // 运行池三键拨新（issue #109 同类，buddy-ai 国际池）：账号记录已回写，但网关
     // 运行池钉死在装配时刻——expire_first「有过期时间者优先」会恒压池内
     // expire=None 的账号，充值续期后的新到期进不了池。快照缺到期信息时保留池内
-    // 旧值（对齐上方账号记录 expire 仅 Some 才覆盖的口径），余额以本次取数为准
+    // 旧值（对齐上方账号记录 expire 仅 Some 才覆盖的口径），余额以本次取数为准。
+    // 键位复核（审查 H2，2026-10-17 判定假阳性）：buddy-ai 网关装配
+    // （buddy_ai_upstream_accounts）以账号 id 充当条目 uid（区别于国内池的 JWT
+    // sub），status_list 键域与 out 的账号 id 天然同域——按 id 查 current 即命中；
+    // 勿改按 JWT uid 查（会恒 miss 使拨新失效）
     {
         let shared = runtime
             .map(|rt| {
@@ -819,32 +925,20 @@ pub fn buddy_ai_credits_sync_impl(
         ),
     );
     // 返回刷新后的账号视图（前端直接替换列表，免二次拉取）
+    // 审查修复（H7）：复用 buddy_ai_account_view 统一装配——原手写第二份字段表缺
+    // is_current_* / has_snapshot_* 四键（前端替换列表后徽标/快照存在性消失），
+    // domain 字面量亦与 INTL_DOMAIN 常量漂移
     let pool = load_buddy_pool(state);
     let tokens2 = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
         .get("tokens")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let ctx = BuddyAiViewCtx::load(state);
     Ok(pool
         .accounts
         .iter()
-        .map(|a| {
-            let rec = tokens2.get(&a.id).cloned().unwrap_or_default();
-            json!({
-                "id": a.id, "uid": a.uid, "nickname": a.nickname, "note": a.note,
-                "group_id": a.group_id,
-                "access_token_expires_at": a.access_token_expires_at,
-                "refresh_token_expires_at": a.refresh_token_expires_at,
-                "auth_saved_at": a.auth_saved_at,
-                "needs_relogin": a.needs_relogin, "relogin_reason": a.relogin_reason,
-                "disabled": a.disabled,
-                "credits_balance": a.credits_balance, "credits_expire_at": a.credits_expire_at,
-                "credits_fetched_at": a.credits_fetched_at,
-                "credits_packages": a.credits_packages,
-                "has_credential": rec.get("access_token").and_then(Value::as_str).map(|t| !t.is_empty()).unwrap_or(false),
-                "domain": rec.get("domain").and_then(Value::as_str).unwrap_or("www.workbuddy.ai"),
-            })
-        })
+        .map(|a| buddy_ai_account_view(a, tokens2.get(&a.id), &ctx))
         .collect())
 }
 

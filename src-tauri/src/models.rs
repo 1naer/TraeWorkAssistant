@@ -878,6 +878,11 @@ pub struct ApiPoolFile {
     /// buddy-ai 池标签筛选（tag_ 前缀 id）：与分组筛选取交集（D5 池语义）；空 = 不限
     #[serde(default)]
     pub buddy_ai_tag_ids: Vec<String>,
+    /// buddy-ai 池内调度策略（取值同 strategy；空串 = 跟随 Trae 池，与
+    /// wb_strategy / qoder_strategy 同语义）。启动（do_start）与热应用（pool_set）
+    /// 共用 PoolStrategy::resolve_buddy_ai 解析，保证两处行为一致
+    #[serde(default)]
+    pub buddy_ai_strategy: String,
     /// Qwen3.8-Flash 免费活动倍率覆盖（资源调度页模型目录开关，默认开）：
     /// 开启时该模型目录/兜底倍率按 0 处理——/v1/models 展示 0× + 取号豁免
     /// 零积分过滤（issue #111：上游免费活动期 billable=false 不扣分，但
@@ -958,6 +963,7 @@ impl Default for ApiPoolFile {
             buddy_ai_hedge_threshold_ms: default_hedge_threshold_ms(),
             buddy_ai_group_ids: Vec::new(),
             buddy_ai_tag_ids: Vec::new(),
+            buddy_ai_strategy: String::new(),
         }
     }
 }

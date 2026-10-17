@@ -227,6 +227,9 @@ fn board_platform(key: &str) -> Option<&'static str> {
         // F-80 Qoder 看板与 trae/buddy 同款联动：快照任务写入 qoder_credits_cache
         // 与当日历史后，常驻页面需静默重读（审查修复：此前缺映射致 Qoder 看板滞后）
         "qoder-credits-snapshot" => Some("qoder"),
+        // T3 审查修复：buddy-ai 积分同步任务写入 buddy_ai_credits_cache 与池快照
+        // 后，BuddyAi 看板同款联动（此前缺映射致看板数据滞后到下次手动刷新）
+        "buddy-ai-credits-sync" => Some("buddy-ai"),
         _ => None,
     }
 }
@@ -550,8 +553,8 @@ fn run_task(
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
         // Buddy 国际版每日活跃打卡（阶段 3b）：抢轮次锁与 UI 路径互斥（skipped_busy
-        // 幂等跳过同 wb-checkin）；可重试失败返 Err 交 30 分钟冷却重试，永久性
-        // 凭证失败（无凭证/打卡幂等戳已成功）剔除
+        // 幂等跳过同 wb-checkin）；失败返 Err 交 30 分钟冷却重试（401 可经网关自愈，
+        // 不判永久剔除，见下方 T7/BL-5 定调注释）
         "buddy-ai-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_buddy_ai_round() else {
                 return Ok(json!({ "ok": true, "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过", "skipped_busy": true }));
@@ -580,19 +583,13 @@ fn run_task(
                     ),
                 );
             }
-            let failed_permanent = events
-                .iter()
-                .filter(|e| {
-                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
-                    e.get("status").and_then(Value::as_str) == Some("fail")
-                        // 审查修复（BL-5）：仅 HTTP 401（凭证失效）判永久——当日 30
-                        // 分钟冷却重试只会全天重复跑六步链 + 首败通知误报。403 可能
-                        // 是 WAF/风控暂态，保留冷却重试；「无凭证/今日已完成」为死
-                        // 条件删除（前者已被花名册过滤，后者是 already 非 fail）
-                        && m.contains("HTTP 401")
-                })
-                .count() as i64;
-            let retryable = (failed - failed_permanent).max(0);
+            // 审查复审修复（T7/BL-5 冲突定调）：T7 已把 fail 文案中「HTTP 401/403」
+            // 统一改写为「凭证401/403」（buddy_ai_checkin.rs fail 闭包），此处旧
+            // contains("HTTP 401") 过滤恒不命中，且原注释与 T7 语义矛盾。定调采纳
+            // T7 语义：buddy-ai 凭证失效可经网关 401 自愈/续期轮换新值，30 分钟冷却
+            // 重试可能成功——不再有「永久剔除」类失败，全部失败交冷却重试（一旦
+            // 自愈即停；无凭证账号本就被花名册过滤，不会全天空转）
+            let retryable = failed;
             if retryable > 0 {
                 let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
@@ -1130,16 +1127,19 @@ mod tests {
         assert!(matches!(sched_plan(&st, trae_models()), SchedPlan::Skip));
     }
 
-    /// 看板联动平台映射（issue #61 + 审查修复）：三个看板数据任务分别 emit
-    /// buddy/trae/qoder；凭证刷新与签到类任务不属于看板数据同步，不得误 emit
+    /// 看板联动平台映射（issue #61 + 审查修复）：四个看板数据任务分别 emit
+    /// buddy/trae/qoder/buddy-ai；凭证刷新与签到类任务不属于看板数据同步，不得误 emit
     #[test]
     fn board_platform_maps_board_tasks_only() {
         assert_eq!(board_platform("wb-credits-snapshot"), Some("buddy"));
         assert_eq!(board_platform("trae-credits-snapshot"), Some("trae"));
         assert_eq!(board_platform("trae-usage-sync"), Some("trae"));
         assert_eq!(board_platform("qoder-credits-snapshot"), Some("qoder"));
+        assert_eq!(board_platform("buddy-ai-credits-sync"), Some("buddy-ai"));
         assert_eq!(board_platform("qoder-refresh"), None);
         assert_eq!(board_platform("qoder-checkin"), None);
+        assert_eq!(board_platform("buddy-ai-checkin"), None);
+        assert_eq!(board_platform("buddy-ai-renew"), None);
     }
 
     /// 失败退避（issue #66 健壮性④）：无记录/首败 30 分钟起步，连续失败 ×2

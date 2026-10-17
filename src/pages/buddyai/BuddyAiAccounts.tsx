@@ -37,7 +37,7 @@ import type { BuddyAiAccountView, GroupView, TagView, WbCheckinRecord, WbOauthDo
  * BuddyAI（buddy-ai 国际版）账号管理页（P3 对齐国内 Buddy 账号管理）。
  *
  * 列对齐：账号（昵称+uid）/ 分组（共享分组下拉）/ 备注 / 积分 / TOKEN 到期 /
- * 凭证状态 / 启停 / 操作（编辑·启停·续期·移除）+ 批量勾选移除。
+ * 凭证状态 / 操作（切换·保存·续期·编辑·删除）+ 批量勾选移除。
  * 国际不适用项（不展示）：每日目标 / 休假锁单 / 签到策略（intl 打卡为 ACP 链，
  * 无 UI 签到通道与签到点概念）。
  *
@@ -688,7 +688,9 @@ export default function BuddyAiAccounts() {
           <EmptyState
             icon={<Globe size={28} />}
             title="还没有国际版账号"
-            hint="点击「扫码登录」走 workbuddy.ai OAuth，或「导入凭证」手工导入国际账号 token（须为 .workbuddy.ai 域）"
+            /* 审查修复（M9）：引导文案与页面按钮实名对齐（原「扫码登录/导入凭证」
+               均非本页按钮名，用户照提示找不到入口），并补充「扫描本机账号」入口 */
+            hint="点击「OAuth登录」完成 workbuddy.ai 授权自动入池；也可「扫描本机账号」识别本机客户端登录账号，或「导入账号」导入账号池 JSON"
           />
         ) : filteredAccounts.length === 0 ? (
           <div className="flex h-32 items-center justify-center text-sm text-slate-400">当前分组下无账号。</div>
@@ -973,7 +975,7 @@ export default function BuddyAiAccounts() {
             />
             <span>
               附带凭证副本
-              <span className="ml-1 text-xs text-slate-400">（不勾选 = 仅账号清单，导入后需重新登录/导入凭证）</span>
+              <span className="ml-1 text-xs text-slate-400">（不勾选 = 仅账号清单，导入后需重新 OAuth 登录或导入带凭证的账号 JSON）</span>
             </span>
           </label>
           {exportWithCreds ? (
@@ -1044,7 +1046,12 @@ export default function BuddyAiAccounts() {
                 </thead>
                 <tbody>
                   {(pkgTarget.credits_packages ?? []).map((p, i) => {
-                    const soon = p.expire_secs != null && p.expire_secs <= Math.floor(Date.now() / 1000) + 7 * 86400;
+                    /* 审查修复（U8）：补「未过期」判断——原实现已过期包（expire_secs
+                       <= now）也命中 soon 被标「7 日内到期」，语义失真；对齐列表行
+                       soonestExpire（L727 附近）口径：仅「未过期且 7 日内到期」标记 */
+                    const nowSecs = Math.floor(Date.now() / 1000);
+                    const soon =
+                      p.expire_secs != null && p.expire_secs > nowSecs && p.expire_secs <= nowSecs + 7 * 86400;
                     return (
                       <tr key={i} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
                         <td className="py-1.5 pr-2">
@@ -1209,7 +1216,7 @@ export default function BuddyAiAccounts() {
               ) : (
                 <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
                   本机登录账号尚未入池。国际版凭证存于客户端加密 vault（不可提取明文），
-                  请在本机客户端保持该账号登录，然后点「扫码登录」完成 OAuth 授权入池。
+                  请在本机客户端保持该账号登录，然后在账号管理页点「OAuth登录」完成授权入池。
                 </div>
               )}
             </>

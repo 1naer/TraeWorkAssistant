@@ -353,7 +353,10 @@ export default function BuddyAiOverview() {
             <p className="text-xs text-slate-500">按步骤完成初始化，已完成的步骤无需重复处理。</p>
           </div>
           <Badge tone={allDone ? 'green' : 'amber'}>
-            {completed}/{steps.length} 已完成
+            {/* 审查修复（U 系列）：分子只计必选步骤，分母同步改为 required.length——
+                原分母 steps.length 含可选步骤，未开调度时显示「4/5 已完成」却配
+                绿色 allDone 徽标，完成度口径自相矛盾 */}
+            {completed}/{required.length} 已完成
           </Badge>
         </div>
         <ol className="divide-y divide-slate-100 dark:divide-slate-800">

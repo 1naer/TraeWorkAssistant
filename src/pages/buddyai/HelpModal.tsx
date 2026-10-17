@@ -15,11 +15,13 @@ export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: ()
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
             <li>
-              <b>添加账号</b>：点右上角「扫码登录」走 workbuddy.ai OAuth 自动入池；或「导入凭证」手工粘贴国际账号
-              access_token / refresh_token（须为 .workbuddy.ai 域，国内账号会被区域校验拒绝）。
+              {/* 审查修复（M9 同款）：原「扫码登录/导入凭证」均非本页按钮实名，且「手工粘贴 token」
+                  机制不存在（导入仅接受账号池 JSON 文件），照帮助操作会找不到入口 */}
+              <b>添加账号</b>：点右上角「OAuth登录」走 workbuddy.ai 授权自动入池；「扫描本机账号」识别本机客户端
+              登录账号；或「导入账号」导入账号池 JSON（凭证须为 .workbuddy.ai 域，国内账号会被区域校验拒绝）。
             </li>
             <li>
-              <b>同步积分</b>：到「积分看板」点「同步积分」拉取各账号余额与积分包明细。
+              <b>同步积分</b>：到「积分看板」点「刷新数据」拉取各账号余额与积分包明细。
             </li>
             <li>
               <b>开启调度</b>：到「资源调度」打开 buddy-ai 国际档，独立池参与统一网关路由（与国内档互不影响）。
@@ -29,10 +31,11 @@ export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: ()
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <LogIn size={15} className="text-amber-500" /> 扫码登录（OAuth）
+            {/* 审查修复（M9 同款）：章节标题与正文引用按钮实名「OAuth登录」（原「扫码登录」非实名） */}
+            <LogIn size={15} className="text-amber-500" /> OAuth登录（扫码授权）
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击「扫码登录」，应用自动打开浏览器完成 workbuddy.ai
+            点击「OAuth登录」，应用自动打开浏览器完成 workbuddy.ai
             授权，成功后自动解析凭证并入池（凭证仅写入本地 token store，全程掩码不上传）。浏览器未自动打开时，弹框内可「复制完整链接」手动打开；超过
             5 分钟未收到结果会自动解除等待，最终结果以账号列表为准。
           </p>
@@ -40,12 +43,14 @@ export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: ()
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <KeyRound size={15} className="text-amber-500" /> 导入凭证 / 凭证续期
+            {/* 审查修复（M9 同款）：章节标题与正文对齐按钮实名「导入账号」，并纠正机制描述
+                （导入仅接受账号池 JSON 文件，非手工粘贴 token） */}
+            <KeyRound size={15} className="text-amber-500" /> 导入账号 / 凭证续期
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            「导入凭证」接受手工粘贴的国际账号 token（access_token 必填、refresh_token
+            「导入账号」接受「导出账号」生成的账号池 JSON（access_token 必填、refresh_token
             选填——缺失则不可自动续期）。行内「续期」用 refreshToken 换新 accessToken；网关 401 / token
-            临期时也会自动走 workbuddy.ai 刷新端点轮换（每账号刷新锁互斥，rt 轮换防覆盖）。带「需重新登录」标记的账号凭证已失效，续期无法恢复——需重新扫码登录或导入新凭证。
+            临期时也会自动走 workbuddy.ai 刷新端点轮换（每账号刷新锁互斥，rt 轮换防覆盖）。带「需重新登录」标记的账号凭证已失效，续期无法恢复——需重新 OAuth 登录或导入新账号 JSON。
           </p>
         </section>
 
@@ -67,7 +72,7 @@ export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: ()
             <Coins size={15} className="text-amber-500" /> 积分看板
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            「同步积分」经 workbuddy.ai get-user-resource 实时取数：余额 / 积分包明细（分包剩余与到期）/ 90 天趋势 /
+            「刷新数据」经 workbuddy.ai get-user-resource 实时取数：余额 / 积分包明细（分包剩余与到期）/ 90 天趋势 /
             Token 统计（网关记账 buddy-ai 档）/ 请求明细（官网请求级流水）。账号管理页积分单元格可点开查看该账号积分包明细。
           </p>
         </section>
@@ -87,7 +92,7 @@ export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: ()
             <RefreshCw size={15} className="text-amber-500" /> 启停与批量操作
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            行内「启停」控制账号是否参与打卡花名册与网关取号（停用不影响凭证存储）；勾选多行可「批量移除」（逐项容错，失败项可重试）；「导出账号」默认脱敏，附带凭证副本需强确认——导出文件等同密码。
+            账号是否参与打卡花名册与网关取号由「资源调度」页账号池勾选控制（停用不影响凭证存储）；勾选多行可「批量移除」（逐项容错，失败项可重试）；「导出账号」默认脱敏，附带凭证副本需强确认——导出文件等同密码。
           </p>
         </section>
 

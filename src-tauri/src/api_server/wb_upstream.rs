@@ -565,11 +565,38 @@ pub fn refresh_access_token(
             }
             rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        // 凭证收敛（P0-1）：secure upsert（敏感字段进 vault、DB 占位；失败仅日志——
-        // 401 刷新是网关后台路径，报错无 UI 可达，且下一次刷新会重试收敛）
-        if let Err(e) = crate::tasks::wb_common::token_store_upsert_secure(data_dir, account_id, &r)
-        {
-            fs_utils::app_log(data_dir, &format!("wb 网关刷新回写失败（已落占位）: {e}"));
+        // 凭证收敛（P0-1）：secure upsert（敏感字段进 vault、DB 占位）。
+        // 审查修复（M10）：回写失败原实现仅日志并照常返回新 token——刷新端点可能
+        // 一次性轮换 refresh_token，新 rt 只存在于本函数局部变量，返回 Ok 即随栈帧
+        // 永久丢失：下一轮 401 用 store 里的旧 rt 刷新必然失败，账号被迫重新登录。
+        // 修复：先退避重试消化 vault/DB 瞬时故障；重试耗尽后按 rt 是否被轮换分流——
+        // 已轮换 → 上抛 Err（调用方换号/禁用是正确语义，该账号下次刷新注定失败）；
+        // 未轮换 → 仅丢 access 更新，下轮 401 重新刷新即可自愈，维持仅日志（原场景）
+        let mut upsert_err: Option<String> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+            }
+            match crate::tasks::wb_common::token_store_upsert_secure(data_dir, account_id, &r) {
+                Ok(()) => {
+                    upsert_err = None;
+                    break;
+                }
+                Err(e) => upsert_err = Some(e),
+            }
+        }
+        if let Some(e) = upsert_err {
+            let rt_rotated = new_refresh
+                .as_deref()
+                .is_some_and(|nr| !nr.is_empty() && nr != refresh);
+            let msg = format!("wb 网关刷新回写失败（重试 3 次后）: {e}");
+            if rt_rotated {
+                let fatal =
+                    format!("{msg}；refresh token 已被服务端轮换且无法持久化，账号需重新登录");
+                fs_utils::app_log(data_dir, &fatal);
+                return Err(fatal);
+            }
+            fs_utils::app_log(data_dir, &msg);
         }
     }
     Ok(new_access)
@@ -699,10 +726,35 @@ fn refresh_access_token_intl(
             }
             rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        // secure upsert（敏感字段进 buddy-ai vault 命名空间、DB 占位）；失败仅日志
-        //（401 刷新是网关后台路径，报错无 UI 可达，下一次刷新会重试收敛）
-        if let Err(e) = buddy_ai_token_store_upsert(data_dir, account_id, &r) {
-            fs_utils::app_log(data_dir, &format!("buddy-ai 网关刷新回写失败（已落占位）: {e}"));
+        // secure upsert（敏感字段进 buddy-ai vault 命名空间、DB 占位）。
+        // 审查修复（M10）：同 CN 版——回写失败不能仅日志后照常返回新 token，
+        // rt 被服务端轮换且未落盘时新 rt 随栈帧丢失、账号被迫重登；先退避重试，
+        // 重试耗尽后按 rt 是否轮换分流（已轮换上抛 Err，未轮换仅日志可自愈）
+        let mut upsert_err: Option<String> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+            }
+            match buddy_ai_token_store_upsert(data_dir, account_id, &r) {
+                Ok(()) => {
+                    upsert_err = None;
+                    break;
+                }
+                Err(e) => upsert_err = Some(e),
+            }
+        }
+        if let Some(e) = upsert_err {
+            let rt_rotated = new_refresh
+                .as_deref()
+                .is_some_and(|nr| !nr.is_empty() && nr != refresh);
+            let msg = format!("buddy-ai 网关刷新回写失败（重试 3 次后）: {e}");
+            if rt_rotated {
+                let fatal =
+                    format!("{msg}；refresh token 已被服务端轮换且无法持久化，账号需重新登录");
+                fs_utils::app_log(data_dir, &fatal);
+                return Err(fatal);
+            }
+            fs_utils::app_log(data_dir, &msg);
         }
     }
     Ok(new_access)

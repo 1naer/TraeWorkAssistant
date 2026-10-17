@@ -577,6 +577,19 @@ fn apply_native_risk_headers(h: &mut Vec<(String, String)>, n: &NativeRiskIdenti
     }
 }
 
+/// 头值 ASCII 净化（issue #116）：头值仅接受 ASCII 可见字符，计算机名含中文等
+/// 非 ASCII 时 `Cosy-MachineHostname` 会在发包前被 ureq 拒绝（Bad Header →
+/// status=0 网络不可达，请求根本没发出去）。保留 0x21..=0x7E 可见 ASCII，
+/// 过滤非 ASCII/控制字符/空白；净化后为空回退 "PC"（与 env 缺省一致）。
+fn sanitize_header_ascii(s: &str) -> String {
+    let cleaned: String = s.chars().filter(char::is_ascii_graphic).collect();
+    if cleaned.is_empty() {
+        "PC".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// 按客户端 openapi 域实测形态补齐设备描述头（proxy 抓包 2026-10-07 12:35，客户端
 /// 0.4.3 对全部 openapi 请求携带：cosy-version / cosy-machineos / cosy-machinehostname
 /// / cosy-machinecode / cosy-machinetype + 原生 cosy-machinetoken）。
@@ -594,7 +607,9 @@ fn extend_device_headers_with(
     let has = |h: &[(String, String)], k: &str| {
         h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
     };
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string());
+    // issue #116：计算机名真值经 ASCII 净化后再入头
+    let hostname =
+        sanitize_header_ascii(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string()));
     for (k, v) in [
         ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
         ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
@@ -1551,6 +1566,18 @@ mod tests {
         let mut h2 = vec![("Cosy-MachineCode".to_string(), "keep".to_string())];
         extend_device_headers_with(&mut h2, &c, None);
         assert!(h2.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "keep"));
+    }
+
+    /// issue #116：计算机名含中文等非 ASCII 时头值必须净化为可见 ASCII
+    ///（否则 ureq 发包前报 Bad Header，请求未发出 → status=0 网络不可达）
+    #[test]
+    fn sanitize_header_ascii_filters_non_ascii_and_falls_back() {
+        assert_eq!(sanitize_header_ascii("DESKTOP-ABC123"), "DESKTOP-ABC123");
+        assert_eq!(sanitize_header_ascii("我的PC-01"), "PC-01");
+        assert_eq!(sanitize_header_ascii("中文机器名"), "PC", "全非 ASCII 回退默认值");
+        assert_eq!(sanitize_header_ascii(""), "PC");
+        // 控制字符与空白同属头值校验拒绝面，一并过滤
+        assert_eq!(sanitize_header_ascii("ab\tc d"), "abcd");
     }
 
     /// runtime-info.exe stdout 解析：容忍 '.' 终止符（客户端桥分段语义）、拒绝空值

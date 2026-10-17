@@ -1587,6 +1587,10 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         // 四桶对称（审查修复清单 v1.4.9 B8）：漏 Qoder 桶会使 JSON→SQLite 迁移时
         // Qoder 历史用量整表丢弃（api_usage_load 侧 bucket_map_mut 四桶齐全）
         (UsageBucket::Qoder, &f.qoder_days),
+        // 审查修复（M8，国际版）：漏 BuddyAi 桶同因——save 侧丢桶会让
+        // api_usage_load→save 往返及迁移导入静默清空 buddy-ai 历史用量
+        //（load 侧 bucket_map_mut 五桶齐全，save 侧必须对称）
+        (UsageBucket::BuddyAi, &f.buddy_ai_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {

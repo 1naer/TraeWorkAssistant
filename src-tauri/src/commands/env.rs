@@ -302,6 +302,11 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
                 "%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe",
             ],
             proc_names: &["CodeBuddy", "CodeBuddy CN"],
+            // W7 审查注记（2026-10-16 并存实测）：proc_names 仅第 4 级探测消费，而
+            // CN 在盘时 exe_candidates 首位必先命中——"CodeBuddy" 映像名在并存布局
+            // 下归属国际版的交叉仅影响 CN exe 缺失的极端现场（此时机器只装了国际
+            // 端，兜底认国际 exe 是唯一可用语义）；运行态归属仲裁见 is_running_codebuddy
+            // 的 codebuddy_cn_installed 收窄与切换器侧 ImageArk（switcher/profile.rs）
             user_data_dir: format!("{home}\\.codebuddy"),
             settings_key: Some("codebuddy_path"),
         },
@@ -373,9 +378,11 @@ pub fn open_workbuddy_ai_app(state: State<AppState>, proxy_port: Option<u16>) ->
 }
 
 /// 打开 CodeBuddy AI 国际客户端（buddy-ai 应用上下文；探测同 codebuddy 目录）。
+/// 审查修复（M6）：kill_kind 传 "CodeBuddy AI"（映像表仅国际 CodeBuddy.exe），
+/// 原传 "CodeBuddy" 在双客户端并存时会连带关闭国内 "CodeBuddy CN.exe" 实例。
 #[tauri::command(async)]
 pub fn open_codebuddy_ai_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    open_buddy_app(&state, "codebuddy_ai", "CodeBuddy AI", proxy_port, "CodeBuddy")
+    open_buddy_app(&state, "codebuddy_ai", "CodeBuddy AI", proxy_port, "CodeBuddy AI")
 }
 
 /// 打开 WorkBuddy 桌面版：复用 app_locate workbuddy 档案四级探测取 exe。
@@ -464,9 +471,30 @@ pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
 
 /// CodeBuddy 进程检测：同时覆盖通用形态 CodeBuddy.exe 与本机实测的 "CodeBuddy CN.exe"。
 /// 原实现逐个名字跑 tasklist 子进程（未运行时 2 次 ≈ 520ms），改 sysinfo 进程表一次枚举
-/// （见 `switcher::proc::any_running`）
+/// （见 `switcher::proc::any_running`）。
+/// 审查修复（W8，2026-10-16 双客户端并存实测）：CN 拆分形态在盘时只认 "CodeBuddy CN"——
+/// 映像名 "CodeBuddy" 被国际版客户端与国内老单安装共用，并存时国际进程在跑会让
+/// 国内环境检测误报 running=true；CN 不在盘（老单安装布局）保持两形态全认。
 fn is_running_codebuddy() -> bool {
-    crate::switcher::proc::any_running(&["CodeBuddy CN", "CodeBuddy"])
+    if codebuddy_cn_installed() {
+        crate::switcher::proc::any_running(&["CodeBuddy CN"])
+    } else {
+        crate::switcher::proc::any_running(&["CodeBuddy CN", "CodeBuddy"])
+    }
+}
+
+/// CN 拆分形态安装判定（exe 候选首位同款路径）：用于区分共用映像名 "CodeBuddy"
+/// 的归属——在盘 = 并存布局，国际进程属国际版；不在盘 = 老单布局，归国内。
+fn codebuddy_cn_installed() -> bool {
+    std::env::var("LOCALAPPDATA")
+        .map(|l| {
+            std::path::Path::new(&l)
+                .join("Programs")
+                .join("CodeBuddy CN")
+                .join("CodeBuddy CN.exe")
+                .is_file()
+        })
+        .unwrap_or(false)
 }
 
 /// 兜底两级（注册表搜索 / 进程反查）结果短 TTL 缓存（P1 去重）。

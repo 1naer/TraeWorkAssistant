@@ -77,7 +77,7 @@ export default function ApiManagerModal() {
       {/* 豆包视图说明（§5.2：仅概览 Tab 顶部展示） */}
       {activeApp === 'doubao' && tab === 'overview' && (
         <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-300/70 bg-amber-50/80 px-3 py-2 text-xs text-amber-800 dark:border-amber-700/40 dark:bg-amber-900/10 dark:text-amber-200">
-          豆包不提供网关资源，以下为 Trae / Buddy / Qoder 资源池
+          豆包不提供网关资源，以下为 Trae / Buddy / BuddyAI 国际 / Qoder 资源池
         </div>
       )}
 

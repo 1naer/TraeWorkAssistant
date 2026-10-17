@@ -235,6 +235,20 @@ fn result_ev(id: &str, name: &str, status: &str, message: &str) -> Value {
     json!({ "id": id, "name": name, "status": status, "message": message })
 }
 
+/// SSE 读线程停机哨兵（M2 审查修复）：宿主流程（process_account）结束时 drop
+/// 置位停机旗标，读线程在每行循环头检查旗标退出。覆盖双泄漏场景——
+/// ① 阻塞 read 永不返回（服务端不发数据也不关流）→ sse_agent timeout_read(240s)
+///    兜底强制返回（240s > COMPLETE_TIMEOUT_SECS，不误断活跃 turn 静默期）；
+/// ② keepalive 注释行（`:ping`）走 continue 分支永不触碰 send 检测 → 循环头
+///    旗标检查兜底。
+struct SseShutdownGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SseShutdownGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// 单账号打卡全链（§4.5 补篇 ①-⑥）。返回事件；幂等戳成功才落盘（不成功不记打卡）。
 #[allow(clippy::too_many_lines)]
 fn process_account(
@@ -247,7 +261,20 @@ fn process_account(
     base: &str,
     emit: &mut dyn FnMut(&Value),
 ) -> Value {
-    let fail = |m: String| result_ev(acct_id, nickname, "fail", &m);
+    // T7 审查修复：fail 文案统一改写「HTTP 401/403」→「凭证401/403」。调度器
+    // failed_permanent 按 fail 消息含「HTTP 401」子串判 permanent 当日剔除；
+    // buddy-ai 凭证失效可经网关 401 自愈/续期轮换新值（六步链已用锁内最新凭证），
+    // 30 分钟冷却重试可能成功，不应判 permanent——改写子串即归一（BL-5 意图
+    // 随 M3/P1 修正）。原文细节不受影响：轮询异常已先行 app_log 明文落盘
+    let fail = |m: String| {
+        result_ev(
+            acct_id,
+            nickname,
+            "fail",
+            &m.replace("HTTP 401", "凭证401")
+                .replace("HTTP 403", "凭证403"),
+        )
+    };
 
     // 幂等戳：token rec `last_daily_chat`（本地日期；成功才落盘）。
     // 读段持每账号刷新锁：打卡与网关 401 自愈/手动续期共享一把锁（R-2a rt 轮换
@@ -344,8 +371,12 @@ fn process_account(
     // SSE GET 用无整体超时的专用 agent（2026-10-16 二号账号 stuck working 整改）：
     // 流由读线程持续消费（读线程 detached，阻塞的是它自己不是打卡线程），
     // acp_agent 的 30s 整体超时会在读线程 30s 后掐断 SSE → turn 被服务端中止。
+    // M2 审查修复：补 timeout_read——原实现仅 timeout_connect，读线程 read_line
+    // 在服务端既不发数据也不关流时永久阻塞（线程+socket 泄漏）。240s 大于
+    // COMPLETE_TIMEOUT_SECS(180)：活跃 turn 最长静默期不会误断
     let sse_agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(240))
         .build();
     let acp_agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(15))
@@ -378,17 +409,27 @@ fn process_account(
     // 首个 allow 选项、其余回 -32601）防 turn 挂死；RPC 错误回执落 app.log。
     // 连接存活由读线程的阻塞 read 天然维持（EOF/服务端关闭才退出）。
     let (acp_ev_tx, acp_ev_rx) = std::sync::mpsc::channel::<String>();
+    // M2 审查修复：停机哨兵存活到 process_account 返回（含各 fail 早退路径），
+    // drop 置位后读线程在下一次 read 返回时退出
+    let sse_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _sse_stop_guard = SseShutdownGuard(sse_stop.clone());
     {
         let rd_link = link.clone();
         let rd_conn = conn_id.clone();
         let rd_token = sandbox_token.clone();
         let rd_agent = acp_agent.clone();
         let rd_data_dir = state.data_dir.clone();
+        let rd_stop = sse_stop.clone();
         std::thread::spawn(move || {
             use std::io::BufRead;
             let mut reader = std::io::BufReader::new(sse_resp.into_reader());
             let mut line = String::new();
             loop {
+                // M2：循环头检查停机旗标——keepalive 注释行走 continue 永不触碰
+                // send 检测，宿主流程结束后线程原可无限存活
+                if rd_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
@@ -503,8 +544,17 @@ fn process_account(
                 // 4xx 诊断：响应体落 app.log（BackoffErr::Status 只带 code 丢失 body，
                 // Accept/Origin 修复是否命中需原文佐证）
                 Err(ureq::Error::Status(code, resp)) => {
-                    if let Ok(body) = resp.into_string() {
-                        let head: String = body.chars().take(600).collect();
+                    // T6 审查修复：4xx 响应体可能携带沙箱凭证（token/link 等），
+                    // JSON 形态先经 trim_json 脱敏截断再落盘；非 JSON 文本回退原
+                    // 口径（chars().take(600) 按字符截断，无 panic 风险）
+                    let head = match resp.into_string() {
+                        Ok(body) => match serde_json::from_str::<Value>(&body) {
+                            Ok(v) => trim_json(&v),
+                            Err(_) => body.chars().take(600).collect(),
+                        },
+                        Err(_) => String::new(),
+                    };
+                    if !head.is_empty() {
                         crate::fs_utils::app_log(
                             &state.data_dir,
                             &format!("buddy-ai: ACP {method} HTTP {code} 响应体：{head}"),
@@ -599,8 +649,10 @@ fn process_account(
                     );
                     first_poll_err = Some(e.clone());
                 }
-                // 凭证失效早退（审查修复）：401/403 空转满 180s 无意义，且 fail
-                // 文案含「HTTP 401」会被调度器判 permanent 当日剔除——明示可续期
+                // 凭证失效早退（审查修复）：401/403 空转满 180s 无意义，直接退出
+                // 交 30 分钟冷却重试（凭证续期/401 自愈后新值可成功）。last_status
+                // 携带的「HTTP 401」原文会经 fail 闭包改写为「凭证401」（T7），
+                // 不触发调度器 failed_permanent；原始错误已 app_log 佐证
                 if e.contains("HTTP 401") || e.contains("HTTP 403") {
                     last_status = format!("轮询凭证失效（{e}）");
                     break;
@@ -646,6 +698,13 @@ fn process_account(
         .and_then(|t| t.get(acct_id))
         .cloned()
         .unwrap_or_else(|| rec.clone());
+    // T5 审查修复：serde_json IndexMut 对 Null 自动转 Object 安全，但对
+    // Array/Number/String/Bool panic——token store 遭手动改动损坏为非对象时
+    // panic 会沿 process_account 杀掉整轮打卡线程；损坏记录本就不可信，
+    // 重置空对象仅保幂等戳语义（upsert 以此行整体覆盖）
+    if !new_rec.is_object() {
+        new_rec = json!({});
+    }
     new_rec["last_daily_chat"] = json!(today_stamp());
     if let Err(e) = crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, acct_id, &new_rec) {
         return fail(format!("打卡幂等戳落盘失败（记为未完成防假打卡）：{e}"));
@@ -900,8 +959,11 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
             !(today_row && (replace_uids.contains(&uid) || already_only_uids.contains(&uid)))
         });
         for e in &events {
-            // 当日已有成功行的账号：already 事件跳过不落（保留 success+reward 行）
-            if e.get("status").and_then(Value::as_str) == Some("already")
+            // T2 审查修复：与上方 replace_uids 过滤口径对齐——当日已有 success 行时，
+            // 迟到 fail 事件同样跳过不落（否则旧行保留 + fail 行新增 = 同 uid 同日
+            // 双行，前端趋势/日历按行取数语义漂移）
+            let st = e.get("status").and_then(Value::as_str);
+            if (st == Some("already") || st == Some("fail"))
                 && success_today.contains(&ev_uid(e))
             {
                 continue;
@@ -925,6 +987,11 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
                 .and_then(Value::as_str)
                 .map_or(false, |d| d >= cutoff.as_str())
         });
+        // T5 审查修复：docs 文件损坏为非对象时 IndexMut panic——重建空对象，
+        // 当轮 results 照常落库（旧行本就不可解析）
+        if !root.is_object() {
+            root = json!({});
+        }
         root["results"] = Value::Array(merged);
         if let Err(err) = crate::store::docs::buddy_ai_checkin_results_save(&db, &root) {
             crate::fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 打卡结果落库失败: {err}"));

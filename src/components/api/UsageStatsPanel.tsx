@@ -1,8 +1,11 @@
 /**
  * 全局 API 管理 · 用量统计（unified-api-gateway-design §5.2/§5.3）
- * days（Trae 桶）/ wb_days（Buddy 桶）/ custom_days（自定义模型桶）/ qoder_days（Qoder 桶）
- * 四桶聚合，参数化资源池筛选（全部/Trae/Buddy/Qoder/自定义）；含模型分布 Top5（按所选池聚合）。
- * 数据源：api_usage_stats / api_wb_usage_stats / api_custom_usage_stats / api_qoder_usage_stats
+ * days（Trae 桶）/ wb_days（Buddy 桶）/ buddy_ai_days（BuddyAI 桶）/
+ * custom_days（自定义模型桶）/ qoder_days（Qoder 桶）
+ * 五桶聚合，参数化资源池筛选（全部/Trae/Buddy/BuddyAI/Qoder/自定义）；
+ * 含模型分布 Top5（按所选池聚合）。
+ * 数据源：api_usage_stats / api_wb_usage_stats / api_buddy_ai_usage_stats /
+ * api_custom_usage_stats / api_qoder_usage_stats
  * （落盘数据，服务未运行也可查看，口径与键名不变 §9.6）。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -23,13 +26,14 @@ import { fmtTokens } from '../../lib/format';
 import { cn } from '../../lib/cn';
 import type { UsageCounterView, UsageDayView, UsageKeyTokenView, UsageModelLatencyView } from '../../types';
 
-/** 资源池筛选（§5.2：全部/Trae/Buddy/Qoder/自定义模型） */
-export type PoolFilter = 'all' | 'trae' | 'buddy' | 'qoder' | 'custom';
+/** 资源池筛选（§5.2：全部/Trae/Buddy/BuddyAI 国际/Qoder/自定义模型） */
+export type PoolFilter = 'all' | 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
 
 const FILTER_LABELS: Record<PoolFilter, string> = {
   all: '全部',
   trae: 'Trae',
   buddy: 'Buddy',
+  'buddy-ai': 'BuddyAI',
   qoder: 'Qoder',
   custom: '自定义',
 };
@@ -158,6 +162,7 @@ export default function UsageStatsPanel() {
   const [filter, setFilter] = useState<PoolFilter>('all');
   const [traeUsage, setTraeUsage] = useState<UsageDayView[]>([]);
   const [buddyUsage, setBuddyUsage] = useState<UsageDayView[]>([]);
+  const [buddyAiUsage, setBuddyAiUsage] = useState<UsageDayView[]>([]);
   const [customUsage, setCustomUsage] = useState<UsageDayView[]>([]);
   const [qoderUsage, setQoderUsage] = useState<UsageDayView[]>([]);
   const [loading, setLoading] = useState(false);
@@ -165,14 +170,16 @@ export default function UsageStatsPanel() {
   const load = async (d: number) => {
     setLoading(true);
     try {
-      const [trae, buddy, custom, qoder] = await Promise.all([
+      const [trae, buddy, buddyAi, custom, qoder] = await Promise.all([
         api.apiServer.usageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.wbUsageStats(d).catch(() => [] as UsageDayView[]),
+        api.apiServer.buddyAiUsageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.customUsageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.qoderUsageStats(d).catch(() => [] as UsageDayView[]),
       ]);
       setTraeUsage(trae);
       setBuddyUsage(buddy);
+      setBuddyAiUsage(buddyAi);
       setCustomUsage(custom);
       setQoderUsage(qoder);
     } finally {
@@ -189,10 +196,11 @@ export default function UsageStatsPanel() {
   const usage = useMemo(() => {
     if (filter === 'trae') return traeUsage;
     if (filter === 'buddy') return buddyUsage;
+    if (filter === 'buddy-ai') return buddyAiUsage;
     if (filter === 'qoder') return qoderUsage;
     if (filter === 'custom') return customUsage;
-    return mergeBuckets(traeUsage, buddyUsage, qoderUsage, customUsage);
-  }, [filter, traeUsage, buddyUsage, qoderUsage, customUsage]);
+    return mergeBuckets(traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage);
+  }, [filter, traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage]);
 
   // 汇总（跨天聚合）+ 图表数据（与原页面统计逻辑一致，纯搬移）
   const summary = useMemo(() => {
@@ -266,7 +274,7 @@ export default function UsageStatsPanel() {
 
   const filterHint =
     filter === 'all'
-      ? 'Trae + Buddy + Qoder + 自定义 四桶聚合'
+      ? 'Trae + Buddy + BuddyAI + Qoder + 自定义 五桶聚合'
       : filter === 'custom'
         ? '仅自定义模型桶'
         : `仅 ${FILTER_LABELS[filter]} 桶`;

@@ -188,18 +188,21 @@ pub async fn do_start(
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
     let buddy_ai_pool = ApiPool::new();
-    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    // 冷却/禁用标记落 app.log（F-80）：四池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
     buddy_ai_pool.set_log_ctx(&state.data_dir, "buddy-ai");
-    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
-    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时四池应用
+    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置。
+    // M3 审查修复：buddy-ai 池补齐——原先冷启动漏设，调度策略保存前启动的服务
+    // 国际档不过滤低余额账号，与 dispatch_policy_set 热应用「四池即时生效」不一致）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
     pool.set_reserve_credits(reserve_credits);
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
+    buddy_ai_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
         apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &buddy_ai_pool);
 
@@ -241,6 +244,25 @@ pub async fn do_start(
             pool_file.qoder_enabled,
             qoder_count,
             qoder_strategy.as_str(),
+        ),
+    );
+
+    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，
+    // 与 Buddy/Qoder 池同语义；开关默认 false，未启用时不产生告警噪音）
+    let buddy_ai_strategy = crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
+        &pool_file.strategy,
+        &pool_file.buddy_ai_strategy,
+    );
+    buddy_ai_pool.set_strategy(buddy_ai_strategy);
+    // G7 审查修复：补 accounts 计数——WB/Qoder 池启动日志均带账号数，buddy-ai 池
+    // 原先只记开关与策略，导入/同步是否落号无法从启动日志确认（排查盲区）
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-BuddyAI国际池: enabled={} accounts={} strategy={}",
+            pool_file.buddy_ai_enabled,
+            buddy_ai_pool.count(),
+            buddy_ai_strategy.as_str(),
         ),
     );
 
@@ -341,6 +363,8 @@ pub async fn do_start(
         usage_dirty: Mutex::new(Vec::new()),
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         // Trae 401 自愈回调（issue #27 方案 B）：网关层无 AppState，闭包借 AppHandle
         // 每次取 State 调 refresh_jwt_impl(force=true)（全防护：锁/冷却/轮换/失效标记）
         trae_jwt_refresh: Some({
@@ -1104,6 +1128,8 @@ fn merge_pool_set(
         buddy_ai_hedge_threshold_ms: existing.buddy_ai_hedge_threshold_ms,
         buddy_ai_group_ids: existing.buddy_ai_group_ids.clone(),
         buddy_ai_tag_ids: existing.buddy_ai_tag_ids.clone(),
+        // buddy-ai 池内调度策略：pool_set 命令在 merge 后追加应用
+        buddy_ai_strategy: existing.buddy_ai_strategy.clone(),
     }
 }
 
@@ -1172,6 +1198,8 @@ pub fn pool_set(
     // buddy-ai 池分组/标签筛选；None = 保留原值，Some(list) = 覆盖
     buddy_ai_group_ids: Option<Vec<String>>,
     buddy_ai_tag_ids: Option<Vec<String>>,
+    // buddy-ai 池内调度策略（空串 = 跟随 Trae 池）；None = 保留原值
+    buddy_ai_strategy: Option<String>,
     // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
     // （与分组筛选取交集，D5 池语义）
     trae_tag_ids: Option<Vec<String>>,
@@ -1257,6 +1285,11 @@ pub fn pool_set(
     if let Some(v) = buddy_ai_tag_ids {
         pool_file.buddy_ai_tag_ids = v;
     }
+    // buddy-ai 池内调度策略（merge 后追加应用，对齐 buddy_ai_* 先例：
+    // merge_pool_set 纯函数签名不动，存量单测零改动）
+    if let Some(v) = buddy_ai_strategy {
+        pool_file.buddy_ai_strategy = v;
+    }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
     // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
@@ -1270,6 +1303,13 @@ pub fn pool_set(
         // Qoder 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
         rt.shared.qoder_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy),
+        );
+        // buddy-ai 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
+        rt.shared.buddy_ai_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
+                &pool_file.strategy,
+                &pool_file.buddy_ai_strategy,
+            ),
         );
         // per-pool 三参数热应用（F-76②/F-77 拆分版）：并发上限 / 池粘性 TTL /
         // 显式会话粘性 TTL 三池各自生效
@@ -1407,6 +1447,18 @@ pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
     let guard = safe_lock(&runtime);
     match guard.as_ref() {
         Some(rt) => rt.shared.qoder_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 返回运行中 Buddy 国际版（buddy-ai）池的实时状态（全局 API 管理·API Keys
+/// 调度配置候选 + 摘要卡可观测，含 per-account inflight 在途计数）；
+/// 服务未运行时返回空数组
+#[tauri::command]
+pub fn buddy_ai_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.buddy_ai_pool.status_list(),
         None => vec![],
     }
 }
@@ -1841,13 +1893,16 @@ pub fn dispatch_policy_set(
     policy: crate::api_server::dispatch::DispatchPolicy,
 ) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
     crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
-    // 账号保留剩余积分（issue #91）热应用：保存后三池即时生效
+    // 账号保留剩余积分（issue #91）热应用：保存后四池即时生效
     //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared.pool.set_reserve_credits(policy.reserve_credits);
         rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
         rt.shared
             .qoder_pool
+            .set_reserve_credits(policy.reserve_credits);
+        rt.shared
+            .buddy_ai_pool
             .set_reserve_credits(policy.reserve_credits);
     }
     Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
@@ -2140,6 +2195,7 @@ mod pool_merge_tests {
             buddy_ai_hedge_threshold_ms: 8000,
             buddy_ai_group_ids: Vec::new(),
             buddy_ai_tag_ids: Vec::new(),
+            buddy_ai_strategy: "credit_first".into(),
         }
     }
 
@@ -2188,6 +2244,8 @@ mod pool_merge_tests {
         assert_eq!(m.qoder_hedge_threshold_ms, 4000);
         assert!(m.qoder_sticky_enabled);
         assert!(m.trae_enabled);
+        // buddy-ai 池内策略未传 → 保留原值（pool_set 在 merge 后追加应用，本函数恒保留）
+        assert_eq!(m.buddy_ai_strategy, "credit_first");
     }
 
     #[test]

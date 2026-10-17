@@ -5,7 +5,7 @@
  * table-fixed 定宽防横向滚动，带搜索过滤）。
  * 资源调度说明覆盖三层语义：自定义直达 → 池间选池（smart/priority+回退）→ 池内取号，
  * 并指向「资源总览 → 调度策略中心」调整入口（任务7）。
- * 数据源：unified_models（实时聚合 Trae / Buddy / Qoder / 自定义 多池）+ gateway_settings_get（端口）。
+ * 数据源：unified_models（实时聚合 Trae / Buddy / BuddyAI 国际 / Qoder / 自定义 多池）+ gateway_settings_get（端口）。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { CircleHelp, Copy, Search } from 'lucide-react';
@@ -18,6 +18,7 @@ import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
 const POOL_LABELS: Record<string, string> = {
   trae: 'Trae',
   buddy: 'Buddy',
+  'buddy-ai': 'BuddyAI 国际',
   qoder: 'Qoder',
   custom: '自定义',
 };
@@ -190,20 +191,21 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 模型名命中启用条目即直达该上游（上游自有计费），不参与跨池回退。
               </p>
               <p>
-                <span className="font-medium text-slate-600 dark:text-zinc-300">多源同名模型（Trae/Buddy/Qoder）：</span>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">多源同名模型（Trae/Buddy/BuddyAI 国际/Qoder）：</span>
                 按「池间调度策略」选池——智能调度（默认）按 积分先到期 → 免费/低倍率 → 积分多 排序，全并列时按池优先级序；
-                固定优先级按序取首选可用池（Qoder 默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
+                固定优先级按序取首选可用池（Qoder / BuddyAI 国际默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
               </p>
               <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">模型目录标注来源池：</span>
                 「资源总览 → 调度策略中心」开启后，/v1/models 目录为多源同名模型附带{' '}
-                <code>trae/xxx</code>、<code>buddy/xxx</code>、<code>qoder/xxx</code> 别名条目（三家同名模型倍率与效果不同），
+                <code>trae/xxx</code>、<code>buddy/xxx</code>、<code>buddy-ai/xxx</code>、<code>qoder/xxx</code>{' '}
+                别名条目（各池同名模型倍率与效果不同），
                 右表「来源」列同步标注模型由哪些池服务；请求使用带池前缀的模型 ID 即点名锁定该池——
                 单池服务、不参与跨池回退，该池不可用时直接报错（前缀优先级高于 Key 绑定与全局策略）；关闭时目录保持原形态。
               </p>
               <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">池内取号：</span>
-                Trae 池 / Buddy 池 / Qoder 池各自独立配置策略（默认积分先过期优先，可选 余额多优先 / 随机 / 三因子加权 / P2C）。
+                Trae 池 / Buddy 池 / BuddyAI 国际池 / Qoder 池各自独立配置策略（默认积分先过期优先，可选 余额多优先 / 随机 / 三因子加权 / P2C）。
               </p>
               <p className="text-slate-400 dark:text-zinc-500">
                 调整入口：「资源总览」Tab → 调度策略中心（内置最佳组合预设一键应用，运行中网关即时生效，无需重启）。
@@ -218,7 +220,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 <span className="font-medium text-slate-600 dark:text-zinc-300">思考档位：</span>
                 统一六档 minimal / low / medium / high / xhigh / max。请求体{' '}
                 <code>reasoning_effort</code>（OpenAI 兼容）或 <code>thinking</code>（Anthropic 兼容）
-                传入后按池自动映射——Trae 三档 light / high / extra_high，Buddy 按上游声明下发，
+                传入后按池自动映射——Trae 三档 light / high / extra_high，
+                Buddy / BuddyAI 国际 按上游声明下发，
                 Qoder 暂不支持档位透传（目录思考档位仅展示）；
                 档位列取多池声明并集（统一档位值）。Trae 侧未实证的模型显式请求档位时按
                 统一映射填充默认下发，未显式请求时走上游默认（默认深度思考 high 仅对已实证模型生效）。

@@ -124,9 +124,9 @@ pub struct DispatchPolicy {
     #[serde(default = "default_reserve_credits")]
     pub reserve_credits: f64,
     /// /v1/models 为多源同名模型附带池前缀别名条目（issue #90 修复③a）：
-    /// `trae/xxx` / `buddy/xxx` / `qoder/xxx`——三家池同名模型倍率与效果不同，
-    /// 开启后客户端可按前缀点名指定池服务（resolve_target 按前缀锁定单池）。
-    /// 默认关（目录保持原形态，零行为差异）
+    /// `trae/xxx` / `buddy/xxx` / `buddy-ai/xxx` / `qoder/xxx`——各池同名模型
+    /// 倍率与效果不同，开启后客户端可按前缀点名指定池服务（resolve_target 按
+    /// 前缀锁定单池）。默认关（目录保持原形态，零行为差异）
     #[serde(default)]
     pub model_source_labels: bool,
     #[serde(default)]
@@ -1121,6 +1121,8 @@ mod tests {
             usage_dirty: std::sync::Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
             trae_enabled: AtomicBool::new(true),
             // 遗留调度矩阵测试编码 Buddy/Trae 契约（§9.1）：按「Qoder 未启用」

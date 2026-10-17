@@ -621,7 +621,7 @@ export interface ApiServiceStatus {
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'qoder' | 'custom';
+  pool: 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
   rate: number | null;
   enabled: boolean;
 }
@@ -652,7 +652,7 @@ export interface UnifiedModel {
 export interface DispatchPolicy {
   /** smart = 智能调度（默认：到期→倍率/免费→积分多）；priority = 固定优先级 */
   strategy: 'smart' | 'priority';
-  /** 池优先级（priority 模式或 smart 并列时生效；取值 trae/buddy） */
+  /** 池优先级（priority 模式或 smart 并列时生效；取值 trae/buddy/buddy-ai/qoder） */
   priority: string[];
   /** 模型级覆盖（键 canonical_id；显式覆盖不做智能重排） */
   per_model: Record<string, string[]>;
@@ -769,6 +769,8 @@ export interface ApiPoolFile {
   buddy_ai_group_ids?: string[];
   /** buddy-ai 池标签筛选：与分组筛选取交集（D5）；空 = 不限标签 */
   buddy_ai_tag_ids?: string[];
+  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  buddy_ai_strategy?: string;
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
   /** 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行 */

@@ -125,6 +125,11 @@ pub struct ApiSharedState {
     pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
     /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
     pub wb_probe_ok: std::sync::atomic::AtomicI64,
+    /// buddy-ai（国际版）上游健康探针（G8 审查修复）：与 wb_probe 同频控口径，
+    /// 探测 BILLING_BASE_GLOBAL（workbuddy.ai）；-1 未探测 / 0 不可达 / 1 在线
+    pub buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64,
+    /// buddy-ai（国际版）上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
+    pub buddy_ai_probe_ok: std::sync::atomic::AtomicI64,
     /// 跨池回退日志节流（审查中等项 + 二审细化）：key = "model|reason"，
     /// value = 上次落盘 Unix 毫秒；60s 窗口内同 model 同因回退只落盘一次，
     /// 防逐请求刷盘放大；不同 model/reason 互不抑制
@@ -843,6 +848,8 @@ mod inflight_tests {
             usage_dirty: Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
             trae_jwt_refresh: None,
             trae_enabled: std::sync::atomic::AtomicBool::new(true),

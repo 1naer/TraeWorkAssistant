@@ -882,6 +882,8 @@ export const api = {
         buddyAiGroupIds?: string[] | null;
         /** buddy-ai 池标签筛选；null/未传 = 保留原值，空数组 = 清空 */
         buddyAiTagIds?: string[] | null;
+        /** buddy-ai 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
+        buddyAiStrategy?: string;
       },
       wbStrategy?: string,
     ) =>
@@ -926,6 +928,7 @@ export const api = {
         buddyAiHedgeThresholdMs: wbFlags?.buddyAiHedgeThresholdMs ?? null,
         buddyAiGroupIds: wbFlags?.buddyAiGroupIds ?? null,
         buddyAiTagIds: wbFlags?.buddyAiTagIds ?? null,
+        buddyAiStrategy: wbFlags?.buddyAiStrategy ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
@@ -936,6 +939,8 @@ export const api = {
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
+    /** Buddy 国际版（buddy-ai）池实时状态（全局 API 管理·API Keys 调度配置候选） */
+    buddyAiPoolStatus: () => invoke<PoolStatus[]>('buddy_ai_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
     qoderCatalogSync: () => invoke<number>('qoder_catalog_sync'),
     logsList: () => invoke<string[]>('api_logs_list'),

@@ -297,7 +297,7 @@ export default function BuddyAiSettings() {
             />
             <TaskRow
               title="每日自动打卡"
-              desc="网页会话 + 沙箱跑一轮对话，服务端自动入账 30/50 积分（按套餐定档）；幂等跳过当日已完成账号；间隔等细项在「一键签到」页配置。"
+              desc="网页会话 + 沙箱跑一轮对话，服务端自动入账 30/50 积分（按套餐定档）；幂等跳过当日已完成账号；间隔等细项在「活跃打卡」页配置。"
               form={checkinForm}
               onChange={setCheckinForm}
             />
