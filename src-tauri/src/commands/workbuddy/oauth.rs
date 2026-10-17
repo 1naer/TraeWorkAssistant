@@ -192,6 +192,26 @@ impl PoolSink {
             }
         }
     }
+
+    /// 既有凭证 rec（重扫码合并写回用；BuddyAi = buddy_ai_tokens 表）
+    fn load_token(&self, state: &AppState, id: &str) -> serde_json::Value {
+        match self {
+            Self::Cn => {
+                crate::tasks::wb_common::load_token_store(state)
+                    .get("tokens")
+                    .and_then(|t| t.get(id))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            Self::BuddyAi => {
+                crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
+                    .get("tokens")
+                    .and_then(|t| t.get(id))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        }
+    }
 }
 
 /// OAuth 主流程（后台线程执行）：进度经 `<prefix>-oauth-progress` 事件推送，结果经 `<prefix>-oauth-done`。
@@ -402,7 +422,26 @@ pub(super) fn oauth_flow(
         "refresh_token": if refresh_token.is_empty() { None } else { Some(refresh_token) },
         "expires_at_ms": exp_s.map(|s| s * 1000),
     });
-    sink.upsert_token(state, &target_id, &creds)?;
+    // 重扫码合并写回（BuddyAi sink）：upsert 是整行 REPLACE，从零构造会抹掉
+    // last_daily_chat（当日打卡幂等失效→重复跑六步链）/uid/domain 等既有键——
+    // 与导入路径 BL-2 同类缺陷。新键优先，旧键缺省补齐；新码未回发 rt 时保留旧 rt
+    if matches!(sink, PoolSink::BuddyAi) {
+        let existing = sink.load_token(state, &target_id);
+        let mut creds = creds;
+        if let (Some(obj), Some(eobj)) = (creds.as_object_mut(), existing.as_object()) {
+            for (k, v) in eobj {
+                obj.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        if creds.get("refresh_token").map(serde_json::Value::is_null).unwrap_or(false) {
+            if let Some(old_rt) = existing.get("refresh_token").filter(|v| !v.is_null()) {
+                creds["refresh_token"] = old_rt.clone();
+            }
+        }
+        sink.upsert_token(state, &target_id, &creds)?;
+    } else {
+        sink.upsert_token(state, &target_id, &creds)?;
+    }
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -435,14 +474,24 @@ pub(super) fn oauth_login_async(
     }
     let done_event = format!("{}-oauth-done", sink.event_prefix());
     std::thread::spawn(move || {
-        let payload = match AppState::new().and_then(|st| oauth_flow(&app, &st, ep, sink)) {
-            Ok((id, nickname)) => serde_json::json!({
+        // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
+        //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
+        // catch_unwind 确保复位 + 补发失败终态
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            AppState::new().and_then(|st| oauth_flow(&app, &st, ep, sink))
+        }));
+        let payload = match outcome {
+            Ok(Ok((id, nickname))) => serde_json::json!({
                 "ok": true,
                 "id": id,
                 "nickname": nickname,
                 "message": format!("账号「{nickname}」已扫码登录并自动入池"),
             }),
-            Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            Ok(Err(e)) => serde_json::json!({ "ok": false, "message": e }),
+            Err(_) => serde_json::json!({
+                "ok": false,
+                "message": "OAuth 流程内部异常（已恢复），请重试或查看日志"
+            }),
         };
         // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
         crate::events::emit_logged(&app, &done_event, payload, None);

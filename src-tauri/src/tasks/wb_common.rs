@@ -292,6 +292,11 @@ fn token_store_upsert_secure_in(
     } else {
         let mut entry = crate::vault::ns_get(data_dir, ns, id)
             .unwrap_or_else(|| serde_json::json!({}));
+        // vault 旧条目损坏为非对象（String/Array 等）时 index 赋值会 panic——
+        // panic 点在续期/导入/OAuth 回写路径上，防御性归零重建
+        if !entry.is_object() {
+            entry = serde_json::json!({});
+        }
         if !acc.is_empty() {
             entry["access_token"] = serde_json::json!(acc);
         }

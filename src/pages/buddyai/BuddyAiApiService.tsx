@@ -167,7 +167,13 @@ export default function BuddyAiApiService() {
         next.buddyAiEnabled ? 'buddy-ai 国际档已开启（独立池参与调度）' : '已保存 buddy-ai 调度配置',
       );
     } catch (err) {
-      setFlags(prev);
+      // 按本次 patch 字段回滚（审查修复）：整份回滚到调用时快照会连带抹掉
+      // 并发已成功落库的其他字段（连续保存时第二次失败回滚覆盖第一次成功值）
+      const revert = { ...flags };
+      for (const k of Object.keys(next) as Array<keyof typeof next>) {
+        (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
+      }
+      setFlags(revert);
       pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
     } finally {
       setSaving(false);
@@ -475,23 +481,28 @@ export default function BuddyAiApiService() {
                       onChange={(e) => setPendingEnabled((p) => ({ ...p, [a.id]: e.target.checked }))}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">{a.nickname || a.id}</span>
-                      <span className="text-[11px] text-slate-400">
-                        {a.uid || a.id}
-                        {a.credits_balance != null ? ` · ${a.credits_balance.toFixed(0)} 积分` : ''}
+                      {/* 名称 + 徽标同行（对齐国内 Buddy 账号池选择列表：在线/就绪等徽标紧跟账号名） */}
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate text-sm font-medium">{a.nickname || a.id}</span>
+                        {(a.is_current_workbuddy || a.is_current_codebuddy) && (
+                          <Badge tone="green">在线</Badge>
+                        )}
+                        {filteredOut && <Badge tone="slate">筛选外</Badge>}
+                        {a.needs_relogin ? (
+                          <Badge tone="amber">需重登</Badge>
+                        ) : !a.has_credential ? (
+                          <Badge tone="red">无凭证</Badge>
+                        ) : (
+                          <Badge tone="green">就绪</Badge>
+                        )}
                       </span>
+                      <span className="block truncate text-[11px] text-slate-400">{a.uid || a.id}</span>
                     </span>
                   </label>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    {filteredOut && <Badge tone="slate">筛选外</Badge>}
-                    {a.needs_relogin ? (
-                      <Badge tone="amber">需重登</Badge>
-                    ) : !a.has_credential ? (
-                      <Badge tone="red">无凭证</Badge>
-                    ) : (
-                      <Badge tone="green">就绪</Badge>
-                    )}
-                  </div>
+                  {/* 积分右侧独立列（两位小数 tabular-nums，对齐国内「2415.24 积分」展示） */}
+                  <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
+                    {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} 积分` : '余额未知'}
+                  </span>
                 </div>
                 );
               })

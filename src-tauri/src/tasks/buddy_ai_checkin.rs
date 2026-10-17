@@ -244,9 +244,9 @@ fn process_account(
     nickname: &str,
     token: &str,
     uid: &str,
+    base: &str,
     emit: &mut dyn FnMut(&Value),
 ) -> Value {
-    let base = "https://www.workbuddy.ai";
     let fail = |m: String| result_ev(acct_id, nickname, "fail", &m);
 
     // 幂等戳：token rec `last_daily_chat`（本地日期；成功才落盘）。
@@ -264,6 +264,14 @@ fn process_account(
     if last == today_stamp() {
         return result_ev(acct_id, nickname, "already", "今日已完成活跃打卡");
     }
+    // 审查修复（P1）：六步链用锁内读到的最新凭证——轮次开始快照的 token 可能在
+    // 锁内读段前后已被续期/401 自愈轮换，继续用旧值整链 401 且被调度器判
+    // permanent 当日剔除（漏打卡）；锁内读到了新值就改用新值
+    let token = rec
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(token);
     // 锁释放（六步链执行期不持锁——避免阻塞并发的凭证续期；写段见下方二次加锁）
     drop(_read_guard);
 
@@ -333,8 +341,12 @@ fn process_account(
     };
 
     // ③ ACP 通道：GET link（SSE）→ 响应头 Acp-Connection-Id。
-    // BL-3 审查修复：裸 ureq::get 默认无超时——沙箱端点挂起会永久阻塞打卡线程
-    //（轮次守卫不泄漏但当日后续轮次恒 skipped_busy），改用带 30s 超时的 agent
+    // SSE GET 用无整体超时的专用 agent（2026-10-16 二号账号 stuck working 整改）：
+    // 流由读线程持续消费（读线程 detached，阻塞的是它自己不是打卡线程），
+    // acp_agent 的 30s 整体超时会在读线程 30s 后掐断 SSE → turn 被服务端中止。
+    let sse_agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .build();
     let acp_agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(30))
@@ -343,7 +355,7 @@ fn process_account(
     // 在 with_backoff 闭包返回时 drop，服务端随即回收 ACP 连接，④ 全部
     // 404 {"error":"connection not found"}（响应体已由 4xx 诊断落盘佐证）
     let sse = with_backoff(|| {
-        let resp = acp_agent.get(&link)
+        let resp = sse_agent.get(&link)
             .set("Accept", "text/event-stream")
             .set("Authorization", &format!("Bearer {sandbox_token}"))
             .set("User-Agent", "Mozilla/5.0")
@@ -354,10 +366,92 @@ fn process_account(
             .ok_or_else(|| BackoffErr::Msg("ACP 响应缺 Acp-Connection-Id".to_string()))?;
         Ok((resp, conn))
     });
-    let (mut _sse_resp, conn_id) = match sse {
+    let (sse_resp, conn_id) = match sse {
         Ok(v) => v,
         Err(e) => return fail(format!("ACP 通道建立失败：{e}")),
     };
+
+    // SSE 读线程（2026-10-16 二号账号诊断）：此前 SSE 只挂不读——turn 的
+    // session/update 流量、服务端→客户端请求（turn 等客户端应答会永远挂住）、
+    // 四连 RPC 的错误回执全部不可见。读线程解析 SSE data 行：转发事件摘要给
+    // ⑤ 轮询循环；带 id 的服务端请求按 ACP 语义代答（request_permission 放行
+    // 首个 allow 选项、其余回 -32601）防 turn 挂死；RPC 错误回执落 app.log。
+    // 连接存活由读线程的阻塞 read 天然维持（EOF/服务端关闭才退出）。
+    let (acp_ev_tx, acp_ev_rx) = std::sync::mpsc::channel::<String>();
+    {
+        let rd_link = link.clone();
+        let rd_conn = conn_id.clone();
+        let rd_token = sandbox_token.clone();
+        let rd_agent = acp_agent.clone();
+        let rd_data_dir = state.data_dir.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(sse_resp.into_reader());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let Some(data) = line.trim().strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if let Some(method) = v.get("method").and_then(Value::as_str) {
+                    let params = v.get("params").cloned().unwrap_or(Value::Null);
+                    match v.get("id") {
+                        // 服务端→客户端请求：必须应答，否则 turn 挂死等客户端
+                        Some(id) => {
+                            let summary = acp_answer_request(
+                                &rd_agent, &rd_link, &rd_conn, &rd_token, id, method, &params,
+                            );
+                            crate::fs_utils::app_log(
+                                &rd_data_dir,
+                                &format!("buddy-ai: ACP 服务端请求 {summary}（conv 诊断）"),
+                            );
+                            // 发送失败 = 本账号打卡流程已结束（接收端 drop）→ 读线程退出，
+                            // 防「stuck working/失败」场景下线程+socket 无限累积
+                            if acp_ev_tx.send(summary).is_err() {
+                                break;
+                            }
+                        }
+                        // 通知：session/update 流量（轮询循环汇总，不逐条落盘）
+                        None => {
+                            let kind = params
+                                .get("update")
+                                .and_then(|u| u.get("sessionUpdate"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("?");
+                            if acp_ev_tx.send(format!("session/update:{kind}")).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                } else if let Some(id) = v.get("id") {
+                    // 我方四连 RPC 的回执（结果错误才落盘，成功只走摘要流）
+                    if let Some(err) = v.get("error") {
+                        let m = err.get("message").and_then(Value::as_str).unwrap_or("?");
+                        crate::fs_utils::app_log(
+                            &rd_data_dir,
+                            &format!("buddy-ai: ACP RPC 回执错误 id={id}: {m}"),
+                        );
+                        if acp_ev_tx.send(format!("RPC 回执 id={id} 错误: {m}")).is_err() {
+                            break;
+                        }
+                    } else if acp_ev_tx.send(format!("RPC 回执 id={id} ok")).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // ④ ACP JSON-RPC 四连（HTTP 202/200 即受理；set_model 必发——省钱红线）。
     // payload 形态按 ACP 规范 + workbuddy2api-hub run_turn 口径构造；R-4 实测全 202。
@@ -391,7 +485,7 @@ fn process_account(
     ];
     for (rid, method, params) in steps {
         let payload = rpc(rid, method, params);
-        let res = with_backoff(|| {
+        let attempt = || {
             let out = acp_agent.post(&link)
                 .set("Acp-Connection-Id", &conn_id)
                 .set("Authorization", &format!("Bearer {sandbox_token}"))
@@ -420,22 +514,41 @@ fn process_account(
                 }
                 Err(e) => Err(BackoffErr::from(e)),
             }
-        });
+        };
+        // session/prompt 不重试（审查修复）：202 受理后 turn 已在服务端排队，
+        // 超时重发会创建重复 turn（双计费/双 turn）——失败直接 fail 交整轮冷却重试
+        let res = if method == "session/prompt" {
+            attempt().map_err(|e| match e {
+                BackoffErr::Status(c) => format!("HTTP {c}"),
+                BackoffErr::Msg(m) => m,
+            })
+        } else {
+            with_backoff(attempt)
+        };
         if let Err(e) = res {
             return fail(format!("ACP {method} 失败：{e}"));
         }
     }
-    // 四连完成后释放 SSE 流（⑤ 轮询走 console 端点，不需要连接存活；120s 窗口远超
-    // acp_agent 30s 超时，拖着反而可能被超时强行断开产生噪音日志）
-    drop(_sse_resp);
-
     // ⑤ 完成判定轮询（data.status == "completed"，180s 超时）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(COMPLETE_TIMEOUT_SECS);
     let mut completed = false;
     let mut poll_rounds = 0u64;
+    // 诊断追踪（2026-10-16 21:05 超时事故教训：此前轮询期错误被 _ => continue
+    // 静默吞掉，失败只有「未在 180s 内完成」一句，401/结构漂移/状态值变更全不可见）
+    let mut last_status = String::from("(无)");
+    let mut first_poll_err: Option<String> = None;
+    // ACP 流量追踪（2026-10-16 二号账号 stuck working：只挂不读时代码全盲）——
+    // 零流量=turn 未启动/等代答；停在 RPC 回执=agent 挂死；持续 chunk=真慢
+    let mut acp_updates = 0u64;
+    let mut last_acp_event: Option<(String, std::time::Instant)> = None;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(COMPLETE_POLL_SECS));
         poll_rounds += 1;
+        // 吸收 SSE 读线程的事件摘要（非阻塞 drain）
+        while let Ok(s) = acp_ev_rx.try_recv() {
+            acp_updates += 1;
+            last_acp_event = Some((s, std::time::Instant::now()));
+        }
         // 心跳（长静默期修复）：每 5 轮（15s）向前端报一次等待进度——
         // 此前整个轮询期零事件，用户感知为「点了没反应一直执行中」
         if poll_rounds % 5 == 0 {
@@ -468,12 +581,46 @@ fn process_account(
                 completed = true;
                 break;
             }
-            Ok(s) if s == "failed" || s == "error" => break,
-            _ => continue,
+            // 终态集合（completed 之外的失败终态直接退出，不空转烧满 180s）
+            Ok(s) if s == "failed" || s == "error" || s == "cancelled" => {
+                last_status = s;
+                break;
+            }
+            Ok(other) => {
+                last_status = other;
+                continue;
+            }
+            Err(e) => {
+                // 首次轮询异常落盘（token 失效/网络中断一目了然），后续不刷屏
+                if first_poll_err.is_none() {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("buddy-ai: 打卡轮询异常（conv={conv_id}）：{e}"),
+                    );
+                    first_poll_err = Some(e.clone());
+                }
+                // 凭证失效早退（审查修复）：401/403 空转满 180s 无意义，且 fail
+                // 文案含「HTTP 401」会被调度器判 permanent 当日剔除——明示可续期
+                if e.contains("HTTP 401") || e.contains("HTTP 403") {
+                    last_status = format!("轮询凭证失效（{e}）");
+                    break;
+                }
+                continue;
+            }
         }
     }
     if !completed {
-        return fail(format!("会话未在 {COMPLETE_TIMEOUT_SECS}s 内完成（conv={conv_id}）"));
+        let acp_tail = match (&last_acp_event, acp_updates) {
+            (Some((s, t)), n) => format!(
+                "，ACP 流量 {n} 条，最后事件：{s}（{}s 前）",
+                t.elapsed().as_secs()
+            ),
+            (None, _) => "，ACP 流量 0 条（沙箱零响应：turn 未启动或等客户端应答）".to_string(),
+        };
+        return fail(format!(
+            "会话未在 {COMPLETE_TIMEOUT_SECS}s 内完成（conv={conv_id}，最后状态={last_status}，轮询异常={}){acp_tail}",
+            first_poll_err.as_deref().unwrap_or("无")
+        ));
     }
 
     // ⑥ 到账校验 + 幂等戳落盘 + 池快照回写（成功才落盘，§4.5：不成功不记打卡）
@@ -487,6 +634,12 @@ fn process_account(
     // 若用六步链前的旧 rec 整行 REPLACE 会把新凭证抹回旧值（rt 已作废 → 账号须重登）
     let write_lock = crate::tasks::wb_common::refresh_lock_for(acct_id);
     let _write_guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 删号竞态保护（审查修复）：六步链执行期（最长 3 分钟）账号可能已被用户移除
+    //（remove 已三清 token store/vault/锁表）——upsert 语义会把幽灵凭证行复活，
+    // 先确认账号仍在池中才落戳
+    if !crate::commands::workbuddy::buddy_pool_roster(state).iter().any(|(id, _, _)| id == acct_id) {
+        return fail("账号已在本轮打卡期间被移除，幂等戳不落盘".to_string());
+    }
     let latest = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);
     let mut new_rec = latest
         .get("tokens")
@@ -522,6 +675,68 @@ fn process_account(
         ev["reward"] = json!(g);
     }
     ev
+}
+
+/// ACP 服务端→客户端请求代答（SSE 读线程调用）：request_permission 放行首个
+/// allow 选项（打卡是沙箱内最小「Hi」轮，代答与网页端默认放行同效）；其余方法
+/// 回 -32601，避免 turn 因等客户端应答而挂死。返回事件摘要供诊断流。
+fn acp_answer_request(
+    agent: &ureq::Agent,
+    link: &str,
+    conn_id: &str,
+    token: &str,
+    id: &Value,
+    method: &str,
+    params: &Value,
+) -> String {
+    let payload = if method == "session/request_permission" {
+        // 只放行 allow 选项：无 allow 可选时回 cancelled（兜底选第一个 option 可能
+        // 选中 reject/deny 项，导致 turn 被拒绝提前终止）
+        let allow = params.get("options").and_then(Value::as_array).and_then(|os| {
+            os.iter().find(|o| {
+                o.get("kind")
+                    .and_then(Value::as_str)
+                    .map_or(false, |k| k.starts_with("allow"))
+            })
+        });
+        match allow {
+            Some(o) => {
+                let oid = o
+                    .get("optionId")
+                    .or_else(|| o.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "outcome": { "outcome": "selected", "optionId": oid } }
+                })
+            }
+            None => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "outcome": { "outcome": "cancelled" } }
+            }),
+        }
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": "method not supported by checkin client" }
+        })
+    };
+    let status = agent
+        .post(link)
+        .set("Acp-Connection-Id", conn_id)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream, application/json")
+        .set("Origin", "https://www.workbuddy.ai")
+        .set("Referer", "https://www.workbuddy.ai/")
+        .send_string(&payload.to_string())
+        .map(|r| u32::from(r.status()))
+        .unwrap_or(0);
+    format!("{method} ← 已代答（HTTP {status}）")
 }
 
 /// 失败诊断用的响应摘要（审查 H5/H6 修复）：
@@ -609,6 +824,13 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
         } else {
             pool_uid.clone()
         };
+        // base 按 token rec domain 解析（审查修复：原硬编码 www.workbuddy.ai，
+        // rec.domain 非默认域的账号会打到错误主机——与积分/用量路径口径一致）。
+        // buddy-ai 池只收国际账号：domain 缺省/非法一律回落 Global 官方域
+        let base = match rec.get("domain").and_then(Value::as_str) {
+            Some(d) if d.contains(".workbuddy.ai") => crate::tasks::wb_common::region_activity_base(d),
+            _ => crate::tasks::wb_common::BILLING_BASE_GLOBAL,
+        };
         // 开跑即报（长静默修复）：此前逐账号事件仅在处理完成后发出，
         // 多分钟的六步链期间前端零反馈，用户感知为「点了没反应」
         emit(&json!({
@@ -616,7 +838,7 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
             "name": name,
             "message": format!("开始处理（{}/{}），六步链预计 1-3 分钟…", i + 1, accounts.len()),
         }));
-        let mut ev = process_account(state, &agent, id, name, &token, &uid, &mut *emit);
+        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, &mut *emit);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
@@ -655,7 +877,13 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
             .collect();
         let replace_uids: std::collections::HashSet<String> = events
             .iter()
-            .filter(|e| e.get("status").and_then(Value::as_str) != Some("already"))
+            .filter(|e| {
+                let st = e.get("status").and_then(Value::as_str);
+                // already 非最终态不覆盖；当日已有 success 行时迟到 fail 也不覆盖
+                //（正常流到不了——成功已落戳；多端/手工清戳场景防奖励行被抹）
+                st != Some("already")
+                    && !(st == Some("fail") && success_today.contains(&ev_uid(e)))
+            })
             .map(ev_uid)
             .collect();
         let already_only_uids: std::collections::HashSet<String> = events
@@ -695,7 +923,7 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
         merged.retain(|r| {
             r.get("date")
                 .and_then(Value::as_str)
-                .map_or(true, |d| d >= cutoff.as_str())
+                .map_or(false, |d| d >= cutoff.as_str())
         });
         root["results"] = Value::Array(merged);
         if let Err(err) = crate::store::docs::buddy_ai_checkin_results_save(&db, &root) {

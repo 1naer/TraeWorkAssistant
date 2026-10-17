@@ -13,12 +13,22 @@ import {
   YAxis,
 } from 'recharts';
 import ActivityHeatmap from '../../components/charts/ActivityHeatmap';
+import ExpiryCalendar, { type ExpiryItem } from '../../components/ExpiryCalendar';
+import { SOURCES, SOURCE_LABELS, type BoardSource } from '../../components/ChartFilterBar';
 import { StatCard, Badge } from '../../components/ui';
 import PageHeader from '../../components/PageHeader';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { BuddyAiAccountView, GroupView, UsageDayView, WbCheckinRecord } from '../../types';
+import type {
+  BuddyAiAccountView,
+  BuddyAiTokenStats,
+  BuddyAiUsageOfficialAll,
+  GroupView,
+  UsageDayView,
+  UsageSessionsResult,
+  WbCheckinRecord,
+} from '../../types';
 
 /** P8 积分快照行（buddy_ai_credits_history 表） */
 interface CreditSnap {
@@ -136,6 +146,16 @@ function MultiSelectDropdown({
   );
 }
 
+/** 共享空 Map（网关源无获得数据时的占位，避免 useMemo 依赖每次新建） */
+const EMPTY_MAP: Map<string, number> = new Map();
+
+/** 会话明细日期串（本地自然日，n 天前；0 = 今天） */
+function sessDate(daysAgo: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - daysAgo);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 export default function BuddyAiCredits() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [accounts, setAccounts] = useState<BuddyAiAccountView[] | null>(null);
@@ -144,49 +164,53 @@ export default function BuddyAiCredits() {
   const [history, setHistory] = useState<CreditSnap[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
-  // 请求明细（P9：官网 get-user-request-usage 分页）
-  const [usageAcct, setUsageAcct] = useState('');
-  const [usageDays, setUsageDays] = useState(7);
-  const [usagePage, setUsagePage] = useState(1);
-  const [usageData, setUsageData] = useState<{
-    total: number;
-    page: number;
-    pageSize: number;
-    rows: Array<{
-      requestId: string;
-      credit: number;
-      model: string;
-      client: string;
-      requestTime: string;
-      inputTrunc: string;
-      agentPurpose: string;
-    }>;
-  } | null>(null);
-  const [usageLoading, setUsageLoading] = useState(false);
+  // 会话明细（对齐国内 Buddy SessionsTab：定时落地的请求级行缓存，纯缓存零网络查询）
+  const [sessStart, setSessStart] = useState(() => sessDate(6));
+  const [sessEnd, setSessEnd] = useState(() => sessDate(0));
+  const [sessModel, setSessModel] = useState('');
+  const [sessUser, setSessUser] = useState('');
+  const [sessPage, setSessPage] = useState(1);
+  const [sessData, setSessData] = useState<UsageSessionsResult | null>(null);
+  const [sessLoading, setSessLoading] = useState(false);
+  // 模型下拉并集（对齐国内审查 m-7：过滤后子集不收缩下拉，跨查询累计）
+  const [sessModels, setSessModels] = useState<string[]>([]);
+  // 落地缓存重查键：积分同步/官网聚合刷新完成后 +1
+  const [sessReload, setSessReload] = useState(0);
   // 全局筛选（对齐国内看板顶部分组/账号筛选：多选下拉，联动 KPI 卡 / 包明细 / 明细表）
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [groupFilter, setGroupFilter] = useState<string[]>([]);
   const [acctFilter, setAcctFilter] = useState<string[]>([]);
   // Tab 布局（对齐国内 Dashboard：积分 / Token / 到期 / 请求明细）
   const [tab, setTab] = useState<'credits' | 'tokens' | 'expiry' | 'sessions'>('credits');
+  // 数据源切换（对齐国内 Dashboard 第二层分类：本地 / API网关 / 官网，按 Tab 独立记忆）
+  const [creditsSource, setCreditsSource] = useState<BoardSource>('local');
+  const [tokensSource, setTokensSource] = useState<BoardSource>('local');
+  // 官网聚合（31 天零填充；懒加载：积分统计 Tab 首次切到官网源才拉取）
+  const [officialAll, setOfficialAll] = useState<BuddyAiUsageOfficialAll | null>(null);
+  const officialLoadedRef = useRef(false);
+  // 本地 Token 统计（~/.workbuddy-ai/projects 会话扫描；懒加载：Token Tab 首次激活才拉取）
+  const [tokenStats, setTokenStats] = useState<BuddyAiTokenStats | null>(null);
+  const tokensLoadedRef = useRef(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
+      // 主数据 accountsList 失败仅局部报错，不丢弃其余四路已成功的数据（对齐各路独立容错）
       const [accs, recs, usg, hist, gs] = await Promise.all([
-        api.buddyai.accountsList(),
+        api.buddyai.accountsList().catch((err) => {
+          pushToast('error', `账号列表读取失败：${String(err).slice(0, 120)}`);
+          return null as BuddyAiAccountView[] | null;
+        }),
         api.buddyai.checkinResults(90).catch(() => [] as WbCheckinRecord[]),
         api.apiServer.buddyAiUsageStats(90).catch(() => [] as UsageDayView[]),
         api.buddyai.creditsHistory(90).catch(() => [] as CreditSnap[]),
         api.groups.sharedList().catch(() => [] as GroupView[]),
       ]);
-      setAccounts(accs);
+      if (accs) setAccounts(accs);
       setRecords(recs);
       setGroups(gs);
       setUsage(usg);
       setHistory(hist);
-    } catch (err) {
-      pushToast('error', `账号列表读取失败：${String(err).slice(0, 120)}`);
     } finally {
       setLoading(false);
     }
@@ -197,6 +221,37 @@ export default function BuddyAiCredits() {
     void load();
   }, [load]);
 
+  // 官网聚合拉取（后端 10min 缓存 + stale-on-error；「刷新数据」联动重拉）
+  const loadOfficial = useCallback(async () => {
+    try {
+      setOfficialAll(await api.buddyai.usageOfficialAll());
+    } catch (err) {
+      pushToast('error', `官网用量聚合查询失败：${String(err).slice(0, 160)}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 本地 Token 统计（后端 10min 结果缓存；fresh=true 强制重扫）
+  const loadTokenStats = useCallback(async (fresh: boolean) => {
+    try {
+      setTokenStats(await withMinDelay(api.buddyai.tokenStats(fresh), 600));
+    } catch (err) {
+      pushToast('error', `本地 Token 统计失败：${String(err).slice(0, 160)}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 懒加载（对齐国内 §3.4）：官网聚合在积分统计 Tab 官网源首次激活时拉取；
+  // 本地 Token 在 Token Tab 本地源首次激活时拉取
+  useEffect(() => {
+    if (tab === 'credits' && creditsSource === 'official' && !officialLoadedRef.current) {
+      officialLoadedRef.current = true;
+      void loadOfficial();
+    }
+    if (tab === 'tokens' && tokensSource === 'local' && !tokensLoadedRef.current) {
+      tokensLoadedRef.current = true;
+      void loadTokenStats(false);
+    }
+  }, [tab, creditsSource, tokensSource, loadOfficial, loadTokenStats]);
+
   const syncCredits = async () => {
     setSyncing(true);
     try {
@@ -204,6 +259,11 @@ export default function BuddyAiCredits() {
       setAccounts(n);
       const ok = n.filter((a) => a.credits_balance != null).length;
       pushToast('success', `积分已同步（${ok}/${n.length} 个账号取数成功）`);
+      // 已加载过的源随全局刷新联动（官网聚合 10min 缓存过期后此路强制重拉窗口内数据）
+      if (officialLoadedRef.current) void loadOfficial();
+      if (tokensLoadedRef.current) void loadTokenStats(true);
+      // 会话明细落地缓存重查（积分同步顺带官网聚合 → 行级明细随路落盘）
+      setSessReload((k) => k + 1);
     } catch (err) {
       pushToast('error', `积分同步失败：${String(err).slice(0, 160)}`);
     } finally {
@@ -235,8 +295,13 @@ export default function BuddyAiCredits() {
   const today = localDateStr(new Date());
   // 打卡获得（P4 同口径：今日）
   const todayEarned = useMemo(
-    () => records.filter((r) => r.date === today).reduce((s, r) => s + (r.reward ?? 0), 0),
-    [records, today],
+    () =>
+      records
+        .filter((r) => r.date === today && r.status === 'success')
+        // 随分组/账号筛选联动（对齐国内「筛选作用于 KPI」口径）
+        .filter((r) => listF.some((a) => a.id === r.user_id))
+        .reduce((s, r) => s + (r.reward ?? 0), 0),
+    [records, today, listF],
   );
   // 7 日内积分到期账号数（credits_expire_at 落在未来 7 天窗口）
   const expiringSoon = withBalance.filter((a) => {
@@ -274,6 +339,38 @@ export default function BuddyAiCredits() {
   );
   const pkgSoon = (expire: number | null | undefined) =>
     expire != null && expire > nowSec && expire <= nowSec + 7 * 86400;
+  // 积分到期 Tab（对齐国内 ExpiryTab 结构）：账号积分明细行 + 到期日历 items
+  // 包计数与国内口径对齐：只计剩余 > 0 的包（已用完不计）
+  const acctExpiryRows = useMemo(
+    () =>
+      listF.map((a) => {
+        const pkgs = (a.credits_packages ?? []).filter((p) => p.remain > 0);
+        const expires = pkgs
+          .map((p) => p.expire_secs)
+          .filter((t): t is number => t != null && t > 0);
+        return {
+          a,
+          pkgCount: pkgs.length,
+          nearest: expires.length > 0 ? Math.min(...expires) : a.credits_expire_at,
+        };
+      }),
+    [listF],
+  );
+  const expiryItems = useMemo<ExpiryItem[]>(
+    () =>
+      listF.flatMap((a) =>
+        (a.credits_packages ?? [])
+          .filter((p) => p.remain > 0)
+          .map((p) => ({
+            key: `buddyai-${a.id}-${p.code || p.name}-${p.expire_secs ?? 0}`,
+            label: `BuddyAI · ${a.nickname || a.id} · ${p.name || p.code || '积分包'}`,
+            kind: '积分包',
+            expire_ts: p.expire_secs ?? null,
+            note: `剩余 ${p.remain.toFixed(2)} / 总 ${p.size.toFixed(0)}`,
+          })),
+      ),
+    [listF],
+  );
   // 今日消耗积分（网关记账口径：usage 今日 credits 合计——对齐国内「今日消耗积分」）
   const todayCreditsSpent = useMemo(() => {
     const d = usage.find((u) => u.date === today);
@@ -313,68 +410,146 @@ export default function BuddyAiCredits() {
     return m;
   }, [usage]);
 
+  // ── 本地源序列（对齐国内 Buddy：快照 earned 获得 + 逐账号余额差分消耗）──
+  // 账号筛选生效时快照行 accounts 同步收窄（earned 无账号维度，过滤态回退打卡口径）
+  const filteredHistory = useMemo(() => {
+    if (acctFilter.length === 0 && groupFilter.length === 0) return history;
+    const ids = new Set(listF.map((a) => a.id));
+    return history.map((s) => ({ ...s, accounts: s.accounts.filter((x) => ids.has(x.id)) }));
+  }, [history, acctFilter, groupFilter, listF]);
+  const hasSnapEarned = useMemo(() => filteredHistory.some((s) => s.earned != null), [filteredHistory]);
+  const localEarned = useMemo(() => {
+    // 无筛选且快照含 earned → 快照口径；否则回退打卡 reward 按当前筛选账号过滤
+    if (hasSnapEarned && acctFilter.length === 0 && groupFilter.length === 0) {
+      const m = new Map<string, number>();
+      for (const s of filteredHistory) {
+        if (s.earned != null && s.earned > 0) m.set(s.date, (m.get(s.date) ?? 0) + s.earned);
+      }
+      return m;
+    }
+    const m = new Map<string, number>();
+    const ids = new Set(listF.map((a) => a.id));
+    for (const r of records) {
+      if (r.status === 'success' && r.reward && ids.has(r.user_id)) {
+        m.set(r.date, (m.get(r.date) ?? 0) + r.reward);
+      }
+    }
+    return m;
+  }, [filteredHistory, hasSnapEarned, acctFilter, groupFilter, listF, records]);
+  const localSpent = useMemo(() => {
+    // 逐账号余额日差分（负差 = 消耗）；首日无前值不计（对齐国内快照差分口径）
+    const m = new Map<string, number>();
+    const prev = new Map<string, number>();
+    const sorted = [...filteredHistory].sort((a, b) => a.date.localeCompare(b.date));
+    for (const s of sorted) {
+      let spent = 0;
+      for (const x of s.accounts) {
+        const p = prev.get(x.id);
+        if (p != null && x.balance != null && p > x.balance) spent += p - x.balance;
+        if (x.balance != null) prev.set(x.id, x.balance);
+      }
+      if (spent > 0) m.set(s.date, (m.get(s.date) ?? 0) + spent);
+    }
+    return m;
+  }, [filteredHistory]);
+  // 官网源序列（31 天零填充聚合）
+  const officialSpent = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const d of officialAll?.daily ?? []) if (d.usage > 0) m.set(d.date, d.usage);
+    return m;
+  }, [officialAll]);
+
+  // 按源取数（网关源无获得数据，避免净消耗系统性偏负——对齐国内 §3.1 口径决策）
+  const srcEarned = creditsSource === 'gateway' ? EMPTY_MAP : localEarned;
+  const srcSpent =
+    creditsSource === 'gateway' ? dailySpent : creditsSource === 'official' ? officialSpent : localSpent;
+
   // 区间三统计卡（获得 − 消耗 = 净获得）
   const rangeEarned = useMemo(() => {
     let s = 0;
-    for (const [k, v] of dailyEarned) if (k >= rangeStart) s += v;
+    for (const [k, v] of srcEarned) if (k >= rangeStart) s += v;
     return s;
-  }, [dailyEarned, rangeStart]);
+  }, [srcEarned, rangeStart]);
   const rangeSpent = useMemo(() => {
     let s = 0;
-    for (const [k, v] of dailySpent) if (k >= rangeStart) s += v;
+    for (const [k, v] of srcSpent) if (k >= rangeStart) s += v;
     return s;
-  }, [dailySpent, rangeStart]);
+  }, [srcSpent, rangeStart]);
   const rangeNet = rangeEarned - rangeSpent;
 
-  // 趋势序列（区间内逐日双线；无数据日补 0 保持连续横轴）
+  // 网关源请求统计（区间合计）
+  const rangeUsage = useMemo(() => usage.filter((u) => u.date >= rangeStart), [usage, rangeStart]);
+  const gwRequests = rangeUsage.reduce((s, u) => s + u.total_requests, 0);
+  const gwOk = rangeUsage.reduce((s, u) => s + u.ok, 0);
+  const gwErrors = rangeUsage.reduce((s, u) => s + u.errors, 0);
+
+  // 趋势序列（区间内逐日；无数据日补 0 保持连续横轴）
   const trendData = useMemo(() => {
-    const out: Array<{ date: string; 获得积分: number; 消耗积分: number }> = [];
+    const out: Array<{ date: string; 获得积分: number | null; 消耗积分: number }> = [];
     const end = new Date();
     const start = new Date(`${rangeStart}T00:00:00`);
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
       const k = localDateStr(d);
       out.push({
         date: k.slice(5),
-        获得积分: Number((dailyEarned.get(k) ?? 0).toFixed(2)),
-        消耗积分: Number((dailySpent.get(k) ?? 0).toFixed(2)),
+        获得积分: creditsSource === 'gateway' ? null : Number((srcEarned.get(k) ?? 0).toFixed(2)),
+        消耗积分: Number((srcSpent.get(k) ?? 0).toFixed(2)),
       });
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rangeStart, dailyEarned, dailySpent]);
+  }, [rangeStart, srcEarned, srcSpent, creditsSource]);
 
-  // 年度活动热力图（消耗口径，对齐国内；窗口 90 天诚实标注）
+  // 年度活动热力图（消耗口径，随数据源切换；窗口诚实标注）
   const heatValues = useMemo(() => {
     const m = new Map<string, number>();
-    for (const [k, v] of dailySpent) if (v > 0) m.set(k, v);
+    for (const [k, v] of srcSpent) if (v > 0) m.set(k, v);
     return m;
-  }, [dailySpent]);
+  }, [srcSpent]);
+  // 模型消耗排行：网关 = 按积分（近 90 天）；官网 = 31 天全窗口汇总；本地无模型明细
+  const officialModelRank = useMemo(() => {
+    const models = officialAll?.models;
+    if (!models) return [];
+    return models.map((m) => ({ name: m.model, requests: m.request_count, credits: m.credit }));
+  }, [officialAll]);
 
-  // 请求明细拉取（P9：官网分页接口）。
-  // FH-3 审查修复：递增序号守卫——慢响应后到会覆盖新筛选条件的结果（张冠李戴）
-  const usageSeq = useRef(0);
-  const loadUsage = useCallback(
-    async (acctId: string, days: number, page: number) => {
-      if (!acctId) return;
-      const seq = ++usageSeq.current;
-      setUsageLoading(true);
-      try {
-        const r = await api.buddyai.requestUsage(acctId, days, page, 20);
-        if (seq !== usageSeq.current) return; // 过期响应丢弃
-        setUsageData(r);
-        // FM-2：以服务端夹取后的页码为准回同步（筛选/翻页错位自愈）
-        setUsagePage(r.page);
-      } catch (err) {
-        if (seq !== usageSeq.current) return;
-        pushToast('error', `请求流水查询失败：${String(err).slice(0, 160)}`);
-        setUsageData(null);
-      } finally {
-        if (seq === usageSeq.current) setUsageLoading(false);
-      }
-    },
+  // 会话明细查询（纯缓存零网络；筛选变更自动查询，对齐国内 SessionsTab）
+  useEffect(() => {
+    if (sessStart > sessEnd) {
+      setSessData(null);
+      return;
+    }
+    let cancelled = false;
+    setSessLoading(true);
+    api.buddyai
+      .usageSessions({
+        start: sessStart,
+        end: sessEnd,
+        model: sessModel || null,
+        userId: sessUser || null,
+        page: sessPage,
+        pageSize: 50,
+      })
+      .then((r) => {
+        if (cancelled) return;
+        setSessData(r);
+        setSessModels((prev) => Array.from(new Set([...prev, ...(r.models ?? [])])).sort());
+        // 空页回夹：以服务端夹取后的页码为准回同步
+        if (r.page !== sessPage) setSessPage(r.page);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        pushToast('error', `会话明细查询失败：${String(err).slice(0, 160)}`);
+        setSessData(null);
+      })
+      .finally(() => {
+        if (!cancelled) setSessLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
+  }, [sessStart, sessEnd, sessModel, sessUser, sessPage, sessReload]);
   // ── Token 统计切面（对齐国内 TokensTab：独立区间 + 四卡 + 柱线组合图）──
   const [tokenRange, setTokenRange] = useState<'today' | '7d' | '30d' | 'month' | 'year'>('30d');
   const tokenRangeStart = useMemo(() => {
@@ -431,6 +606,61 @@ export default function BuddyAiCredits() {
     return [...m.entries()].map(([name, requests]) => ({ name, requests })).sort((a, b) => b.requests - a.requests);
   }, [usageInRange]);
   const tokenRankMax = tokenModelRank[0]?.requests ?? 0;
+  // Token 本地源派生（~/.workbuddy-ai 会话扫描；区间聚合 + 模型排行 + 热力图）
+  const tokenLocal = useMemo(() => {
+    if (!tokenStats) return null;
+    const byDate = new Map<string, { input: number; output: number; cache_read: number; cache_write: number; calls: number }>();
+    const byModel = new Map<string, { tokens: number; calls: number }>();
+    let input = 0, output = 0, cacheRead = 0, cacheWrite = 0, calls = 0;
+    for (const [model, points] of Object.entries(tokenStats.daily_by_model)) {
+      for (const p of points) {
+        if (!p.date || p.date < tokenRangeStart) continue;
+        const i = p.input ?? 0, o = p.output ?? 0, cr = p.cache_read ?? 0, cw = p.cache_write ?? 0, c = p.calls ?? 0;
+        input += i; output += o; cacheRead += cr; cacheWrite += cw; calls += c;
+        const d = byDate.get(p.date) ?? { input: 0, output: 0, cache_read: 0, cache_write: 0, calls: 0 };
+        d.input += i; d.output += o; d.cache_read += cr; d.cache_write += cw; d.calls += c;
+        byDate.set(p.date, d);
+        const e = byModel.get(model) ?? { tokens: 0, calls: 0 };
+        e.tokens += i + o + cw;
+        e.calls += c;
+        byModel.set(model, e);
+      }
+    }
+    return { input, output, cacheRead, cacheWrite, calls, byDate, byModel };
+  }, [tokenStats, tokenRangeStart]);
+  const tokenLocalTrend = useMemo(() => {
+    const out: Array<Record<string, number | string>> = [];
+    const end = new Date();
+    const start = new Date(`${tokenRangeStart}T00:00:00`);
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const k = localDateStr(d);
+      const a = tokenLocal?.byDate.get(k);
+      out.push({
+        date: k.slice(5),
+        缓存读取: a?.cache_read ?? 0,
+        新增输入: Math.max(0, (a?.input ?? 0) - (a?.cache_read ?? 0)),
+        输出: a?.output ?? 0,
+        缓存写入: a?.cache_write ?? 0,
+        调用: a?.calls ?? 0,
+      });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenLocal, tokenRangeStart]);
+  const tokenLocalRank = useMemo(() => {
+    if (!tokenLocal) return [];
+    return [...tokenLocal.byModel.entries()]
+      .map(([name, m]) => ({ name, tokens: m.tokens }))
+      .sort((a, b) => b.tokens - a.tokens);
+  }, [tokenLocal]);
+  const tokenLocalRankMax = tokenLocalRank[0]?.tokens ?? 0;
+  const tokenLocalHeat = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const p of tokenStats?.daily ?? []) {
+      if (p.date && p.total > 0) m.set(p.date, p.total);
+    }
+    return m;
+  }, [tokenStats]);
 
   const fmtExpire = (ts: number | null) =>
     ts == null ? '—' : new Date(ts * 1000).toLocaleString();
@@ -527,31 +757,47 @@ export default function BuddyAiCredits() {
         </div>
       </div>
 
-      {/* 积分统计（对齐国内 CreditsTab：数据源平铺 + 三统计卡 + 双线趋势 + 时间筛选平铺） */}
+      {/* 积分统计（对齐国内 CreditsTab：数据源可切换 + 按源统计卡 + 趋势 + 时间筛选平铺） */}
       {tab === 'credits' && (
       <div className="card mt-4 p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-medium">积分统计</span>
-            {/* 数据源平铺徽标（对齐国内：本地 / API网关 / 官网，有数据点亮） */}
+            {/* 数据源切换（对齐国内 Dashboard 第二层分类：本地 / API网关 / 官网） */}
             <span className="text-[11px] text-slate-400">数据源</span>
-            {([
-              ['本地', history.length > 0, '积分快照（buddy_ai_credits_history，每日同步落库）'],
-              ['API网关', usage.length > 0, '网关用量记账（buddy_ai_days，模型倍率 × 用量）'],
-              ['官网', records.length > 0, '官网打卡记录（workbuddy.ai 侧入账流水）'],
-            ] as [string, boolean, string][]).map(([label, on, tip]) => (
-              <span
-                key={label}
-                title={tip}
-                className={`rounded px-1.5 py-0.5 text-[11px] ${
-                  on
-                    ? 'bg-emerald-500/10 font-medium text-emerald-600 dark:text-emerald-400'
-                    : 'bg-slate-100 text-slate-400 dark:bg-zinc-800 dark:text-zinc-500'
-                }`}
-              >
-                {label}
-              </span>
-            ))}
+            <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
+              {SOURCES.map((s) => {
+                const tip =
+                  s === 'local'
+                    ? '本地积分快照（buddy_ai_credits_history，每日同步落库；消耗为逐账号余额差分）'
+                    : s === 'gateway'
+                      ? 'API 网关用量记账（buddy_ai_days，模型倍率 × 用量，90 天窗口）'
+                      : '官网请求流水聚合（get-user-request-usage 全账号 31 天，10 分钟缓存）';
+                return (
+                  <button
+                    key={s}
+                    title={tip}
+                    className={`rounded-md px-3 py-1 text-xs font-medium transition ${
+                      creditsSource === s
+                        ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
+                        : 'text-slate-500 dark:text-zinc-400'
+                    }`}
+                    onClick={() => setCreditsSource(s)}
+                  >
+                    {SOURCE_LABELS[s]}
+                  </button>
+                );
+              })}
+            </div>
+            <span className="text-[11px] text-slate-400">
+              {creditsSource === 'local'
+                ? '快照 earned 获得 · 余额差分消耗'
+                : creditsSource === 'gateway'
+                  ? '记账口径 · 90 天窗口'
+                  : officialAll?.stale
+                    ? '缓存回退 · 非当日数据'
+                    : '官网流水 · 31 天窗口'}
+            </span>
           </div>
           {/* 时间筛选平铺（对齐国内：胶囊单选，不使用下拉） */}
           <div className="flex overflow-hidden rounded-lg border border-slate-200 text-xs dark:border-zinc-700">
@@ -579,36 +825,70 @@ export default function BuddyAiCredits() {
           </div>
         </div>
 
-        {/* 区间三统计卡（获得 / 消耗 / 净获得，对齐国内配色） */}
-        <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <div className="rounded-lg border-t-2 border-emerald-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">区间总获得</div>
-            <div className="text-xl font-bold tabular-nums text-emerald-500">{rangeEarned.toFixed(2)}</div>
-            <div className="text-[11px] text-slate-400">打卡入账按日合计</div>
-          </div>
-          <div className="rounded-lg border-t-2 border-amber-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">区间总消耗</div>
-            <div className="text-xl font-bold tabular-nums text-amber-500">{rangeSpent.toFixed(2)}</div>
-            <div className="text-[11px] text-slate-400">网关用量记账（模型倍率 × 用量）</div>
-          </div>
-          <div className="rounded-lg border-t-2 border-rose-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">净获得</div>
-            <div className={`text-xl font-bold tabular-nums ${rangeNet >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-              {rangeNet >= 0 ? '+' : ''}{rangeNet.toFixed(2)}
+        {/* 区间统计卡（网关源 = 消耗/成功/失败；本地/官网源 = 获得/消耗/净获得） */}
+        {creditsSource === 'gateway' ? (
+          <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border-t-2 border-amber-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+              <div className="text-xs text-slate-500">区间总消耗</div>
+              <div className="text-xl font-bold tabular-nums text-amber-500">{rangeSpent.toFixed(2)}</div>
+              <div className="text-[11px] text-slate-400">网关用量记账（模型倍率 × 用量）</div>
             </div>
-            <div className="text-[11px] text-slate-400">获得 − 消耗</div>
+            <div className="rounded-lg border-t-2 border-emerald-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+              <div className="text-xs text-slate-500">成功请求</div>
+              <div className="text-xl font-bold tabular-nums text-emerald-500">{gwOk.toLocaleString()}</div>
+              <div className="text-[11px] text-slate-400">区间内网关转发成功请求合计</div>
+            </div>
+            <div className="rounded-lg border-t-2 border-rose-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+              <div className="text-xs text-slate-500">失败请求</div>
+              <div className="text-xl font-bold tabular-nums text-rose-500">{gwErrors.toLocaleString()}</div>
+              <div className="text-[11px] text-slate-400">超时/上游错误计入</div>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border-t-2 border-emerald-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+              <div className="text-xs text-slate-500">区间总获得</div>
+              <div className="text-xl font-bold tabular-nums text-emerald-500">{rangeEarned.toFixed(2)}</div>
+              <div className="text-[11px] text-slate-400">
+                {creditsSource === 'local' ? '快照 earned（缺失日回退打卡口径）' : '积分快照 earned 口径'}
+              </div>
+            </div>
+            <div className="rounded-lg border-t-2 border-amber-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+              <div className="text-xs text-slate-500">区间总消耗</div>
+              <div className="text-xl font-bold tabular-nums text-amber-500">{rangeSpent.toFixed(2)}</div>
+              <div className="text-[11px] text-slate-400">
+                {creditsSource === 'local' ? '逐账号余额日差分推导' : '官网请求流水 credit 合计'}
+              </div>
+            </div>
+            <div className="rounded-lg border-t-2 border-rose-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+              <div className="text-xs text-slate-500">净获得</div>
+              <div className={`text-xl font-bold tabular-nums ${rangeNet >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                {rangeNet >= 0 ? '+' : ''}{rangeNet.toFixed(2)}
+              </div>
+              <div className="text-[11px] text-slate-400">获得 − 消耗</div>
+            </div>
+          </div>
+        )}
 
-        {range === 'year' && (
+        {(range === 'year' || creditsSource === 'official') && (
           <p className="mb-3 text-[11px] text-slate-400">
-            注：打卡记录与网关用量仅保留近 90 天窗口，「近一年」区间按可得数据统计（起点自动钳到窗口内）。
+            {creditsSource === 'official'
+              ? '注：官网源仅覆盖近 31 天窗口（全账号聚合，跨账号合并）；区间超出部分按可得数据统计。'
+              : '注：打卡记录与网关用量仅保留近 90 天窗口，「近一年」区间按可得数据统计（起点自动钳到窗口内）。'}
           </p>
         )}
 
-        {trendData.length === 0 ? (
+        {creditsSource === 'local' && !hasSnapEarned && localSpent.size === 0 ? (
           <p className="py-6 text-center text-xs text-slate-400">
-            暂无数据。打卡成功或通过网关调用后按日落库，即可看到趋势。
+            暂无本地快照数据。打开「积分看板」或点「刷新数据」完成积分同步后按日落库，即可看到趋势。
+          </p>
+        ) : trendData.every((d) => d.消耗积分 === 0 && (d.获得积分 == null || d.获得积分 === 0)) ? (
+          <p className="py-6 text-center text-xs text-slate-400">
+            {creditsSource === 'gateway'
+              ? '该区间无网关消耗记录（启用 buddy-ai 国际档并通过网关调用后展示）。'
+              : creditsSource === 'official'
+                ? '该区间无官网消耗记录（官网源覆盖近 31 天；点「刷新数据」重拉后再试）。'
+                : '该区间无本地快照消耗记录。'}
           </p>
         ) : (
           <div className="h-56">
@@ -619,8 +899,17 @@ export default function BuddyAiCredits() {
                 <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
                 <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Line type="monotone" dataKey="获得积分" stroke="#10b981" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="消耗积分" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                {creditsSource !== 'gateway' && (
+                  <Line type="monotone" dataKey="获得积分" stroke="#10b981" strokeWidth={2} dot={false} connectNulls />
+                )}
+                <Line
+                  type="monotone"
+                  dataKey="消耗积分"
+                  name={creditsSource === 'gateway' ? '消耗积分（网关记账）' : '消耗积分'}
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  dot={false}
+                />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -628,56 +917,112 @@ export default function BuddyAiCredits() {
       </div>
       )}
 
-      {/* 积分包到期（P9 抓包解锁：get-user-resource Accounts[] 分包解析；对齐国内「到期」Tab） */}
+      {/* 积分到期（对齐国内 ExpiryTab：账号积分明细 + 积分到期日历 + 积分包明细） */}
       {tab === 'expiry' && (
-      <div className="card mt-4 overflow-x-auto p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <span className="text-sm font-medium">积分包到期</span>
-          <span className="text-[11px] text-slate-400">按包拆分剩余/总额/到期，升序排列（同步积分后刷新）</span>
-        </div>
-        {pkgList.length === 0 ? (
-          <p className="py-4 text-center text-xs text-slate-400">暂无分包数据，先「同步积分」取数。</p>
-        ) : (
-          <table className="w-full min-w-[640px] text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
-                <th className="py-2 pr-3 font-medium">账号</th>
-                <th className="py-2 pr-3 font-medium">包名</th>
-                <th className="py-2 pr-3 font-medium">剩余</th>
-                <th className="py-2 pr-3 font-medium">总额</th>
-                <th className="py-2 pr-3 font-medium">到期时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              {pkgList.map((p, i) => (
-                <tr key={`${p.acct}-${p.code}-${i}`} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
-                  <td className="py-2 pr-3 text-xs">{p.acct}</td>
-                  <td className="py-2 pr-3 text-xs">
-                    {p.name || p.code || '—'}
-                    {pkgSoon(p.expire_secs) && p.remain > 0 ? <Badge tone="amber">7 日内到期</Badge> : null}
-                  </td>
-                  <td className="py-2 pr-3 text-xs tabular-nums text-emerald-600 dark:text-emerald-400">{p.remain.toFixed(2)}</td>
-                  <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">{p.size.toFixed(0)}</td>
-                  <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">
-                    {p.expire_secs ? new Date(p.expire_secs * 1000).toLocaleString() : '—'}
-                  </td>
+      <>
+        {/* ① 账号积分明细（含积分包个数 / 最近到期，对齐国内 ExpiryTab 表结构） */}
+        <div className="card mt-4 overflow-x-auto p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <span className="text-sm font-medium">账号积分明细</span>
+            <span className="text-[11px] text-slate-400">积分包个数只计剩余 &gt; 0 的包（同步积分后刷新）</span>
+          </div>
+          {acctExpiryRows.length === 0 ? (
+            <p className="py-4 text-center text-xs text-slate-400">当前筛选条件下无账号。</p>
+          ) : (
+            <table className="w-full min-w-[680px] text-sm">
+              <thead>
+                <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
+                  <th className="py-2 pr-3 font-medium">账号</th>
+                  <th className="py-2 pr-3 font-medium">可用积分</th>
+                  <th className="py-2 pr-3 font-medium" title="剩余 > 0 的积分包计数（与顶部「积分包总数」口径一致）">
+                    积分包
+                  </th>
+                  <th className="py-2 pr-3 font-medium">最近到期</th>
+                  <th className="py-2 pr-3 font-medium">取数状态</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+              </thead>
+              <tbody>
+                {acctExpiryRows.map(({ a, pkgCount, nearest }) => (
+                  <tr key={a.id} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
+                    <td className="py-2.5 pr-3">
+                      <div className="font-medium">{a.nickname || a.id}</div>
+                      <div className="text-[11px] text-slate-400">{a.uid || a.id}</div>
+                    </td>
+                    <td className="py-2.5 pr-3 tabular-nums">
+                      {a.credits_balance != null ? (
+                        <span className="inline-flex items-center gap-1">
+                          <Coins size={13} className="text-amber-500" />
+                          {a.credits_balance.toFixed(2)}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-slate-400">未取数</span>
+                      )}
+                    </td>
+                    <td className="py-2.5 pr-3 text-xs tabular-nums text-slate-500">{pkgCount} 个</td>
+                    <td className="py-2.5 pr-3 text-xs tabular-nums">
+                      {nearest != null ? (
+                        <span className={nearest <= nowSec ? 'text-rose-500' : pkgSoon(nearest) ? 'text-amber-500' : 'text-slate-500'}>
+                          {new Date(nearest * 1000).toLocaleDateString()}
+                          {nearest <= nowSec ? '（已过期）' : pkgSoon(nearest) ? '（7 日内）' : ''}
+                        </span>
+                      ) : (
+                        <span className="text-slate-400">—</span>
+                      )}
+                    </td>
+                    <td className="py-2.5 pr-3 text-xs text-slate-500">{fmtFetched(a.credits_fetched_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* ② 积分到期日历（复用国内 ExpiryCalendar：按月分组倒序 + 倒计时徽标） */}
+        <div className="card mt-4 p-4">
+          <h3 className="mb-3 text-sm font-medium">积分到期日历</h3>
+          <ExpiryCalendar
+            items={expiryItems}
+            emptyHint="暂无到期项：先「刷新数据」完成积分同步，取得积分包明细后展示。"
+          />
+        </div>
+      </>
       )}
 
-      {/* Token 统计（P8 补齐：buddy_ai_days 桶网关记账切面） */}
-      {/* Token 统计（对齐国内 TokensTab：独立区间胶囊 + 四统计卡 + 柱线组合图 + 模型排行 + 热力图） */}
+      {/* Token 统计（对齐国内 TokensTab：数据源切换 + 独立区间胶囊 + 四统计卡 + 柱线组合图） */}
       {tab === 'tokens' && (
       <div className="card mt-4 p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-medium">Token 统计</span>
+            {/* 数据源切换（对齐国内 Dashboard 第二层分类；官网源 BuddyAI 无接口 → 禁用） */}
+            <span className="text-[11px] text-slate-400">数据源</span>
+            <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
+              {SOURCES.map((s) => {
+                const reason =
+                  s === 'official' ? 'BuddyAI 官网未提供按日 token 明细接口' : undefined;
+                return (
+                  <button
+                    key={s}
+                    disabled={!!reason}
+                    title={reason ?? SOURCE_LABELS[s]}
+                    className={`rounded-md px-3 py-1 text-xs font-medium transition ${
+                      tokensSource === s
+                        ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
+                        : 'text-slate-500 dark:text-zinc-400'
+                    } ${reason ? 'cursor-not-allowed opacity-40' : ''}`}
+                    onClick={() => setTokensSource(s)}
+                  >
+                    {SOURCE_LABELS[s]}
+                  </button>
+                );
+              })}
+            </div>
             <span className="text-[11px] text-slate-400">
-              网关记账（buddy-ai 档）· 仅保留 90 天窗口 · ~/.workbuddy-ai 独立记账
+              {tokensSource === 'local'
+                ? tokenStats
+                  ? `~/.workbuddy-ai 会话扫描 · ${tokenStats.files_scanned} 个文件 · ${tokenStats.window_days} 天窗口`
+                  : '~/.workbuddy-ai 会话扫描（加载中…）'
+                : '网关记账（buddy-ai 档）· 仅保留 90 天窗口 · ~/.workbuddy-ai 独立记账'}
             </span>
           </div>
           {/* 区间胶囊（独立于积分统计区间，对齐国内 TokensTab 顶栏） */}
@@ -705,68 +1050,144 @@ export default function BuddyAiCredits() {
             ))}
           </div>
         </div>
-        {/* 四统计卡（对齐国内配色：总紫 / 输入蓝 / 输出绿 / 请求橙） */}
-        <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-4">
-          <div className="rounded-lg border-t-2 border-violet-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">总 Tokens</div>
-            <div className="text-xl font-bold tabular-nums text-violet-500">{sumTokens.toLocaleString()}</div>
-            <div className="text-[11px] text-slate-400">输入 + 输出合计</div>
-          </div>
-          <div className="rounded-lg border-t-2 border-sky-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">输入 Tokens</div>
-            <div className="text-xl font-bold tabular-nums text-sky-500">{sumPrompt.toLocaleString()}</div>
-            <div className="text-[11px] text-slate-400">prompt（含缓存读取）</div>
-          </div>
-          <div className="rounded-lg border-t-2 border-emerald-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">输出 Tokens</div>
-            <div className="text-xl font-bold tabular-nums text-emerald-500">{sumCompletion.toLocaleString()}</div>
-            <div className="text-[11px] text-slate-400">completion 合计</div>
-          </div>
-          <div className="rounded-lg border-t-2 border-amber-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
-            <div className="text-xs text-slate-500">请求数</div>
-            <div className="text-xl font-bold tabular-nums text-amber-500">{sumRequests.toLocaleString()}</div>
-            <div className="text-[11px] text-slate-400">
-              {sumErrors > 0 ? `失败 ${sumErrors} 次` : '网关测量口径'}
+        {/* 四统计卡（本地源：总/输入/输出/缓存命中率；网关源：总/输入/输出/请求数） */}
+        {tokensSource === 'local' ? (
+          <>
+            <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+              <div className="rounded-lg border-t-2 border-violet-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">总 Tokens</div>
+                <div className="text-xl font-bold tabular-nums text-violet-500">
+                  {((tokenLocal?.input ?? 0) + (tokenLocal?.output ?? 0) + (tokenLocal?.cacheWrite ?? 0)).toLocaleString()}
+                </div>
+                <div className="text-[11px] text-slate-400">输入 + 输出 + 缓存写入</div>
+              </div>
+              <div className="rounded-lg border-t-2 border-sky-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">输入 Tokens</div>
+                <div className="text-xl font-bold tabular-nums text-sky-500">{(tokenLocal?.input ?? 0).toLocaleString()}</div>
+                <div className="text-[11px] text-slate-400">其中缓存读取 {(tokenLocal?.cacheRead ?? 0).toLocaleString()}</div>
+              </div>
+              <div className="rounded-lg border-t-2 border-emerald-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">输出 Tokens</div>
+                <div className="text-xl font-bold tabular-nums text-emerald-500">{(tokenLocal?.output ?? 0).toLocaleString()}</div>
+                <div className="text-[11px] text-slate-400">completion 合计</div>
+              </div>
+              <div className="rounded-lg border-t-2 border-amber-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">缓存命中率</div>
+                <div className="text-xl font-bold tabular-nums text-amber-500">
+                  {(tokenLocal?.input ?? 0) > 0
+                    ? `${(((tokenLocal?.cacheRead ?? 0) / (tokenLocal?.input ?? 1)) * 100).toFixed(1)}%`
+                    : '—'}
+                </div>
+                <div className="text-[11px] text-slate-400">口径：缓存读取 / 输入总量</div>
+              </div>
             </div>
-          </div>
-        </div>
-        {tokenTrend.length === 0 ? (
-          <p className="py-4 text-center text-xs text-slate-400">该区间无网关请求记录。</p>
+            {!tokenStats ? (
+              <p className="py-4 text-center text-xs text-slate-400">本地会话扫描中…（首次加载稍候）</p>
+            ) : tokenLocalTrend.every(
+                (d) => !(d['缓存读取'] as number) && !(d['新增输入'] as number) && !(d['输出'] as number) && !(d['缓存写入'] as number),
+              ) ? (
+              <p className="py-4 text-center text-xs text-slate-400">
+                暂无本地会话用量：通过 WorkBuddy AI 国际客户端产生会话后展示（~/.workbuddy-ai/projects）。
+              </p>
+            ) : (
+              <div className="h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={tokenLocalTrend} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#8884" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" tickLine={false} axisLine={false} />
+                    <YAxis
+                      yAxisId="tokens"
+                      tick={{ fontSize: 10 }}
+                      tickLine={false}
+                      axisLine={false}
+                      tickFormatter={(v: number) => `${Math.round(v / 1000)}k`}
+                    />
+                    <YAxis yAxisId="calls" orientation="right" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar yAxisId="tokens" dataKey="缓存读取" stackId="t" fill="#6366f1" />
+                    <Bar yAxisId="tokens" dataKey="新增输入" stackId="t" fill="#38bdf8" />
+                    <Bar yAxisId="tokens" dataKey="输出" stackId="t" fill="#10b981" />
+                    <Bar yAxisId="tokens" dataKey="缓存写入" stackId="t" fill="#f59e0b" radius={[3, 3, 0, 0]} />
+                    <Line
+                      yAxisId="calls"
+                      type="monotone"
+                      dataKey="调用"
+                      stroke="#f43f5e"
+                      strokeWidth={1.5}
+                      strokeDasharray="5 3"
+                      dot={false}
+                    />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </>
         ) : (
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={tokenTrend} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#8884" vertical={false} />
-                <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" tickLine={false} axisLine={false} />
-                <YAxis
-                  yAxisId="tokens"
-                  tick={{ fontSize: 10 }}
-                  tickLine={false}
-                  axisLine={false}
-                  tickFormatter={(v: number) => `${Math.round(v / 1000)}k`}
-                />
-                <YAxis yAxisId="calls" orientation="right" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
-                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar yAxisId="tokens" dataKey="输入" stackId="t" fill="#0ea5e9" />
-                <Bar yAxisId="tokens" dataKey="输出" stackId="t" fill="#10b981" radius={[3, 3, 0, 0]} />
-                <Line
-                  yAxisId="calls"
-                  type="monotone"
-                  dataKey="调用"
-                  stroke="#f43f5e"
-                  strokeWidth={1.5}
-                  strokeDasharray="5 3"
-                  dot={false}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
+          <>
+            <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+              <div className="rounded-lg border-t-2 border-violet-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">总 Tokens</div>
+                <div className="text-xl font-bold tabular-nums text-violet-500">{sumTokens.toLocaleString()}</div>
+                <div className="text-[11px] text-slate-400">输入 + 输出合计</div>
+              </div>
+              <div className="rounded-lg border-t-2 border-sky-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">输入 Tokens</div>
+                <div className="text-xl font-bold tabular-nums text-sky-500">{sumPrompt.toLocaleString()}</div>
+                <div className="text-[11px] text-slate-400">prompt（含缓存读取）</div>
+              </div>
+              <div className="rounded-lg border-t-2 border-emerald-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">输出 Tokens</div>
+                <div className="text-xl font-bold tabular-nums text-emerald-500">{sumCompletion.toLocaleString()}</div>
+                <div className="text-[11px] text-slate-400">completion 合计</div>
+              </div>
+              <div className="rounded-lg border-t-2 border-amber-500 bg-slate-50/60 p-3 dark:bg-zinc-900/60">
+                <div className="text-xs text-slate-500">请求数</div>
+                <div className="text-xl font-bold tabular-nums text-amber-500">{sumRequests.toLocaleString()}</div>
+                <div className="text-[11px] text-slate-400">
+                  {sumErrors > 0 ? `失败 ${sumErrors} 次` : '网关测量口径'}
+                </div>
+              </div>
+            </div>
+            {tokenTrend.length === 0 ? (
+              <p className="py-4 text-center text-xs text-slate-400">该区间无网关请求记录。</p>
+            ) : (
+              <div className="h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={tokenTrend} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#8884" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" tickLine={false} axisLine={false} />
+                    <YAxis
+                      yAxisId="tokens"
+                      tick={{ fontSize: 10 }}
+                      tickLine={false}
+                      axisLine={false}
+                      tickFormatter={(v: number) => `${Math.round(v / 1000)}k`}
+                    />
+                    <YAxis yAxisId="calls" orientation="right" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar yAxisId="tokens" dataKey="输入" stackId="t" fill="#0ea5e9" />
+                    <Bar yAxisId="tokens" dataKey="输出" stackId="t" fill="#10b981" radius={[3, 3, 0, 0]} />
+                    <Line
+                      yAxisId="calls"
+                      type="monotone"
+                      dataKey="调用"
+                      stroke="#f43f5e"
+                      strokeWidth={1.5}
+                      strokeDasharray="5 3"
+                      dot={false}
+                    />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </>
         )}
       </div>
       )}
 
-      {/* Token 模型排行（请求数口径；网关源无按模型 token 明细，对齐国内诚实声明） */}
+      {/* Token 模型排行（本地 = 按 tokens；网关 = 请求数口径，对齐国内诚实声明） */}
       {tab === 'tokens' && (
       <div className="card mt-4 p-4">
         <div className="mb-3 flex items-center justify-between">
@@ -778,11 +1199,51 @@ export default function BuddyAiCredits() {
                 ? '近 7 天'
                 : tokenRange === 'month'
                   ? '本月'
-                  : '近 90 天'}{' '}
-            · 网关记账 · 按请求数排序 Top8 + 其余合计
+                  : tokenRange === 'year'
+                    ? '近 90 天'
+                    : '近 30 天'}{' '}
+            · {tokensSource === 'local' ? '本地会话 · 按 tokens 排序' : '网关记账 · 按请求数排序'} Top8 + 其余合计
           </span>
         </div>
-        {tokenModelRank.length === 0 ? (
+        {tokensSource === 'local' ? (
+          tokenLocalRank.length === 0 ? (
+            <p className="py-6 text-center text-xs text-slate-400">
+              该区间无本地会话记录（通过 WorkBuddy AI 国际客户端产生会话后展示）。
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {tokenLocalRank.slice(0, 8).map((m) => (
+                <div key={m.name} className="flex items-center gap-3">
+                  <span className="w-44 shrink-0 truncate text-xs text-slate-600 dark:text-zinc-300" title={m.name}>
+                    {m.name}
+                  </span>
+                  <div className="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-zinc-800">
+                    <div
+                      className="h-full rounded-full bg-sky-500"
+                      style={{ width: `${tokenLocalRankMax > 0 ? Math.max((m.tokens / tokenLocalRankMax) * 100, 2) : 0}%` }}
+                    />
+                  </div>
+                  <span className="w-24 shrink-0 text-right text-xs tabular-nums text-slate-500">
+                    {m.tokens.toLocaleString()} tokens
+                  </span>
+                </div>
+              ))}
+              {tokenLocalRank.length > 8 && (
+                <div className="flex items-center gap-3 border-t border-slate-100 pt-2 dark:border-zinc-800">
+                  <span className="w-44 shrink-0 truncate text-xs text-slate-400">
+                    其余 {tokenLocalRank.length - 8} 个模型
+                  </span>
+                  <span className="w-24 shrink-0 text-right text-xs tabular-nums text-slate-400">
+                    {tokenLocalRank.slice(8).reduce((s, m) => s + m.tokens, 0).toLocaleString()} tokens
+                  </span>
+                </div>
+              )}
+              <p className="text-[11px] leading-4 text-slate-400">
+                口径说明：本地源按会话 jsonl 的 tokens 字段逐日按模型聚合（~/.workbuddy-ai/projects）。
+              </p>
+            </div>
+          )
+        ) : tokenModelRank.length === 0 ? (
           <p className="py-6 text-center text-xs text-slate-400">该区间无网关请求记录。</p>
         ) : (
           <div className="space-y-2">
@@ -821,17 +1282,24 @@ export default function BuddyAiCredits() {
       </div>
       )}
 
-      {/* Token 年度活动热力图（全量 90 天窗口 tokens，不受区间筛选影响） */}
+      {/* Token 年度活动热力图（本地 = 会话扫描全窗口；网关 = 90 天记账窗口） */}
       {tab === 'tokens' && (
       <div className="card mt-4 p-4">
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium">年度活动热力图</span>
-          <span className="text-[11px] text-slate-400">每日 Tokens（输入 + 输出）· 网关记账（仅保留 90 天窗口）</span>
+          <span className="text-[11px] text-slate-400">
+            每日 Tokens（输入 + 输出）·{' '}
+            {tokensSource === 'local' ? '本地会话扫描（随扫描窗口）' : '网关记账（仅保留 90 天窗口）'}
+          </span>
         </div>
         <ActivityHeatmap
-          values={tokenHeat}
+          values={tokensSource === 'local' ? tokenLocalHeat : tokenHeat}
           unit="tokens"
-          emptyHint="暂无网关用量：启用 buddy-ai 国际档并通过网关调用后展示。"
+          emptyHint={
+            tokensSource === 'local'
+              ? '暂无本地会话用量：通过 WorkBuddy AI 国际客户端产生会话后展示。'
+              : '暂无网关用量：启用 buddy-ai 国际档并通过网关调用后展示。'
+          }
         />
       </div>
       )}
@@ -890,20 +1358,32 @@ export default function BuddyAiCredits() {
       </div>
       )}
 
-      {/* 模型消耗排行（积分口径对齐国内：Top8 + 其余合计） */}
+      {/* 模型消耗排行（积分口径对齐国内：Top8 + 其余合计；官网源 = 31 天全窗口汇总） */}
       {tab === 'credits' && (
       <div className="card mt-4 p-4">
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium">模型消耗排行</span>
-          <span className="text-[11px] text-slate-400">近 90 天 · 网关记账 · 按积分排序 Top8 + 其余合计</span>
+          <span className="text-[11px] text-slate-400">
+            {creditsSource === 'gateway'
+              ? '近 90 天 · 网关记账 · 按积分排序 Top8 + 其余合计'
+              : creditsSource === 'official'
+                ? '官网 31 天全窗口 · 跨账号汇总 · 按积分排序'
+                : '本地快照无模型明细'}
+          </span>
         </div>
-        {modelRank.length === 0 ? (
+        {creditsSource === 'local' ? (
           <p className="py-6 text-center text-xs text-slate-400">
-            暂无消耗记录（启用 buddy-ai 国际档并通过网关调用后，此处展示按模型排行）。
+            本地快照仅有日合计（余额差分），无模型明细；切「官网」或「API网关」查看模型排行。
+          </p>
+        ) : (creditsSource === 'gateway' ? modelRank : officialModelRank).length === 0 ? (
+          <p className="py-6 text-center text-xs text-slate-400">
+            {creditsSource === 'official'
+              ? '官网暂无模型消耗记录（31 天窗口），点「刷新数据」重拉后再试。'
+              : '暂无消耗记录（启用 buddy-ai 国际档并通过网关调用后，此处展示按模型排行）。'}
           </p>
         ) : (
           <div className="space-y-2">
-            {modelRank.slice(0, 8).map((m) => (
+            {(creditsSource === 'gateway' ? modelRank : officialModelRank).slice(0, 8).map((m) => (
               <div key={m.name} className="flex items-center gap-3">
                 <span className="w-44 shrink-0 truncate text-xs text-slate-600 dark:text-zinc-300" title={m.name}>
                   {m.name}
@@ -911,7 +1391,18 @@ export default function BuddyAiCredits() {
                 <div className="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-zinc-800">
                   <div
                     className="h-full rounded-full bg-amber-500"
-                    style={{ width: `${rankMax > 0 ? Math.max((m.credits / rankMax) * 100, 2) : 0}%` }}
+                    style={{
+                      // 守门与分母同源：网关用网关 max，官网用官网 max（跨源混用会在
+                      // 网关零用量时把官网排行整列渲染成 0%）
+                      width: `${
+                        (creditsSource === 'gateway' ? rankMax : officialModelRank[0]?.credits ?? 0) > 0
+                          ? Math.max(
+                              (m.credits / (creditsSource === 'gateway' ? rankMax : officialModelRank[0]?.credits ?? 0)) * 100,
+                              2,
+                            )
+                          : 0
+                      }%`,
+                    }}
                   />
                 </div>
                 <span className="w-28 shrink-0 text-right text-xs tabular-nums text-slate-500">
@@ -919,149 +1410,226 @@ export default function BuddyAiCredits() {
                 </span>
               </div>
             ))}
-            {modelRank.length > 8 && (
+            {(creditsSource === 'gateway' ? modelRank : officialModelRank).length > 8 && (
               <div className="flex items-center gap-3 border-t border-slate-100 pt-2 dark:border-zinc-800">
                 <span className="w-44 shrink-0 truncate text-xs text-slate-400">
-                  其余 {modelRank.length - 8} 个模型
+                  其余 {(creditsSource === 'gateway' ? modelRank : officialModelRank).length - 8} 个模型
                 </span>
                 <span className="w-28 shrink-0 text-right text-xs tabular-nums text-slate-400">
-                  {modelRank.slice(8).reduce((s, m) => s + m.credits, 0).toFixed(2)} 积分
+                  {(creditsSource === 'gateway' ? modelRank : officialModelRank)
+                    .slice(8)
+                    .reduce((s, m) => s + m.credits, 0)
+                    .toFixed(2)}{' '}
+                  积分
                 </span>
               </div>
             )}
             <p className="text-[11px] leading-4 text-slate-400">
-              口径说明：按模型积分取自网关记账（模型倍率 × 用量）按日聚合；请求级真实积分见「会话明细」（官网流水）。
+              口径说明：
+              {creditsSource === 'gateway'
+                ? '按模型积分取自网关记账（模型倍率 × 用量）按日聚合；请求级真实积分见「会话明细」（官网流水）。'
+                : '官网源为 get-user-request-usage 31 天全窗口跨账号汇总，不随区间筛选变化；请求级明细见「会话明细」。'}
             </p>
           </div>
         )}
       </div>
       )}
 
-      {/* 年度活动热力图（消耗口径，对齐国内；窗口 90 天诚实标注） */}
+      {/* 年度活动热力图（消耗口径，随数据源切换；窗口诚实标注） */}
       {tab === 'credits' && (
       <div className="card mt-4 p-4">
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium">年度活动热力图</span>
-          <span className="text-[11px] text-slate-400">每日消耗积分 · 网关记账（仅保留 90 天窗口）</span>
+          <span className="text-[11px] text-slate-400">
+            每日消耗积分 ·{' '}
+            {creditsSource === 'gateway'
+              ? '网关记账（仅保留 90 天窗口）'
+              : creditsSource === 'official'
+                ? '官网流水（31 天窗口）'
+                : '本地快照差分（随快照保留窗口）'}
+          </span>
         </div>
-        <ActivityHeatmap values={heatValues} unit="积分" emptyHint="暂无消耗记录：启用 buddy-ai 国际档并通过网关调用后展示。" />
+        <ActivityHeatmap
+          values={heatValues}
+          unit="积分"
+          emptyHint={
+            creditsSource === 'official'
+              ? '官网源暂无消耗记录：点「刷新数据」重拉后再试。'
+              : '暂无消耗记录：启用 buddy-ai 国际档并通过网关调用后展示。'
+          }
+        />
       </div>
       )}
 
-      {/* 会话明细（P9 抓包解锁：官网 get-user-request-usage 请求级流水；Tab 名对齐国内） */}
+      {/* 会话明细（定时落地口径：官网请求级行缓存，纯缓存零网络；对齐国内 Buddy SessionsTab） */}
       {tab === 'sessions' && (
-      <div className="card mt-4 p-4">
-        <div className="mb-3 flex flex-wrap items-center gap-2">
-          <span className="text-sm font-medium">会话明细</span>
-          <select
-            className="rounded-md border border-slate-200 bg-transparent px-2 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
-            value={usageAcct}
+      <div className="mt-4 space-y-4">
+        {/* 筛选行：日期区间 + 快捷区间 + 账号 / 模型下拉（默认全部账号） */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-slate-500 dark:text-zinc-400">筛选</span>
+          <input
+            type="date"
+            value={sessStart}
             onChange={(e) => {
-              setUsageAcct(e.target.value);
-              setUsagePage(1);
-              setUsageData(null);
+              setSessStart(e.target.value);
+              setSessPage(1);
+            }}
+            className="input !py-1.5 !text-xs w-36"
+          />
+          <span className="text-xs text-slate-400">至</span>
+          <input
+            type="date"
+            value={sessEnd}
+            onChange={(e) => {
+              setSessEnd(e.target.value);
+              setSessPage(1);
+            }}
+            className="input !py-1.5 !text-xs w-36"
+          />
+          <button
+            className="chip border"
+            onClick={() => {
+              setSessStart(sessDate(6));
+              setSessEnd(sessDate(0));
+              setSessPage(1);
             }}
           >
-            <option value="">选择账号…</option>
-            {list.map((a) => (
+            近 7 天
+          </button>
+          <button
+            className="chip border"
+            onClick={() => {
+              setSessStart(sessDate(29));
+              setSessEnd(sessDate(0));
+              setSessPage(1);
+            }}
+          >
+            近 30 天
+          </button>
+          <select
+            value={sessUser}
+            onChange={(e) => {
+              setSessUser(e.target.value);
+              setSessPage(1);
+            }}
+            className="input !w-auto !py-1 text-xs"
+          >
+            <option value="">全部账号</option>
+            {listF.map((a) => (
               <option key={a.id} value={a.id}>
                 {a.nickname || a.id}
               </option>
             ))}
           </select>
           <select
-            className="rounded-md border border-slate-200 bg-transparent px-2 py-1 text-xs focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
-            value={usageDays}
+            value={sessModel}
             onChange={(e) => {
-              setUsageDays(Number(e.target.value));
-              setUsagePage(1);
-              // FM-2：筛选条件变更清空旧窗口数据（旧 total/旧行不得滞留展示）
-              setUsageData(null);
+              setSessModel(e.target.value);
+              setSessPage(1);
             }}
+            className="input !w-auto !py-1 text-xs"
           >
-            <option value={7}>近 7 天</option>
-            <option value={14}>近 14 天</option>
-            <option value={31}>近 31 天</option>
+            <option value="">全部模型</option>
+            {sessModels.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
           </select>
-          <button
-            className="btn-outline text-xs"
-            disabled={!usageAcct || usageLoading}
-            onClick={() => void loadUsage(usageAcct, usageDays, usagePage)}
-          >
-            {usageLoading ? '查询中…' : '查询'}
-          </button>
-          <span className="text-[11px] text-slate-400">
-            {usageData ? `共 ${usageData.total} 条 · 第 ${usagePage} 页` : '官网请求级流水（含打卡请求，可作官网侧旁证）'}
-          </span>
+          {sessLoading && <span className="text-xs text-slate-400">加载中…</span>}
+          {sessData && sessData.fetched_at > 0 && (
+            <span className="text-[11px] text-slate-400">
+              落地于 {new Date(sessData.fetched_at * 1000).toLocaleString()}
+            </span>
+          )}
         </div>
-        {!usageData ? (
-          <p className="py-4 text-center text-xs text-slate-400">选择账号与时间范围后点「查询」。</p>
-        ) : usageData.rows.length === 0 ? (
-          <p className="py-4 text-center text-xs text-slate-400">该窗口内无请求记录。</p>
+
+        {sessData && sessData.total === 0 ? (
+          <div className="card p-4">
+            <p className="py-6 text-center text-xs text-slate-400">
+              {sessData.fetched_at > 0
+                ? '当前筛选条件下暂无会话记录，可调整时间范围、账号或模型后重试。'
+                : '暂无落地数据：官网请求级行随「积分统计 · 官网源」加载或定时同步（Buddy 国际版积分数据同步）落盘，完成后自动展示。'}
+            </p>
+          </div>
         ) : (
-          <>
+          <div className="card overflow-hidden">
+            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3 dark:border-zinc-800">
+              <h3 className="font-medium">会话明细</h3>
+              <span className="text-xs text-slate-400">
+                {sessData
+                  ? `共 ${sessData.total.toLocaleString()} 条请求 · 区间合计 ${sessData.credits_total.toFixed(2)} 积分`
+                  : ''}
+              </span>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[720px] text-sm">
-                <thead>
-                  <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
-                    <th className="py-2 pr-3 font-medium">时间</th>
-                    <th className="py-2 pr-3 font-medium">模型</th>
-                    <th className="py-2 pr-3 font-medium">客户端</th>
-                    <th className="py-2 pr-3 font-medium">消耗积分</th>
-                    <th className="py-2 pr-3 font-medium">用途</th>
-                    <th className="py-2 pr-3 font-medium">输入内容</th>
+                <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
+                  <tr>
+                    <th className="px-4 py-2 text-left">时间</th>
+                    <th className="px-4 py-2 text-left">账号</th>
+                    <th className="px-4 py-2 text-left">会话说明</th>
+                    <th className="px-4 py-2 text-left">模型</th>
+                    <th className="px-4 py-2 text-right">消耗积分</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {usageData.rows.map((r, i) => (
-                    <tr key={`${r.requestId}-${i}`} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/50">
-                      <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">{r.requestTime}</td>
-                      <td className="py-2 pr-3 font-mono text-xs">{r.model}</td>
-                      <td className="py-2 pr-3 text-xs text-slate-500">{r.client}</td>
-                      <td className="py-2 pr-3 text-xs tabular-nums">
-                        {r.credit > 0 ? (
-                          <span className="text-amber-600 dark:text-amber-400">{r.credit.toFixed(2)}</span>
+                  {(sessData?.rows ?? []).map((r, idx) => (
+                    <tr
+                      key={`${r.user_id}-${r.session_id || 'x'}-${r.ts}-${idx}`}
+                      className="border-t border-slate-200 dark:border-zinc-800"
+                    >
+                      <td className="whitespace-nowrap px-4 py-2 text-xs tabular-nums text-slate-500">
+                        {new Date(r.ts * 1000).toLocaleString()}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2 text-xs">{r.account_name || r.user_id}</td>
+                      <td className="max-w-[260px] truncate px-4 py-2 text-xs" title={r.preview}>
+                        {r.preview || '—'}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2 text-xs">{r.model}</td>
+                      <td className="px-4 py-2 text-right text-xs tabular-nums">
+                        {r.credits > 0 ? (
+                          <span className="text-amber-600 dark:text-amber-400">{r.credits.toFixed(2)}</span>
                         ) : (
                           <span className="text-slate-400">0</span>
                         )}
                       </td>
-                      <td className="py-2 pr-3 text-xs text-slate-500">{r.agentPurpose}</td>
-                      <td className="py-2 pr-3 max-w-[220px] truncate text-xs text-slate-500" title={r.inputTrunc}>
-                        {r.inputTrunc || '—'}
-                      </td>
                     </tr>
                   ))}
+                  {sessData && sessData.rows.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="px-4 py-6 text-center text-xs text-slate-400">
+                        当前筛选条件下无会话记录
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
-            <div className="mt-3 flex items-center justify-end gap-2 text-xs">
-              <button
-                className="btn-outline px-2 py-1"
-                disabled={usagePage <= 1 || usageLoading}
-                onClick={() => {
-                  const p = usagePage - 1;
-                  setUsagePage(p);
-                  void loadUsage(usageAcct, usageDays, p);
-                }}
-              >
-                上一页
-              </button>
-              <span className="tabular-nums text-slate-500">
-                {usagePage} / {Math.max(Math.ceil(usageData.total / usageData.pageSize), 1)}
+            <div className="flex items-center justify-between border-t border-slate-100 px-5 py-2.5 dark:border-zinc-800">
+              <span className="text-xs text-slate-400">
+                第 {sessData?.page ?? sessPage} / {sessData ? Math.max(1, Math.ceil(sessData.total / sessData.page_size)) : 1} 页 · 每页 50 条
               </span>
-              <button
-                className="btn-outline px-2 py-1"
-                disabled={usagePage >= Math.ceil(usageData.total / usageData.pageSize) || usageLoading}
-                onClick={() => {
-                  const p = usagePage + 1;
-                  setUsagePage(p);
-                  void loadUsage(usageAcct, usageDays, p);
-                }}
-              >
-                下一页
-              </button>
+              <div className="flex gap-2">
+                <button
+                  className="btn-outline !px-2.5 !py-1 text-xs"
+                  disabled={sessLoading || sessPage <= 1}
+                  onClick={() => setSessPage((p) => Math.max(1, p - 1))}
+                >
+                  上一页
+                </button>
+                <button
+                  className="btn-outline !px-2.5 !py-1 text-xs"
+                  disabled={
+                    sessLoading || !sessData || sessPage >= Math.max(1, Math.ceil(sessData.total / sessData.page_size))
+                  }
+                  onClick={() => setSessPage((p) => p + 1)}
+                >
+                  下一页
+                </button>
+              </div>
             </div>
-          </>
+          </div>
         )}
       </div>
       )}

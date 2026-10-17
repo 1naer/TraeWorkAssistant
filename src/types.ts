@@ -1205,6 +1205,59 @@ export interface BuddyAiAccountView {
   has_snapshot_codebuddy?: boolean;
 }
 
+/** BuddyAI 官网按模型用量点（get-user-request-usage 聚合；镜像 WbUsageModelPoint） */
+export interface BuddyAiUsageModelPoint {
+  model: string;
+  request_count: number;
+  credit: number;
+}
+
+/** BuddyAI 全账号官网用量聚合（积分看板「官网」源；31 天零填充；镜像 WbUsageOfficialAll） */
+export interface BuddyAiUsageOfficialAll {
+  status: 'complete';
+  source: 'official_all';
+  accounts_total: number;
+  accounts_ok: number;
+  range_start: string;
+  range_end: string;
+  fetched_at_ms: number;
+  request_count_total: number;
+  /** 全部账号拉取失败时回退的过期聚合缓存（stale-on-error） */
+  stale?: boolean;
+  stale_reason?: string;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number; models: BuddyAiUsageModelPoint[] }[];
+  /** 按模型汇总（31 天全窗口、跨账号合并；stale 旧缓存可能缺省） */
+  models?: BuddyAiUsageModelPoint[];
+}
+
+/** BuddyAI 本地 Token 聚合条目（镜像 WbTokenAgg） */
+export interface BuddyAiTokenAgg {
+  total: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  uncached_input: number;
+  calls: number;
+  cache_hit_rate?: number | null;
+  date?: string;
+  key?: string;
+}
+
+/** BuddyAI 本地 Token 统计（~/.workbuddy-ai/projects 会话 jsonl 扫描；镜像 WbTokenStats） */
+export interface BuddyAiTokenStats {
+  summary: BuddyAiTokenAgg;
+  models: BuddyAiTokenAgg[];
+  projects: BuddyAiTokenAgg[];
+  daily: BuddyAiTokenAgg[];
+  daily_by_model: Record<string, BuddyAiTokenAgg[]>;
+  files_scanned: number;
+  parse_errors: number;
+  generated_at: number;
+  window_days: number;
+}
+
 export interface WorkBuddyAccountView {
   id: string;
   uid: string;

@@ -559,6 +559,27 @@ fn run_task(
             let mut events: Vec<Value> = Vec::new();
             let done = super::buddy_ai_checkin::run_checkin_round(st, &mut |ev| events.push(ev.clone()));
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            // 逐账号失败明细落 app_log（与 UI 路径 buddy_ai_checkin_start 同口径）：
+            // 定时路径此前只记计数——「2 失败」无原因，180s 超时/401/ACP 挂死不可辨
+            //（2026-10-17 09:20 定时轮 2/2 失败排查教训）
+            if failed > 0 {
+                crate::fs_utils::app_log(
+                    &st.data_dir,
+                    &format!(
+                        "buddy-ai: 定时打卡失败明细——{}",
+                        events
+                            .iter()
+                            .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                            .map(|e| format!(
+                                "{}({})",
+                                e.get("name").and_then(Value::as_str).unwrap_or("?"),
+                                e.get("message").and_then(Value::as_str).unwrap_or("")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                );
+            }
             let failed_permanent = events
                 .iter()
                 .filter(|e| {
@@ -642,15 +663,29 @@ fn run_task(
         // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试
         "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(st),
         // Buddy 国际版积分数据同步（get-user-resource 全池取数 → 池回写 + 快照）：
-        // 空池自然空转；runtime 传网关运行态（运行池三键拨新，issue #109 同类）
+        // 空池自然空转；runtime 传网关运行态（运行池三键拨新，issue #109 同类）。
+        // 顺带官网用量聚合刷新（force 跳过 10min 缓存，国内 wb-credits-snapshot 同款）——
+        // 聚合拉取随路落盘请求级行明细（buddy_ai_usage_sessions_cache），
+        // 会话明细 Tab 的定时保鲜数据源；统计尽力而为不上抛
         "buddy-ai-credits-sync" => {
-            crate::commands::workbuddy::buddy_ai_credits_sync_impl(st, runtime).map(|v| {
-                json!({
-                    "ok": true,
-                    "accounts": v.len(),
-                    "fetched": v.iter().filter(|a| a.get("credits_balance").map(|b| !b.is_null()).unwrap_or(false)).count(),
-                })
-            })
+            let credits = crate::commands::workbuddy::buddy_ai_credits_sync_impl(st, runtime)?;
+            let usage = match crate::commands::workbuddy::buddy_ai_usage_official_all_impl(st, true) {
+                Ok(_) => "已刷新",
+                Err(_) => "跳过（无可用凭证或拉取失败）",
+            };
+            // 本地 Token 统计重扫（对齐国内 wb-credits-snapshot 配套）：fresh=false 走
+            // 10min 结果缓存——每日任务时刻缓存必然过期，实际执行重扫；过期短缓存直接命中
+            let token_files = crate::commands::workbuddy_stats::buddy_ai_token_stats_impl(st, false)
+                .get("files_scanned")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Ok(json!({
+                "ok": true,
+                "accounts": credits.len(),
+                "fetched": credits.iter().filter(|a| a.get("credits_balance").map(|b| !b.is_null()).unwrap_or(false)).count(),
+                "usage": usage,
+                "token_files": token_files,
+            }))
         }
         // Buddy 国际版模型目录同步（/v3/config 直连 → 动态替换）：空池/无凭证静默跳过
         "buddy-ai-catalog-sync" => {

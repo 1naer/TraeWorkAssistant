@@ -112,7 +112,10 @@ export default function BuddyAiOverview() {
     (n, a) =>
       n +
       (a.credits_packages ?? []).filter(
-        (p) => p.expire_secs != null && p.expire_secs <= nowSec + 7 * 86400 && p.remain > 0,
+        // 与积分看板 pkgSoon 同口径：未来 7 天窗口（补 > nowSec 下界——
+        // 原判定把已过期包也计入告警，会持续挂在提醒卡上）
+        (p) =>
+          p.expire_secs != null && p.expire_secs > nowSec && p.expire_secs <= nowSec + 7 * 86400 && p.remain > 0,
       ).length,
     0,
   );

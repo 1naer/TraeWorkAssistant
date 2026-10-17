@@ -559,13 +559,30 @@ pub fn unified_models_ex(
         }
     }
 
-    // 源2.5：buddy-ai（国际版静态目录，阶段 2 审查修复）：调用方提供旗标时并入
-    //（旧签名包装传 None = 测试面与既有调用方零变化）。CN 目录已有条目仅追加来源
-    // 标记（R-9 同账号体系同名模型双区可服务）；Intl 专属 id 建新条目。倍率静态
-    // 占位（1.0 待人工核对回填）不进展示——rate 记 None（未声明，显示 —），防假定价；
-    // 条目始终入表（镜像 Qoder 语义），`enabled` 徽章 = 开关 && 池健康
+    // 源2.5：buddy-ai（国际版目录）：调用方提供旗标时并入（旧签名包装传 None =
+    // 测试面与既有调用方零变化）。CN 目录已有条目仅追加来源标记（R-9 同账号体系
+    // 同名模型双区可服务）；Intl 专属 id 建新条目。倍率静态占位（1.0 待人工核对
+    // 回填）不进展示——rate 记 None（未声明，显示 —），防假定价；条目始终入表
+    //（镜像 Qoder 语义），`enabled` 徽章 = 开关 && 池健康。
+    // 目录源修复（审查 P1）：消费动态目录 buddy_ai_load（kv buddy_ai_model_catalog，
+    // 与 dispatch 取号/资源调度页同源）——原用 builtin 静态表，「同步官网模型」新增的
+    // Intl 模型不出现在 /v1/models 与管理端目录，上游下架的模型仍展示为可路由
     if buddy_ai.is_some() {
-        for m in super::wb_catalog::builtin_buddy_ai() {
+        // 倍率来源判定（审查修复配套）：动态目录（kv buddy_ai_model_catalog）存在才
+        // 透传真实倍率——kv 缺失时 buddy_ai_load 回落 builtin 占位 1.0，维持 None
+        // 防假定价（与「静态占位不进展示」原口径一致）
+        let dynamic_catalog = crate::store::db(data_dir)
+            .kv_get_raw(super::wb_catalog::BUDDY_AI_CATALOG_KEY)
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        let rate_of = |m: &super::wb_catalog::WbModel| {
+            if dynamic_catalog && m.rate.is_finite() {
+                Some(m.rate)
+            } else {
+                None
+            }
+        };
+        for m in super::wb_catalog::buddy_ai_load(data_dir) {
             let canonical = canonical_id(&m.id);
             if canonical.is_empty() {
                 continue;
@@ -595,7 +612,9 @@ pub fn unified_models_ex(
                             },
                             vendor: String::new(),
                             region: None,
-                            rate: None,
+                            // 动态目录自带真实倍率（credits "x1.39" 解析；NaN=元数据缺失
+                            // 哨兵与 builtin 回落均保持 None 防假定价）
+                            rate: rate_of(&m),
                             efforts: m.supported_efforts.clone(),
                             max_mode: false,
                             context_length: (m.context_length > 0).then_some(m.context_length),
@@ -603,7 +622,7 @@ pub fn unified_models_ex(
                             supports_image: Some(m.supports_image),
                             sources: vec![UnifiedSource {
                                 pool: "buddy-ai",
-                                rate: None,
+                                rate: rate_of(&m),
                                 enabled: bai_enabled,
                             }],
                             manual: false,

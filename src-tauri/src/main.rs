@@ -374,6 +374,8 @@ fn main() {
             commands::workbuddy::buddy_ai_local_scan,
             commands::workbuddy::buddy_ai_env_reset,
             commands::workbuddy::buddy_ai_request_usage,
+            commands::workbuddy::buddy_ai_usage_official_all,
+            commands::workbuddy::buddy_ai_sessions_query,
             commands::workbuddy::buddy_ai_credits_fetch,
             commands::workbuddy::buddy_ai_open_data_dir,
             commands::workbuddy::buddy_ai_catalog_sync,
@@ -385,6 +387,7 @@ fn main() {
             commands::workbuddy::workbuddy_sessions_query,
             commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
+            commands::workbuddy_stats::buddy_ai_token_stats,
             // Qoder（F-80 M1：签到 MVP 闭环 + 最小积分通道）
             commands::qoder::qoder_env_check,
             commands::qoder::qoder_open_ide,

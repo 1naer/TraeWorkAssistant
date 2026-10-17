@@ -868,8 +868,12 @@ fn run_wb_stream(
                                 state.usage_bucket(),
                                 usage.as_ref().map(cached_tokens_of).unwrap_or(0),
                             );
-                            state.record_usage_ttfb(
-                                true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
+                            // 分桶修复（审查 P1）：按 route_pool 实际桶入账——原写死
+                            // is_wb=true，buddy-ai 流式成功请求全部误入 wb_days 桶
+                            //（国内 Buddy 看板虚高、buddy_ai_days 只剩失败行，积分看板失真）
+                            state.record_usage_bucket_ttfb(
+                                state.usage_bucket(), model, win_uid, key_id,
+                                error_info.is_none() && !failed_inline,
                                 true, duration_ms, pt, ct, Some(ttfb_ms),
                             );
                         }

@@ -208,6 +208,7 @@ pub fn buddy_ai_oauth_login(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command(async)]
 pub fn buddy_ai_account_import_creds(
     state: State<'_, AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     name: Option<String>,
     access_token: String,
     refresh_token: Option<String>,
@@ -267,7 +268,11 @@ pub fn buddy_ai_account_import_creds(
     // BL-2 审查修复：同 id 重导合并式写回——upsert 是整行 REPLACE，从零构造会：
     // ① rt 缺省时 DB 占位置空但 vault 旧 rt 仍在（secure 回填复活，与「无则不可
     // 续期」语义矛盾）；② 抹掉 last_daily_chat/uid（当日打卡被重跑）。改为在旧
-    // rec 上合并：新值优先、缺省回落旧值、幂等戳恒保留
+    // rec 上合并：新值优先、缺省回落旧值、幂等戳恒保留。
+    // 凭证读-合并-写全程持每账号刷新锁：读旧 rec 与 upsert 之间若并发续期轮换 rt，
+    // 锁外读到的 stale rt 会整行覆盖新 rt（账号须重登）——与续期/打卡写段同锁域
+    let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+    let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
     let existing = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
         .get("tokens")
         .and_then(|t| t.get(&target_id))
@@ -296,7 +301,10 @@ pub fn buddy_ai_account_import_creds(
         }
     }
     crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &target_id, &creds)?;
+    drop(_refresh_guard);
     fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 手工导入国际账号 {target_id}"));
+    // 新凭证/新成员 → 网关池热重载（不重载运行中的网关看不到新凭证）
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(json!({ "id": target_id, "domain": domain }))
 }
 
@@ -375,9 +383,13 @@ pub(crate) fn buddy_ai_pool_account_id_by_uid(state: &AppState, uid: &str) -> Op
         .map(|a| a.id)
 }
 
-/// 移除 buddy-ai 账号（池条目 + token store 行 + buddy-ai vault 条目三清）
+/// 移除 buddy-ai 账号（池条目 + token store 行 + buddy-ai vault 条目三清 + 标签绑定清理）
 #[tauri::command(async)]
-pub fn buddy_ai_account_remove(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
+pub fn buddy_ai_account_remove(
+    state: State<'_, AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    user_id: String,
+) -> Result<(), String> {
     if user_id.is_empty() || user_id.len() > 64 {
         return Err(format!("非法账号标识: {user_id}"));
     }
@@ -397,6 +409,15 @@ pub fn buddy_ai_account_remove(state: State<'_, AppState>, user_id: String) -> R
     crate::vault::ns_remove(&state.data_dir, crate::tasks::wb_common::BUDDY_AI_VAULT_NS, &user_id);
     crate::tasks::wb_common::refresh_lock_remove(&user_id);
     fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 移除账号 {user_id}"));
+    // 标签绑定清理 + 展开索引失效（对齐国内 workbuddy 账号删除路径；buddy-ai 删号
+    // 此前不清 account_tags，幽灵绑定只能靠不含 buddy-ai 池的孤儿自愈清——永远清不掉）
+    if let Err(e) = crate::store::docs::account_tags_remove_account(&crate::store::db(&state.data_dir), &user_id) {
+        fs_utils::app_log(&state.data_dir, &format!("buddy-ai 账号 {user_id} 标签绑定清理失败: {e}"));
+    }
+    drop(_guard);
+    crate::api_server::org_index::invalidate(&state.data_dir);
+    // 池成员变更 → 网关热重载（已删账号不重载会继续被取号）
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
 }
 
@@ -474,9 +495,14 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     };
     let new_access = as_str(fs_utils::dig(&body, &["accessToken"])).ok_or("刷新响应中无 accessToken")?;
     let new_refresh = as_str(fs_utils::dig(&body, &["refreshToken"]));
-    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
+    // 宽容解析：expiresIn 可能以数字字符串返回（字段漂移时 as_i64 会静默丢失 →
+    // 池过期时间被清成 None → 兜底续期从此永不选中该账号）
+    let num_of = |v: &Value| -> Option<i64> {
+        v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| num_of(v));
     let refresh_expires_in: Option<i64> =
-        fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| v.as_i64());
+        fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| num_of(v));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let exp_ms = expires_in.map(|s| now_ms + s * 1000);
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
@@ -500,13 +526,16 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
         rm.insert("domain".into(), json!(intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"])))));
     }
     crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &acct.id, &merged)?;
-    // 短临界区回写池过期时间
+    // 短临界区回写池过期时间（响应缺 expiresIn 时保留池内旧值——清成 None 会让
+    // 兜底续期从此永不选中该账号；auth_saved_at 同步刷新，给 renew 的「无到期记录
+    // 也纳入」分支提供 48h 节流锚点）
     {
         let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = load_buddy_pool(&state);
         if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct.id) {
-            a.access_token_expires_at = exp_ms.map(|m| m / 1000);
-            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000);
+            a.access_token_expires_at = exp_ms.map(|m| m / 1000).or(a.access_token_expires_at);
+            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000).or(a.refresh_token_expires_at);
+            a.auth_saved_at = Some(chrono::Utc::now().timestamp());
             save_buddy_pool(&state, &pool)?;
         }
     }
@@ -525,10 +554,16 @@ pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
         .accounts
         .iter()
         .filter(|a| {
-            !a.disabled
-                && a.access_token_expires_at
-                    .map(|e| e <= now + 48 * 3600)
-                    .unwrap_or(false)
+            if a.disabled {
+                return false;
+            }
+            match a.access_token_expires_at {
+                // 有到期记录：剩余 ≤48h 纳入
+                Some(e) => e <= now + 48 * 3600,
+                // 无到期记录（导入未带 expiresIn 等）：凭证落盘超 48h 也纳入兜底，
+                // 否则这类账号永不触发兜底续期（auth_saved_at 在续期成功时刷新节流）
+                None => a.auth_saved_at.map(|s| s <= now - 48 * 3600).unwrap_or(false),
+            }
         })
         .map(|a| a.id.clone())
         .collect();
@@ -643,45 +678,39 @@ pub(crate) fn try_acquire_buddy_ai_round() -> Result<BuddyAiRoundGuard, String> 
 
 /// buddy-ai 每日活跃打卡启动（手动触发，UI 进度经 buddy-ai-checkin-progress NDJSON 推送）
 #[tauri::command(async)]
-pub fn buddy_ai_checkin_start(app: tauri::AppHandle) -> Result<(), String> {
+pub fn buddy_ai_checkin_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     // 轮次互斥：CAS 抢占（运行中重复点击显式拒绝）；守卫移动进执行线程，
     // 生命周期覆盖整轮（临时守卫若不 move 会在语句末 Drop 白抢一次锁）
     let _round = try_acquire_buddy_ai_round()?;
+    // 审查修复（P1）：把受管 AppState 克隆进执行线程——原 AppState::new() 造出的
+    // buddy_ai_pool_lock 与 UI 命令的不同实例，打卡整轮的池回写（积分快照）与
+    // 导入/移除/积分同步的池读-改-写互斥失效，并发时互相整文档覆盖丢更新
+    let st = state.inner().clone();
     std::thread::spawn(move || {
         let _round = _round; // 显式移动进闭包，Drop 自动复位 BUSY（含 panic 展开）
-        let st = AppState::new();
-        // FH-2 审查修复：Err（AppState 初始化失败）分支此前只发 exit，done 载荷
-        // 从未 emit → 前端 running 复位、进度空白、零失败反馈。正常路径的 done 由
-        // run_checkin_round 末尾回调发出（不在此重复 emit），此处仅 Err 分支补发
-        let err_done = match st {
-            Ok(st) => {
-                let mut events: Vec<Value> = Vec::new();
-                let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, &mut |ev| {
-                    // NDJSON 契约对齐 wb-checkin：payload 为序列化 JSON 字符串
-                    let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(ev).unwrap_or_default());
-                    events.push(ev.clone());
-                });
-                // 汇总落日志（含单账号明细，排查打卡失败形态）
-                fs_utils::app_log(
-                    &st.data_dir,
-                    &format!(
-                        "buddy-ai: 活跃打卡整轮完成——ok={} already={} failed={} {}",
-                        done.get("ok").and_then(Value::as_i64).unwrap_or(0),
-                        done.get("already").and_then(Value::as_i64).unwrap_or(0),
-                        done.get("failed").and_then(Value::as_i64).unwrap_or(0),
-                        events.iter().filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
-                            .map(|e| format!("{}({})", e.get("id").and_then(Value::as_str).unwrap_or("?"), e.get("message").and_then(Value::as_str).unwrap_or("")))
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    ),
-                );
-                None
-            }
-            Err(e) => Some(json!({ "type": "done", "ok": 0, "already": 0, "failed": 1, "message": e })),
-        };
-        if let Some(done) = err_done {
-            let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(&done).unwrap_or_default());
-        }
+        let mut events: Vec<Value> = Vec::new();
+        let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, &mut |ev| {
+            // NDJSON 契约对齐 wb-checkin：payload 为序列化 JSON 字符串
+            let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(ev).unwrap_or_default());
+            events.push(ev.clone());
+        });
+        // 汇总落日志（含单账号明细，排查打卡失败形态）
+        fs_utils::app_log(
+            &st.data_dir,
+            &format!(
+                "buddy-ai: 活跃打卡整轮完成——ok={} already={} failed={} {}",
+                done.get("ok").and_then(Value::as_i64).unwrap_or(0),
+                done.get("already").and_then(Value::as_i64).unwrap_or(0),
+                done.get("failed").and_then(Value::as_i64).unwrap_or(0),
+                events.iter().filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                    .map(|e| format!("{}({})", e.get("id").and_then(Value::as_str).unwrap_or("?"), e.get("message").and_then(Value::as_str).unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        );
         let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(&json!({"type":"exit"})).unwrap_or_default());
     });
     Ok(())
@@ -837,14 +866,15 @@ pub fn startup_auto_checkin_buddy_ai(app: &tauri::AppHandle, state: &AppState) {
     }
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
+    // 审查修复（P1）：克隆受管 AppState 进线程——AppState::new() 的新锁实例会让
+    // 打卡整轮的池回写与 UI 命令的池读-改-写互斥失效（与 buddy_ai_checkin_start 同款）
+    let st = state.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(60));
         // 抢不到轮次锁（UI 手动打卡在跑）= 幂等跳过
         let Ok(_guard) = try_acquire_buddy_ai_round() else {
             return;
         };
-        let st = AppState::new();
-        let Ok(st) = st else { return };
         let mut events: Vec<Value> = Vec::new();
         let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, &mut |ev| events.push(ev.clone()));
         let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
@@ -993,6 +1023,7 @@ pub fn migrate_wb_global_accounts(state: &AppState) -> Result<(usize, usize), St
 #[tauri::command(async)]
 pub fn buddy_ai_account_save(
     state: State<'_, AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
     name: Option<String>,
     note: Option<String>,
@@ -1014,7 +1045,13 @@ pub fn buddy_ai_account_save(
     if let Some(g) = group_id {
         acct.group_id = g;
     }
-    save_buddy_pool(&state, &pool)
+    let result = save_buddy_pool(&state, &pool);
+    // 成员/分组变更影响网关池装配 → 热重载（先释放池锁，锁序纪律）
+    drop(_guard);
+    if result.is_ok() {
+        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+    }
+    result
 }
 
 /// buddy-ai 账号启停（P3/P6「账号调度池」）：停用即退出打卡花名册与网关取号
@@ -1022,6 +1059,7 @@ pub fn buddy_ai_account_save(
 #[tauri::command(async)]
 pub fn buddy_ai_account_toggle(
     state: State<'_, AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
     disabled: bool,
 ) -> Result<(), String> {
@@ -1033,7 +1071,13 @@ pub fn buddy_ai_account_toggle(
         .find(|a| a.id == user_id)
         .ok_or_else(|| format!("账号不存在: {user_id}"))?;
     acct.disabled = disabled;
-    save_buddy_pool(&state, &pool)
+    let result = save_buddy_pool(&state, &pool);
+    // 启停影响网关取号资格 → 热重载（停用账号不重载会继续被取号，直到下次重载）
+    drop(_guard);
+    if result.is_ok() {
+        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+    }
+    result
 }
 
 /// buddy-ai 官网请求流水查询（P9 抓包解锁：/v2/billing/meter/get-user-request-usage
@@ -1150,6 +1194,495 @@ pub fn buddy_ai_request_usage(
         })
         .unwrap_or_default();
     Ok(json!({ "total": total, "page": page, "pageSize": page_size, "rows": rows }))
+}
+
+/// 全账号官网用量聚合（BuddyAI 积分看板「官网」源；镜像国内 workbuddy_usage_official_all）：
+/// 遍历 buddy-ai 池启用且有凭证的账号，逐个拉取 get-user-request-usage 近 31 天
+/// 分页明细，按日/按模型跨账号求和（31 天零填充）。聚合缓存 10 分钟；
+/// 单账号失败跳过（accounts_ok 计数），全部失败回退过期缓存（stale-on-error）。
+#[tauri::command(async)]
+pub fn buddy_ai_usage_official_all(state: State<'_, AppState>) -> Result<Value, String> {
+    buddy_ai_usage_official_all_impl(&state, false)
+}
+
+pub(crate) fn buddy_ai_usage_official_all_impl(state: &AppState, force: bool) -> Result<Value, String> {
+    let cache_path = "buddy_ai_usage_official_all_cache"; // kv 键（SQLite 化 P2）
+    let cached_val: Option<Value> = {
+        let c: Value = crate::store::db(&state.data_dir).kv_get(cache_path);
+        (c.get("status").is_some()).then_some(c)
+    };
+    if !force {
+        if let Some(cached) = &cached_val {
+            let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
+            if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
+                return Ok(cached.clone());
+            }
+        }
+    }
+
+    let pool = load_buddy_pool(state);
+    let tokens = load_buddy_tokens(state);
+    let agent = crate::tasks::http_agent(30);
+    let mut rows: Vec<(String, f64, String)> = Vec::new(); // (date, credit, model)
+    let mut session_buckets: Vec<(String, String, Vec<BuddyAiSessionRow>)> = Vec::new();
+    let mut accounts_total = 0usize;
+    let mut accounts_ok = 0usize;
+    let mut any_truncated = false;
+    for acct in &pool.accounts {
+        if acct.disabled {
+            continue;
+        }
+        let rec = tokens
+            .get("tokens")
+            .and_then(|t| t.get(&acct.id))
+            .cloned()
+            .unwrap_or_default();
+        let token = as_str(fs_utils::dig(&rec, &["access_token"]))
+            .filter(|t| !t.is_empty())
+            .map(|s| s.to_string());
+        let Some(token) = token else { continue };
+        accounts_total += 1;
+        let uid = if acct.uid.is_empty() {
+            as_str(fs_utils::dig(&rec, &["uid"])).unwrap_or_default().to_string()
+        } else {
+            acct.uid.clone()
+        };
+        let base = crate::tasks::wb_common::region_activity_base(&intl_domain_or(as_str(
+            fs_utils::dig(&rec, &["domain"]),
+        )
+        .map(|s| s.to_string())));
+        match buddy_ai_official_usage_rows(&agent, &base, &token, &uid) {
+            Ok((r, sess, truncated)) => {
+                accounts_ok += 1;
+                any_truncated = any_truncated || truncated;
+                // 行级明细随聚合一并落盘（国内 save_account_session_rows 同款）：
+                // 会话明细 Tab 纯缓存查询的数据源；定时任务与页面拉取共用此落地
+                session_buckets.push((acct.id.clone(), if acct.nickname.is_empty() { acct.id.clone() } else { acct.nickname.clone() }, sess));
+                rows.extend(r);
+            }
+            Err(e) => fs_utils::app_log(
+                &state.data_dir,
+                &format!("buddy-ai: 官网用量拉取失败（{}）：{e}", acct.id),
+            ),
+        }
+    }
+    if accounts_ok == 0 {
+        // 全部失败：不动会话明细缓存（防止失败轮把已落地明细清空），聚合回退 stale
+        if let Some(c) = &cached_val {
+            let mut stale = c.clone();
+            stale["stale"] = json!(true);
+            stale["stale_reason"] = json!("all_accounts_fetch_failed");
+            return Ok(stale);
+        }
+        return Err("无可用账号凭证，或全部账号官网用量拉取失败（请检查登录态）".to_string());
+    }
+    // 行级明细落盘（成功轮才写；部分失败时失败账号保留旧桶不清零；读-改-写经锁串行化）
+    {
+        static SESSIONS_KV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = SESSIONS_KV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        // 旧缓存：保留非本轮成功账号的历史桶（失败账号明细不清零；已移除账号的桶顺带清理）
+        let mut accounts_json: serde_json::Map<String, Value> = cached_val
+            .as_ref()
+            .and_then(|c| c.get("accounts"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let pool_ids: std::collections::BTreeSet<String> =
+            pool.accounts.iter().map(|a| a.id.clone()).collect();
+        accounts_json.retain(|id, _| pool_ids.contains(id));
+        for (id, name, rows) in session_buckets {
+            accounts_json.insert(
+                id,
+                json!({
+                    "name": name,
+                    "rows": rows.iter().map(|r| json!({
+                        "ts": r.ts,
+                        "request_id": r.request_id,
+                        "model": r.model,
+                        "credits": r.credits,
+                        "preview": r.preview,
+                    })).collect::<Vec<_>>(),
+                }),
+            );
+        }
+        let cache = json!({
+            "fetched_at": chrono::Utc::now().timestamp_millis(),
+            "accounts": accounts_json,
+        });
+        let _ = crate::store::db(&state.data_dir).kv_set("buddy_ai_usage_sessions_cache", &cache);
+    }
+
+    // 聚合：今日/近7天/本月 + 31 天零填充逐日 + 模型排行（对齐国内 usage_official_fetch 口径）
+    use chrono::Datelike;
+    let today = chrono::Local::now().date_naive();
+    let mut usage_today = 0.0f64;
+    let mut usage_week = 0.0f64;
+    let mut usage_month = 0.0f64;
+    let mut daily_credits: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut daily_models: std::collections::HashMap<String, std::collections::HashMap<String, (u64, f64)>> =
+        std::collections::HashMap::new();
+    let mut model_totals: std::collections::HashMap<String, (u64, f64)> = std::collections::HashMap::new();
+    for (date, credit, model) in &rows {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+            let dist = (today - d).num_days();
+            if dist == 0 {
+                usage_today += credit;
+            }
+            if (0..7).contains(&dist) {
+                usage_week += credit;
+            }
+            if d.year() == today.year() && d.month() == today.month() {
+                usage_month += credit;
+            }
+        }
+        *daily_credits.entry(date.clone()).or_insert(0.0) += credit;
+        let dm = daily_models.entry(date.clone()).or_default();
+        let e = dm.entry(model.clone()).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += credit;
+        let mt = model_totals.entry(model.clone()).or_insert((0, 0.0));
+        mt.0 += 1;
+        mt.1 += credit;
+    }
+    let mut models_out: Vec<Value> = model_totals
+        .into_iter()
+        .map(|(model, (count, credit))| json!({ "model": model, "request_count": count, "credit": credit }))
+        .collect();
+    models_out.sort_by(|a, b| {
+        let ca = a.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+        let cb = b.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+        cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut daily_out: Vec<Value> = Vec::new();
+    for i in (0..=30).rev() {
+        let key = (today - chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
+        let mut day_models: Vec<Value> = daily_models
+            .get(&key)
+            .map(|m| {
+                m.iter()
+                    .map(|(model, (count, credit))| json!({ "model": model, "request_count": count, "credit": credit }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        day_models.sort_by(|a, b| {
+            let ca = a.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+            let cb = b.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+            cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        daily_out.push(json!({
+            "date": key,
+            "usage": daily_credits.get(&key).copied().unwrap_or(0.0),
+            "models": day_models,
+        }));
+    }
+    let payload = json!({
+        "status": "complete",
+        "source": "official_all",
+        "accounts_total": accounts_total,
+        "accounts_ok": accounts_ok,
+        "range_start": (today - chrono::Duration::days(30)).format("%Y-%m-%d").to_string(),
+        "range_end": today.format("%Y-%m-%d").to_string(),
+        "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
+        "request_count_total": rows.len(),
+        // 31 天 > 30 页×100 行上限时为 true（聚合低估，前端须明示）
+        "truncated": any_truncated,
+        "summary": {
+            "usage_today": usage_today,
+            "usage_7days": usage_week,
+            "usage_this_month": usage_month,
+        },
+        "daily": daily_out,
+        "models": models_out,
+    });
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "buddy-ai: 官网用量聚合刷新（{accounts_ok}/{accounts_total} 账号成功，{} 行）",
+            rows.len()
+        ),
+    );
+    Ok(payload)
+}
+
+/// buddy-ai 会话明细查询（纯缓存零网络；镜像国内 workbuddy_sessions_query）。
+/// 数据源 = buddy_ai_usage_sessions_cache（官网用量聚合拉取时随路落盘，
+/// 定时任务 buddy-ai-credits-sync 与页面「官网源」加载共用保鲜）。
+/// 区间 [start, end] 本地日字符串字典序比较；model/user_id 可选过滤；
+/// 按时间倒序分页；账号归属 buddy-ai 池（已移除账号的残留桶不展示）。
+#[tauri::command(async)]
+pub fn buddy_ai_sessions_query(
+    state: State<'_, AppState>,
+    start: String,
+    end: String,
+    model: Option<String>,
+    user_id: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<crate::commands::usage_history::UsageSessionsResult, String> {
+    use crate::commands::usage_history::{UsageSessionView, UsageSessionsResult};
+    let cache: Value = crate::store::db(&state.data_dir).kv_get("buddy_ai_usage_sessions_cache");
+
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(50).clamp(1, 200);
+    let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
+
+    // 账号归属判定：buddy-ai 池现役账号（含停用——历史消耗仍可见）
+    let pool_ids: std::collections::BTreeSet<String> =
+        load_buddy_pool(&state).accounts.iter().map(|a| a.id.clone()).collect();
+    // 缓存 fetched_at 为毫秒；契约统一为 Unix 秒（与国内 Buddy 会话明细一致）
+    let fetched_at = cache.get("fetched_at").and_then(Value::as_i64).unwrap_or(0) / 1000;
+
+    let mut rows: Vec<UsageSessionView> = Vec::new();
+    let mut models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (acct_id, bucket) in cache.get("accounts").and_then(Value::as_object).into_iter().flatten() {
+        if !pool_ids.contains(acct_id) || uid_filter.is_some_and(|f| acct_id != f) {
+            continue;
+        }
+        let name = bucket.get("name").and_then(Value::as_str).unwrap_or("");
+        for r in bucket.get("rows").and_then(Value::as_array).into_iter().flatten() {
+            let ts = r.get("ts").and_then(Value::as_i64).unwrap_or(0);
+            let date = chrono::DateTime::from_timestamp(ts, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            if date.as_str() < start.as_str() || date.as_str() > end.as_str() {
+                continue;
+            }
+            let m = r.get("model").and_then(Value::as_str).unwrap_or("未知模型");
+            models.insert(m.to_string());
+            if model_filter.is_some_and(|f| m != f) {
+                continue;
+            }
+            rows.push(UsageSessionView {
+                user_id: acct_id.clone(),
+                account_name: name.to_string(),
+                session_id: r.get("request_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                ts,
+                date,
+                model: m.to_string(),
+                // buddy-ai 官网行级明细无 mode/cost/token 字段 → 全空（前端显示 —）
+                mode: String::new(),
+                credits: r.get("credits").and_then(Value::as_f64).unwrap_or(0.0),
+                cost_money: 0.0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                preview: r.get("preview").and_then(Value::as_str).unwrap_or("").to_string(),
+                record_id: String::new(),
+            });
+        }
+    }
+
+    rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.session_id.cmp(&a.session_id)));
+    let total = rows.len() as u64;
+    let credits_total = rows.iter().map(|r| r.credits).sum();
+    let total_pages = total.div_ceil(page_size as u64).max(1) as u32;
+    let page = page.min(total_pages);
+    let begin = ((page as u64 - 1).saturating_mul(page_size as u64)) as usize;
+    let rows: Vec<UsageSessionView> = rows.into_iter().skip(begin).take(page_size as usize).collect();
+
+    Ok(UsageSessionsResult {
+        fetched_at,
+        total,
+        credits_total,
+        page,
+        page_size,
+        rows,
+        models: models.into_iter().collect(),
+    })
+}
+
+/// 官网请求级行（buddy_ai_usage_sessions_cache 落盘行；镜像国内 WbSessionRow）
+#[derive(Clone)]
+struct BuddyAiSessionRow {
+    ts: i64,
+    request_id: String,
+    model: String,
+    credits: f64,
+    preview: String,
+}
+
+/// requestTime → Unix 秒（宽容：epoch 秒/毫秒、RFC3339、本地时间串、纯日期回退当日零点；
+/// 对齐国内 usage_row_ts 口径）
+fn buddy_ai_row_ts(raw: &Value) -> Option<i64> {
+    use chrono::TimeZone;
+    if let Some(n) = raw.as_f64() {
+        if !n.is_finite() {
+            return None;
+        }
+        let ms = if n.abs() < 10_000_000_000.0 { (n * 1000.0).round() as i64 } else { n.round() as i64 };
+        return chrono::DateTime::from_timestamp_millis(ms).map(|d| d.timestamp());
+    }
+    let text = raw.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(parsed.timestamp());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+            return chrono::Local
+                .from_local_datetime(&parsed)
+                .single()
+                .map(|d| d.timestamp());
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return chrono::Local
+            .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
+            .single()
+            .map(|dt| dt.timestamp());
+    }
+    None
+}
+
+/// 会话说明提取：inputTrunc（官网已截断）优先，缺失取 input，兜底 agentPurpose；
+/// 压平换行截断 200 字符（对齐国内 usage_row_preview）
+fn buddy_ai_row_preview(item: &Value) -> String {
+    let pick = ["inputTrunc", "input_trunc", "input", "agentPurpose", "agent_purpose"]
+        .iter()
+        .find_map(|k| as_str(fs_utils::dig(item, &[*k])).filter(|s| !s.trim().is_empty()))
+        .unwrap_or_default();
+    let flat: String = pick
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    if flat.chars().count() <= 200 {
+        return flat.to_string();
+    }
+    flat.chars().take(200).collect()
+}
+
+/// 单账号官网用量 31 天分页拉取（buddy_ai_usage_official_all_impl 复用；
+/// 端点/回退与 buddy_ai_request_usage 同款：/v2 前缀 404 回退裸路径）。
+/// 返回 (聚合行 (date, credit, model), 请求级行)；requestId 去重，
+/// credit 缺失/负值/日期不可解析行跳过；请求级行仅含 ts 可解析的行。
+fn buddy_ai_official_usage_rows(
+    agent: &ureq::Agent,
+    base: &str,
+    token: &str,
+    uid: &str,
+) -> Result<(Vec<(String, f64, String)>, Vec<BuddyAiSessionRow>, bool), String> {
+    let start_text = format!(
+        "{} 00:00:00",
+        (chrono::Local::now().date_naive() - chrono::Duration::days(30)).format("%Y-%m-%d")
+    );
+    let end_text = chrono::Local::now().format("%Y-%m-%d 23:59:59").to_string();
+    let call = |url: &str, page: u64| -> Result<Value, String> {
+        let body = json!({
+            "startTime": start_text,
+            "endTime": end_text,
+            "pageNum": page,
+            "pageSize": 100,
+        });
+        match agent
+            .post(url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("X-User-Id", uid)
+            .set("X-Client-Platform", "web")
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+        {
+            Ok(r) => r
+                .into_json::<Value>()
+                .map_err(|e| format!("官网用量响应解析失败: {e}")),
+            Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    let v2_url = format!("{base}/v2/billing/meter/get-user-request-usage");
+    let bare_url = format!("{base}/billing/meter/get-user-request-usage");
+    // 首页探测路径：/v2 前缀 404 → 裸路径（官网网页走裸路径）；
+    // 探测成功的那次响应即首页数据，直接消费（不丢弃重取，省一次往返）
+    let (url, first) = match call(&v2_url, 1) {
+        Ok(v) => (v2_url, v),
+        Err(e) if e == "HTTP 404" => (bare_url.clone(), call(&bare_url, 1)?),
+        Err(e) => return Err(e),
+    };
+    let mut rows: Vec<(String, f64, String)> = Vec::new();
+    let mut sess_rows: Vec<BuddyAiSessionRow> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reported_total: i64 = 0;
+    let mut page_responses: Vec<Value> = vec![first];
+    let mut next_page = 2u64;
+    loop {
+        let Some(v) = page_responses.pop() else {
+            if next_page > 30 {
+                break;
+            }
+            page_responses.push(call(&url, next_page)?);
+            next_page += 1;
+            continue;
+        };
+        if v.get("code").and_then(Value::as_i64) != Some(0) {
+            return Err(format!(
+                "官网返回异常: {}",
+                v.get("msg").and_then(Value::as_str).unwrap_or("未知错误")
+            ));
+        }
+        let data = v.get("data").cloned().unwrap_or_default();
+        let items = data
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        reported_total = reported_total.max(data.get("total").and_then(Value::as_i64).unwrap_or(0));
+        for item in &items {
+            let credit = item
+                .get("credit")
+                .and_then(|c| c.as_f64().or_else(|| c.as_str().and_then(|s| s.parse().ok())));
+            let Some(credit) = credit.filter(|c| *c >= 0.0) else { continue };
+            let Some(rt) = item.get("requestTime").and_then(Value::as_str) else { continue };
+            // requestTime "YYYY-MM-DD HH:MM:SS"（宽容：取前 10 位日期段）
+            let date = rt.trim().get(0..10).unwrap_or("").to_string();
+            if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+                continue;
+            }
+            let model = item
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .unwrap_or("未知模型")
+                .to_string();
+            let rid = item
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{date}|{model}|{credit}|{next_page}|{}", rows.len()));
+            if seen.insert(rid.clone()) {
+                if let Some(ts) = item.get("requestTime").and_then(buddy_ai_row_ts) {
+                    sess_rows.push(BuddyAiSessionRow {
+                        ts,
+                        request_id: rid,
+                        model: model.clone(),
+                        credits: credit,
+                        preview: buddy_ai_row_preview(item),
+                    });
+                }
+                rows.push((date, credit, model));
+            }
+        }
+        // 终止判据：空页；total 已知且取满；total 缺失/为 0 时以不满页为续页判据
+        //（防 total 字段漂移导致只取 1 页即提前终止）
+        if items.is_empty() {
+            break;
+        }
+        if reported_total > 0 && seen.len() as i64 >= reported_total {
+            break;
+        }
+        if reported_total == 0 && (items.len() as i64) < 100 {
+            break;
+        }
+    }
+    // 截断标记（31 天 > 30 页 × 100 行的重度账号）：聚合可低估，调用方/前端须可感知
+    let truncated = reported_total > seen.len() as i64;
+    Ok((rows, sess_rows, truncated))
 }
 
 /// buddy-ai 积分历史查询（P8：趋势曲线数据源；近 N 天快照升序，默认 90 天）

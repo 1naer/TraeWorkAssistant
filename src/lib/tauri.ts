@@ -4,6 +4,8 @@ import type {
   AccountView,
   ApiServiceStatus,
   BuddyAiAccountView,
+  BuddyAiUsageOfficialAll,
+  BuddyAiTokenStats,
   ApiPoolFile,
   ApiKeyEntry,
   CcSwitchStatus,
@@ -525,6 +527,28 @@ export const api = {
     catalogSync: () => invoke<number>('buddy_ai_catalog_sync'),
     /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
     creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
+    /** 全账号官网用量聚合（积分看板「官网」源；31 天零填充，10min 缓存 + stale-on-error） */
+    usageOfficialAll: () => invoke<BuddyAiUsageOfficialAll>('buddy_ai_usage_official_all'),
+    /** 本地 Token 统计（~/.workbuddy-ai/projects 会话 jsonl 扫描；fresh=true 跳过 10min 结果缓存） */
+    tokenStats: (fresh?: boolean) =>
+      invoke<BuddyAiTokenStats>('buddy_ai_token_stats', { fresh: fresh ?? null }),
+    /** 会话明细（定时落地的官网请求级行缓存，纯缓存零网络；镜像国内 workbuddy.usageSessions） */
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('buddy_ai_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
   },
   // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
   workbuddy: {

@@ -218,8 +218,20 @@ pub fn parse_v3_config(body: &Value) -> Vec<WbModel> {
                     rate: f64::NAN,
                 },
             }
+        } else if let Some(m) = model_from_item(&e) {
+            // 对象形态（兼容上游升级）：优先复用元数据解析器——supportsImages/
+            // disabledMultimodal/credits 倍率全覆盖（原手写链 supports_image 硬编码
+            // false，图片能力声明全丢且 merge_static_fallback 不回填）
+            if m.id.is_empty()
+                || !seen.insert(m.id.clone())
+                || is_noise_model_id(&m.id)
+            {
+                continue;
+            }
+            out.push(m);
+            continue;
         } else {
-            // 对象形态（兼容上游升级）：字段链宽容取值
+            // 对象形态兜底：字段链宽容取值（解析器未命中 id 时）
             let id = ["id", "model", "name"]
                 .iter()
                 .find_map(|k| e.get(*k).and_then(|v| v.as_str()))
@@ -338,14 +350,7 @@ pub fn buddy_ai_fetch_and_replace(data_dir: &Path, uid: &str, token: &str) -> Re
         .set("Referer", &format!("{BILLING_BASE_GLOBAL}/"));
     let body: Value = match req.call() {
         Ok(r) => {
-            let v: Value = r.into_json().map_err(|e| format!("Intl 目录响应解析失败: {e}"))?;
-            // 诊断落盘（2026-10-16 首抓核对）：原文落 logs/，字段链漂移/倍率段排查
-            // 不必重抓；文件小（~数十 KB）随 100MB 滚动清理
-            let dump = data_dir.join("logs").join("intl_v3_config_raw.json");
-            if let Ok(text) = serde_json::to_string_pretty(&v) {
-                let _ = std::fs::write(&dump, text);
-            }
-            v
+            r.into_json().map_err(|e| format!("Intl 目录响应解析失败: {e}"))?
         }
         Err(ureq::Error::Status(code, r)) => {
             let text = r.into_string().unwrap_or_default();
@@ -362,10 +367,17 @@ pub fn buddy_ai_fetch_and_replace(data_dir: &Path, uid: &str, token: &str) -> Re
             "Intl 目录解析产出 0 个模型（agents[cli].models 结构不符预期，body 摘要: {excerpt}），本地目录保持不变"
         ));
     }
-    // 质量守门（与 CN fetch_and_replace 同款）：全零目录 = 字段链漂移信号，拒绝落盘
+    // 质量守门（与 CN fetch_and_replace 同款）：全零目录 = 字段链漂移信号，拒绝落盘。
+    // 豁免（审查修复）：全部 id 命中内置静态表 → 结构可信（元数据链漂移但清单真实），
+    // 放行落盘——否则「全免费档 x0.00 + data.models 元数据缺失」的合法目录会被误杀，
+    // 每次同步都失败且本地目录永远停在旧快照
+    let builtin = builtin_buddy_ai();
+    let builtin_ids: std::collections::HashSet<&str> =
+        builtin.iter().map(|b| b.id.as_str()).collect();
     if models
         .iter()
         .all(|m| m.rate == 0.0 && m.supported_efforts.is_empty() && m.context_length == 0)
+        && !models.iter().all(|m| builtin_ids.contains(m.id.as_str()))
     {
         return Err(format!(
             "Intl 目录 {} 个条目能力字段全空（倍率/档位/上下文均未解析到，字段链疑似漂移），本地目录保持不变",
@@ -683,8 +695,10 @@ fn model_from_item(item: &Value) -> Option<WbModel> {
         )
         .unwrap_or_else(|| {
             item.get("contextWindow")
-                .and_then(|c| c.get("defaultLength"))
-                .and_then(Value::as_u64)
+                .and_then(|c| {
+                    // contextWindow 双形态：对象 {defaultLength}（上游嵌套）或扁平数字
+                    c.as_u64().or_else(|| c.get("defaultLength").and_then(Value::as_u64))
+                })
                 .unwrap_or(0)
         }),
         max_tokens: dig_u64(item, &["maxTokens", "max_tokens", "maxOutputTokens"]).unwrap_or(0),
