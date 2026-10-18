@@ -79,6 +79,20 @@ pub const DEFAULT_TARGETS: &[&str] = &[
     "qoder.sh",
     "qoder.cn",
     "qoder.ai",
+    // Buddy 国际版（buddy-ai）：官网/客户端流量解密（/v3/config 模型目录动态抓取、
+    // OAuth/billing 端点观察）。宽后缀覆盖 www. 等子域。
+    "workbuddy.ai",
+    "codebuddy.ai",
+    // Buddy 国内（wb 池）使用域全集（wb_common.rs 域名单点同源）：
+    // copilot.tencent.com = chat 网关 + OAuth 三件套 + login；
+    // www.codebuddy.cn = token refresh + billing/meter + 签到活动状态；
+    // www.workbuddy.cn = 活动 banner/成长任务/积分领取。
+    // 宽后缀匹配覆盖 www. 等子域；不收宽 "tencent.com"（会吞腾讯系无关流量）。
+    // 注意：wb 池后端请求（ureq 直连）不经本地代理，此白名单服务的是
+    // WorkBuddy/CodeBuddy 桌面客户端侧流量的抓包观察。
+    "copilot.tencent.com",
+    "codebuddy.cn",
+    "workbuddy.cn",
 ];
 
 /// 上游直连白名单默认域（p3-2e）：命中域的转发流量跳过用户 VPN 直接连目标。

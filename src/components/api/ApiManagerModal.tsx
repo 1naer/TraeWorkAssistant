@@ -6,9 +6,10 @@
  * 豆包视图：概览 Tab 顶部提示「豆包不提供网关资源，以下为 Trae / Buddy / Qoder 资源池」。
  * 子弹框（子 Key 配置/删除确认）沿用 Modal 组件叠加，z 序高于主弹窗。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from '../ui';
 import { useAppStore } from '../../store';
+import { getVisiblePoolText } from '../../lib/appVisibility';
 import { cn } from '../../lib/cn';
 import GatewayHeader from './GatewayHeader';
 import InterfaceConfig from './InterfaceConfig';
@@ -35,6 +36,7 @@ export default function ApiManagerModal() {
   const open = useAppStore((s) => s.showApiManager);
   const setOpen = useAppStore((s) => s.setShowApiManager);
   const activeApp = useAppStore((s) => s.activeApp);
+  const settings = useAppStore((s) => s.settings);
   const [tab, setTab] = useState<TabKey>('overview');
   // 子弹框打开期间屏蔽主弹窗 ESC 关闭：Modal 的 keydown 监听按挂载序触发，
   // 主弹窗 onClose 先执行——此 ref 为 true 时不关主弹窗，仅由子弹框自身 onClose 关闭
@@ -50,6 +52,9 @@ export default function ApiManagerModal() {
   const requestClose = () => {
     if (!subOpenRef.current) setOpen(false);
   };
+
+  // 豆包提示条文案随「应用显示」联动（隐藏池不再列出；四池全隐藏时提示存量配置保留生效）
+  const poolText = useMemo(() => getVisiblePoolText(settings), [settings]);
 
   return (
     <Modal open={open} onClose={requestClose} title="API 管理" widthClass="max-w-[76.8rem]">
@@ -74,10 +79,12 @@ export default function ApiManagerModal() {
         ))}
       </div>
 
-      {/* 豆包视图说明（§5.2：仅概览 Tab 顶部展示） */}
+      {/* 豆包视图说明（§5.2：仅概览 Tab 顶部展示；池名随「应用显示」联动） */}
       {activeApp === 'doubao' && tab === 'overview' && (
         <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-300/70 bg-amber-50/80 px-3 py-2 text-xs text-amber-800 dark:border-amber-700/40 dark:bg-amber-900/10 dark:text-amber-200">
-          豆包不提供网关资源，以下为 Trae / Buddy / Qoder 资源池
+          {poolText
+            ? `豆包不提供网关资源，以下为 ${poolText} 资源池`
+            : '豆包不提供网关资源；当前无可见应用的资源池（存量配置保留生效）'}
         </div>
       )}
 

@@ -26,10 +26,17 @@ export type ViewKey =
   | 'qoder-checkin'
   | 'qoder-credits'
   | 'qoder-api-service'
-  | 'qoder-settings';
+  | 'qoder-settings'
+  // BuddyAI 应用页面（buddy-ai 国际版独立池；六页子导航对齐国内 Buddy，应用显示默认不展示）
+  | 'buddyai-overview'
+  | 'buddyai-accounts'
+  | 'buddyai-checkin'
+  | 'buddyai-credits'
+  | 'buddyai-api-service'
+  | 'buddyai-settings';
 
-/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 */
-export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao';
+/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 / BuddyAI（buddy-ai 国际版） */
+export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao' | 'buddy-ai';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
@@ -37,6 +44,7 @@ export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   buddy: 'buddy-overview',
   qoder: 'qoder-overview',
   doubao: 'doubao-overview',
+  'buddy-ai': 'buddyai-overview',
 };
 
 
@@ -471,6 +479,41 @@ export interface Settings {
   hidden_apps: AppKey[];
   /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
   app_icons: Partial<Record<AppKey, string>>;
+  /**
+   * BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）。
+   * 独立于 hidden_apps：存量配置 hidden_apps 已持久化为 []，借道隐藏列表无法
+   * 区分「默认隐藏」与「用户显式取消隐藏」，故用 opt-in 字段；
+   * 系统设置-应用显示面板勾选后生效
+   */
+  buddy_ai_visible: boolean;
+  /** buddy-ai 每日活跃打卡调度开关（默认关，国际档显式开启制） */
+  buddy_ai_checkin_enabled: boolean;
+  /** buddy-ai 打卡调度时刻 HH:MM（默认 09:20） */
+  buddy_ai_checkin_hhmm: string;
+  /** buddy-ai 打卡多账号间隔秒（默认 3，0 = 关闭） */
+  buddy_ai_checkin_gap_secs: number | null;
+  /** buddy-ai 凭证兜底续期调度开关（默认开，lazy 48h——AT 到期前 48h 内才真正刷新） */
+  buddy_ai_renew_enabled: boolean;
+  /** buddy-ai 凭证兜底续期时刻 HH:MM（默认 10:35） */
+  buddy_ai_renew_hhmm: string;
+  /** buddy-ai 积分数据每日同步开关（默认开；旧键，新装由 mode 派生） */
+  buddy_ai_credits_sync_enabled: boolean;
+  /** buddy-ai 积分同步时刻 HH:MM（默认 23:45） */
+  buddy_ai_credits_sync_hhmm: string;
+  /** buddy-ai 积分同步模式：off | hourly | every_hours | every_days | daily（空 = 旧数据） */
+  buddy_ai_credits_sync_mode: string;
+  /** buddy-ai 积分同步间隔小时数（every_hours 模式，默认 2，1..24） */
+  buddy_ai_credits_sync_hours: string;
+  /** buddy-ai 积分同步间隔天数（every_days 模式，默认 1，1..30） */
+  buddy_ai_credits_sync_days: string;
+  /** buddy-ai 模型目录每日同步开关（默认开） */
+  buddy_ai_catalog_sync_enabled: boolean;
+  /** buddy-ai 模型目录同步时刻 HH:MM（默认 05:55） */
+  buddy_ai_catalog_sync_hhmm: string;
+  /** WorkBuddy AI 国际版 exe 手动路径（BuddyAI 环境配置页；null = 自动检测） */
+  workbuddy_ai_path: string | null;
+  /** CodeBuddy AI 国际客户端 exe 手动路径（null = 自动检测） */
+  codebuddy_ai_path: string | null;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
@@ -578,7 +621,7 @@ export interface ApiServiceStatus {
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'qoder' | 'custom';
+  pool: 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
   rate: number | null;
   enabled: boolean;
 }
@@ -609,7 +652,7 @@ export interface UnifiedModel {
 export interface DispatchPolicy {
   /** smart = 智能调度（默认：到期→倍率/免费→积分多）；priority = 固定优先级 */
   strategy: 'smart' | 'priority';
-  /** 池优先级（priority 模式或 smart 并列时生效；取值 trae/buddy） */
+  /** 池优先级（priority 模式或 smart 并列时生效；取值 trae/buddy/buddy-ai/qoder） */
   priority: string[];
   /** 模型级覆盖（键 canonical_id；显式覆盖不做智能重排） */
   per_model: Record<string, string[]>;
@@ -710,6 +753,24 @@ export interface ApiPoolFile {
   group_ids?: string[];
   /** WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池 */
   wb_enabled?: boolean;
+  /** Buddy 国际版（buddy-ai）独立池开关（阶段 2）：开启后 buddy-ai 档参与国际池路由；默认 false（显式开启制） */
+  buddy_ai_enabled?: boolean;
+  /** buddy-ai 显式会话粘性开关（§4.2，独立于国内档粘性）；默认 false */
+  buddy_ai_sticky_enabled?: boolean;
+  /** buddy-ai 池粘性 TTL 秒（per-pool 参数，默认 300） */
+  buddy_ai_pool_sticky_ttl_secs?: number;
+  /** buddy-ai 池账号并发上限（0 = 不限，默认 1） */
+  buddy_ai_account_concurrency_limit?: number;
+  /** buddy-ai 显式会话粘性 TTL 秒（默认 1800） */
+  buddy_ai_sticky_ttl_secs?: number;
+  /** buddy-ai 竞速对冲阈值毫秒（0 = 关闭，默认 8000） */
+  buddy_ai_hedge_threshold_ms?: number;
+  /** buddy-ai 池分组筛选：非空 = 仅所选分组的国际账号参与调度；空 = 不限分组 */
+  buddy_ai_group_ids?: string[];
+  /** buddy-ai 池标签筛选：与分组筛选取交集（D5）；空 = 不限标签 */
+  buddy_ai_tag_ids?: string[];
+  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  buddy_ai_strategy?: string;
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
   /** 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行 */
@@ -1104,6 +1165,101 @@ export interface UpdateDownloaded {
 }
 
 // ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
+/** Buddy 国际版（buddy-ai）账号视图（buddy_ai_accounts_list，阶段 3 分区 UI） */
+export interface BuddyAiAccountView {
+  /** 账号 id（池键，wb-<hash> 派生口径同国内） */
+  id: string;
+  /** 真实账号 uuid（JWT sub，可能为空——手工导入无 uid 时为 ''） */
+  uid: string;
+  nickname: string;
+  note: string;
+  group_id: string;
+  access_token_expires_at: number | null;
+  refresh_token_expires_at: number | null;
+  auth_saved_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  /** 启停（P3）：true = 已停用——不参与打卡花名册与网关取号 */
+  disabled: boolean;
+  /** 积分包明细（P9：get-user-resource Accounts[] 分包解析；null = 未取数） */
+  credits_packages: Array<{
+    name: string;
+    code: string;
+    remain: number;
+    size: number;
+    expire_secs: number | null;
+  }> | null;
+  credits_balance: number | null;
+  /** 积分包最近到期时刻（秒级 unix 时间戳；注意与 credits_fetched_at 的 rfc3339 串不同） */
+  credits_expire_at: number | null;
+  credits_fetched_at: string | null;
+  /** 凭证是否存在（vault 回填后有明文 access_token 才算可用） */
+  has_credential: boolean;
+  /** token rec domain（恒含 .workbuddy.ai） */
+  domain: string;
+  /** WorkBuddy AI 端当前账号（国际 auth 文件 workbuddy-desktop-ai.info uid 匹配） */
+  is_current_workbuddy?: boolean;
+  /** CodeBuddy AI 端当前账号（live storage.json genie.uid 匹配） */
+  is_current_codebuddy?: boolean;
+  /** WorkBuddy AI 端快照槽已建立（主槽或 .bak 回退槽） */
+  has_snapshot_workbuddy?: boolean;
+  /** CodeBuddy AI 端快照槽已建立 */
+  has_snapshot_codebuddy?: boolean;
+}
+
+/** BuddyAI 官网按模型用量点（get-user-request-usage 聚合；镜像 WbUsageModelPoint） */
+export interface BuddyAiUsageModelPoint {
+  model: string;
+  request_count: number;
+  credit: number;
+}
+
+/** BuddyAI 全账号官网用量聚合（积分看板「官网」源；31 天零填充；镜像 WbUsageOfficialAll） */
+export interface BuddyAiUsageOfficialAll {
+  status: 'complete';
+  source: 'official_all';
+  accounts_total: number;
+  accounts_ok: number;
+  range_start: string;
+  range_end: string;
+  fetched_at_ms: number;
+  request_count_total: number;
+  /** 全部账号拉取失败时回退的过期聚合缓存（stale-on-error） */
+  stale?: boolean;
+  stale_reason?: string;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number; models: BuddyAiUsageModelPoint[] }[];
+  /** 按模型汇总（31 天全窗口、跨账号合并；stale 旧缓存可能缺省） */
+  models?: BuddyAiUsageModelPoint[];
+}
+
+/** BuddyAI 本地 Token 聚合条目（镜像 WbTokenAgg） */
+export interface BuddyAiTokenAgg {
+  total: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  uncached_input: number;
+  calls: number;
+  cache_hit_rate?: number | null;
+  date?: string;
+  key?: string;
+}
+
+/** BuddyAI 本地 Token 统计（~/.workbuddy-ai/projects 会话 jsonl 扫描；镜像 WbTokenStats） */
+export interface BuddyAiTokenStats {
+  summary: BuddyAiTokenAgg;
+  models: BuddyAiTokenAgg[];
+  projects: BuddyAiTokenAgg[];
+  daily: BuddyAiTokenAgg[];
+  daily_by_model: Record<string, BuddyAiTokenAgg[]>;
+  files_scanned: number;
+  parse_errors: number;
+  generated_at: number;
+  window_days: number;
+}
+
 export interface WorkBuddyAccountView {
   id: string;
   uid: string;

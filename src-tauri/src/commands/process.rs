@@ -93,9 +93,17 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
         "Doubao" => vec!["Doubao.exe"],
         // WorkBuddy 桌面版（批次3 会话备份/恢复前置关闭）
         "WorkBuddy" => vec!["WorkBuddy.exe"],
+        // WorkBuddy AI 国际版客户端（buddy-ai 抓包代理注入前置关闭；仅 AI 形态映像，
+        // 不含国内 WorkBuddy.exe——两客户端可并存，注入国际版不得误杀国内实例）
+        "WorkBuddy AI" => vec!["WorkBuddyAI.exe", "WorkBuddy AI.exe"],
         // CodeBuddy 桌面版（安装形态含 CN 后缀，与 trae-switch-bridge.ps1 ProcNames 对齐；
         // 此前缺失导致 Rust 侧 graceful_kill_app 杀不掉 CodeBuddy，与桥行为不一致存竞态）
         "CodeBuddy" => vec!["CodeBuddy.exe", "CodeBuddy CN.exe"],
+        // 审查修复（M6，2026-10-16 双客户端并存实测）：CodeBuddy AI 国际客户端
+        // 抓包注入前置关闭只认国际映像 CodeBuddy.exe——kind "CodeBuddy" 的映像表
+        // 含国内 "CodeBuddy CN.exe"，并存时注入国际版会连带误杀国内实例
+        //（对齐上方 "WorkBuddy AI" 收窄先例）
+        "CodeBuddy AI" => vec!["CodeBuddy.exe"],
         // Qoder CN IDE（F-80 M4 环境重置前置关闭，防清理后被回写）；
         // 0.4.3+ 拆分形态真 IDE 独立进程 Qoder CN IDE.exe（见 qoder/common.rs ide_exe_candidates）
         "Qoder CN" => vec!["Qoder CN.exe", "Qoder CN Launcher.exe", "Qoder CN IDE.exe"],

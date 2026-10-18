@@ -212,6 +212,122 @@ pub fn token_store_upsert_secure(
     })
 }
 
+// ── buddy-ai（国际版）token store：独立表 + 独立 vault 命名空间 ──────────────
+//
+// §3.4 隔离清单：与 wb 池零共享（表 / vault ns 双维度隔离）；secure 收敛口径
+// （敏感字段进 vault、DB 占位）与 wb 侧完全一致，仅表名/命名空间参数化。
+
+/// buddy-ai token store 表名（schema.rs ROW_TABLES 白名单内）
+pub const BUDDY_AI_TOKEN_TABLE: &str = "buddy_ai_tokens";
+/// buddy-ai vault 命名空间（与 wb 池 "wb" 隔离）
+pub const BUDDY_AI_VAULT_NS: &str = "buddy-ai";
+
+/// 通用 secure 读取（table + vault ns 参数化）：与 token_store_load_secure 同口径
+fn token_store_load_secure_in(data_dir: &std::path::Path, table: &str, ns: &str) -> Value {
+    let mut store = crate::store::docs::token_store_load(table, &crate::store::db(data_dir));
+    let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return store;
+    };
+    for (id, rec) in tokens.iter_mut() {
+        let Some(rm) = rec.as_object_mut() else { continue };
+        let Some(sec) = crate::vault::ns_get(data_dir, ns, id) else { continue };
+        let acc = sec.get("access_token").and_then(Value::as_str).unwrap_or("");
+        let rt = sec.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+        let mut has_access_key = false;
+        let mut has_refresh_key = false;
+        for k in TOKEN_SENSITIVE_KEYS {
+            let is_access = k.ends_with("ccess_token");
+            let val = if is_access { acc } else { rt };
+            if !rm.contains_key(k) {
+                continue;
+            }
+            if is_access {
+                has_access_key = true;
+            } else {
+                has_refresh_key = true;
+            }
+            if !val.is_empty()
+                && rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty())
+            {
+                rm.insert(k.to_string(), serde_json::json!(val));
+            }
+        }
+        if !acc.is_empty() && !has_access_key {
+            rm.insert("access_token".into(), serde_json::json!(acc));
+        }
+        if !rt.is_empty() && !has_refresh_key {
+            rm.insert("refresh_token".into(), serde_json::json!(rt));
+        }
+    }
+    store
+}
+
+/// 通用 secure upsert（table + vault ns 参数化）：与 token_store_upsert_secure 同口径
+fn token_store_upsert_secure_in(
+    data_dir: &std::path::Path,
+    table: &str,
+    ns: &str,
+    id: &str,
+    rec: &Value,
+) -> Result<(), String> {
+    let mut rec = rec.clone();
+    let Some(rm) = rec.as_object_mut() else {
+        return crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec);
+    };
+    let mut acc = String::new();
+    let mut rt = String::new();
+    for k in TOKEN_SENSITIVE_KEYS {
+        let v = rm.get(k).and_then(Value::as_str).unwrap_or("");
+        if v.is_empty() {
+            continue;
+        }
+        if k.ends_with("ccess_token") {
+            acc = v.to_string();
+        } else {
+            rt = v.to_string();
+        }
+    }
+    let vault_result = if acc.is_empty() && rt.is_empty() {
+        Ok(())
+    } else {
+        let mut entry = crate::vault::ns_get(data_dir, ns, id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        // vault 旧条目损坏为非对象（String/Array 等）时 index 赋值会 panic——
+        // panic 点在续期/导入/OAuth 回写路径上，防御性归零重建
+        if !entry.is_object() {
+            entry = serde_json::json!({});
+        }
+        if !acc.is_empty() {
+            entry["access_token"] = serde_json::json!(acc);
+        }
+        if !rt.is_empty() {
+            entry["refresh_token"] = serde_json::json!(rt);
+        }
+        crate::vault::ns_set(data_dir, ns, id, &entry)
+    };
+    for k in TOKEN_SENSITIVE_KEYS {
+        if rm.contains_key(k) {
+            rm.insert(k.to_string(), serde_json::json!(""));
+        }
+    }
+    crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec)?;
+    vault_result.map_err(|e| format!("凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}"))
+}
+
+/// buddy-ai token store 读取（vault 回填，仅内存不落明文）
+pub fn buddy_ai_token_store_load(data_dir: &std::path::Path) -> Value {
+    token_store_load_secure_in(data_dir, BUDDY_AI_TOKEN_TABLE, BUDDY_AI_VAULT_NS)
+}
+
+/// buddy-ai token store 单账号 UPSERT（敏感字段进 buddy-ai vault 命名空间，DB 占位）
+pub fn buddy_ai_token_store_upsert(
+    data_dir: &std::path::Path,
+    id: &str,
+    rec: &Value,
+) -> Result<(), String> {
+    token_store_upsert_secure_in(data_dir, BUDDY_AI_TOKEN_TABLE, BUDDY_AI_VAULT_NS, id, rec)
+}
+
 /// 生效凭证 = token store 与 auth 文件中 expiresAtMs 更晚者（F-10 谁新用谁）。
 /// auth 文件仅当其 uid 与账号匹配时参与双源比较（桌面当前登录态）。
 /// 读 token store（SQLite 化 P3：wb_tokens 表；结构 {version, tokens:{id:rec}}）。
@@ -464,12 +580,28 @@ pub fn get_json(
 }
 
 // ── 区域路由（T4.5/F-36，§5.2）──────────────────────────────────────────────
-// CN：billing/积分 + 活动接口走 www.codebuddy.cn；Global（domain 含 .workbuddy.ai）：
-// 全走 www.workbuddy.ai。plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+// CN：billing/积分走 www.codebuddy.cn、活动接口走 www.workbuddy.cn；
+// Global（domain 含 .workbuddy.ai）全走 www.workbuddy.ai。
+// token refresh 随区域切换（R-2a 实测收口：Intl=workbuddy.ai /v2/plugin/auth/token/refresh
+// code 0，rt 每次轮换）——见下方 region_refresh_url；REFRESH_URL 仅 CN 侧消费。
 
 pub const BILLING_BASE_CN: &str = "https://www.codebuddy.cn";
 pub const BILLING_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
+/// CN 活动/积分网关（签到/活动 banner/成长任务/积分领取走 www.workbuddy.cn，
+/// 与 BILLING_BASE_CN=codebuddy.cn（token refresh）是**两个不同域**——
+/// credits.rs 三处散点收敛到此单点（§4.5 域名收敛，CN 行为保持不变）
+pub const ACTIVITY_BASE_CN: &str = "https://www.workbuddy.cn";
 pub const REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
+
+/// 活动/积分网关 base 按区域取用（§4.5 域名收敛：Global=workbuddy.ai、
+/// CN=workbuddy.cn，消除 credits.rs 中「含 workbuddy.ai 判定 + 双域混用」散点）
+pub fn region_activity_base(domain: &str) -> &'static str {
+    if is_global_region(domain) {
+        BILLING_BASE_GLOBAL
+    } else {
+        ACTIVITY_BASE_CN
+    }
+}
 
 pub fn is_global_region(domain: &str) -> bool {
     domain.contains(".workbuddy.ai")
@@ -494,6 +626,95 @@ pub fn billing_bases(domain: &str) -> [&'static str; 2] {
     [main, alt]
 }
 
+// ── 区域端点结构体（buddy-ai 国际版，阶段 1 开工项）────────────────────────
+//
+// 《Buddy国际版支持落地方案.md》§4.1：从硬编码提升为 WbRegionEndpoints，
+// CN/Global 两份静态实例。Gate 阻塞层已全部实测收口（2026-10-15，§5）：
+// R-1 OAuth 全链路 / R-2a refresh / R-3 身份 / R-6 billing 字段同构。
+// 身份基座 = WorkBuddy 桌面端身份（§8-1 推荐候选：模型目录最全 51 个、
+// 两外部项目长期实证）；UA/版本号单点维护，版本更新仅改常量。
+
+/// 区域端点集（常量仅承载，不接线；阶段 2 网关转发按账号 region 分流——
+/// chat/refresh/billing 三字段届时由 wb_upstream/wb_common 消费，当前仅 auth 链读用）
+#[allow(dead_code)]
+pub struct WbRegionEndpoints {
+    /// chat 网关 base（/v2/chat/completions）
+    pub chat_base: &'static str,
+    /// OAuth 三件套 base（auth/state → auth/token → login/account）
+    pub auth_base: &'static str,
+    /// authUrl 缺失/不完整时的登录页构造 base（resolve_auth_url 回退形态）
+    pub login_base: &'static str,
+    /// auth/state platform 参数——国际版的灵魂差异（附录 B 修正 3：必须纳入字段）
+    pub platform: &'static str,
+    /// OAuth 请求 Origin/Referer（CN=www.codebuddy.cn / Intl=www.workbuddy.ai）
+    pub web_origin: &'static str,
+    /// OAuth ④ 步账号资料端点路径（R-1：国际域单数 `/v2/plugin/auth/account` 404，
+    /// 账号标识走 JWT sub 兜底；CN 为 `/v2/plugin/login/account`）
+    pub account_path: &'static str,
+    /// token refresh base（/v2/plugin/auth/token/refresh 前缀）
+    pub refresh_base: &'static str,
+    /// billing/meter base
+    pub billing_base: &'static str,
+    /// 出站身份 UA（桌面腿）
+    pub ua: &'static str,
+    /// 客户端版本（authUrl version 参数，R-1：官方桌面端实证 5.7.6；可选参数）
+    pub client_version: &'static str,
+}
+
+/// CN 区（2026-10-18 实测：platform=workbuddy + WorkBuddy 桌面 UA 两者同时满足，
+/// 服务端才返回 www.workbuddy.cn/login 新登录页；老 UA 下改 platform 无效、
+/// 新 UA 下 platform=CLI 亦回老链接，Origin 无影响。auth API 上游仍是 copilot.tencent.com）
+pub const REGION_CN: WbRegionEndpoints = WbRegionEndpoints {
+    chat_base: "https://copilot.tencent.com",
+    auth_base: "https://copilot.tencent.com",
+    login_base: "https://www.workbuddy.cn",
+    platform: "workbuddy",
+    web_origin: "https://www.codebuddy.cn",
+    account_path: "/v2/plugin/login/account",
+    refresh_base: "https://www.codebuddy.cn",
+    billing_base: BILLING_BASE_CN,
+    // 与国际区同形态三段式（对齐官方桌面端 5.8.3 抓包；auth 探针已验证）
+    ua: "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
+    client_version: "5.8.3",
+};
+
+/// Global 区（buddy-ai）：workbuddy.ai 单一鉴权门面（R-9 实锤两域同账号体系，无双门面）
+pub const REGION_GLOBAL: WbRegionEndpoints = WbRegionEndpoints {
+    chat_base: "https://www.workbuddy.ai",
+    auth_base: "https://www.workbuddy.ai",
+    login_base: "https://www.workbuddy.ai",
+    platform: "workbuddy-ai",
+    web_origin: "https://www.workbuddy.ai",
+    account_path: "/v2/plugin/auth/account",
+    refresh_base: "https://www.workbuddy.ai",
+    billing_base: BILLING_BASE_GLOBAL,
+    // R-3 附录 A：桌面端身份 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`
+    ua: "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1",
+    // R-1：官方桌面端 authUrl 实证带 version=5.7.6（比 UA 基准 5.5.2 新，跟进官方）
+    client_version: "5.7.6",
+};
+
+/// 区域端点取用（唯一入口，杜绝散落硬编码；阶段 2 网关转发接线时启用）
+#[allow(dead_code)]
+pub fn region_endpoints(global_region: bool) -> &'static WbRegionEndpoints {
+    if global_region {
+        &REGION_GLOBAL
+    } else {
+        &REGION_CN
+    }
+}
+
+/// token refresh URL 按区域收敛（G-2）：三处硬编码统一到本函数。
+/// R-2a 实测收口（2026-10-15）：`www.workbuddy.ai/v2/plugin/auth/token/refresh` code 0，
+/// `X-Auth-Refresh-Source` 取 plugin / workbuddy 均接受，refreshToken 每次轮换（回写为准）。
+pub fn region_refresh_url(domain: &str) -> &'static str {
+    if is_global_region(domain) {
+        "https://www.workbuddy.ai/v2/plugin/auth/token/refresh"
+    } else {
+        REFRESH_URL
+    }
+}
+
 // ── token 刷新（F-09）──────────────────────────────────────────────────────
 
 /// refresh 失败原因（审查 P1-4：区分「凭证失效」与「网络故障」，
@@ -512,6 +733,82 @@ pub enum RefreshFail {
     Busy,
 }
 
+/// refresh 4xx 响应体 → 上游错误细节（issue #118）：提取 OAuth 标准
+/// error/error_description（如 `invalid_grant: Session doesn't have required client`）
+/// 及常见 message 字段；JSON 不可解析时回退原文截断（≤160 字符），均空返回 None。
+/// 供 relogin_reason / 网关与手动刷新错误透传，让用户能区分「会话失效（重登可恢复）」
+/// 与「疑似封禁」，不必再来 issue 求证。
+pub fn refresh_fail_detail(parsed: Option<&Value>, raw: &str) -> Option<String> {
+    // 审查修复：空白压缩——HTML/WAF 错误页多行原文会破坏 app_log 单行格式与 UI 展示
+    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(v) = parsed {
+        let mut parts: Vec<&str> = Vec::new();
+        for k in [
+            "error",
+            "error_description",
+            "message",
+            "msg",
+            "errorMessage",
+            "description",
+        ] {
+            if let Some(s) = v
+                .get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if !parts.contains(&s) {
+                    parts.push(s);
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return Some(collapse(&parts.join(": ")));
+        }
+    }
+    let raw = collapse(raw.trim());
+    if raw.is_empty() {
+        return None;
+    }
+    let cut = raw
+        .char_indices()
+        .nth(160)
+        .map(|(i, _)| i)
+        .unwrap_or(raw.len());
+    Some(raw[..cut].to_string())
+}
+
+/// 上游错误细节 → 用户可读处置提示（issue #118）。
+/// 封禁/限制类关键词优先判定：避免混合文案（如 "session ... (account blocked)"）
+/// 被会话失效分支误安抚为「重登可恢复」；不含 forbidden（WAF/HTTP 403 页
+/// 普遍含该词，避免拦截页被误判为封禁）。
+pub fn refresh_fail_hint(detail: &str) -> &'static str {
+    let d = detail.to_ascii_lowercase();
+    if d.contains("disabled")
+        || d.contains("banned")
+        || d.contains("suspended")
+        || d.contains("blocked")
+    {
+        "疑似账号被禁用/限制，请到官方平台确认"
+    } else if d.contains("invalid_grant") || d.contains("session") || d.contains("token is not active") {
+        "服务端会话已失效（被迫下线，非账号封禁），重新登录即可恢复"
+    } else {
+        "refresh token 已被服务端拒绝，重新登录或重新导入凭证可恢复"
+    }
+}
+
+/// refresh 4xx → 用户可读错误消息（issue #118）：读取 ureq `Error::Status(code, resp)`
+/// 的响应体，经 refresh_fail_detail / refresh_fail_hint 透传上游细节；
+/// 无可提取细节时回退 fallback（调用方组装，含 HTTP 状态码文案）。
+pub fn refresh_fail_msg(code: u16, resp: ureq::Response, fallback: &str) -> String {
+    let raw = resp.into_string().unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&raw).ok();
+    match refresh_fail_detail(parsed.as_ref(), &raw) {
+        Some(d) => format!("刷新失败（HTTP {code}）：{d}（{}）", refresh_fail_hint(&d)),
+        None => fallback.to_string(),
+    }
+}
+
 /// 调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
 /// 成功返回新 Creds（expires 字段按 expiresIn/refreshExpiresIn 秒数回填）。
 pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
@@ -519,9 +816,13 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
 }
 
 /// refresh_token_once 的带失败原因版本（审查 P1-4）。
-pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Creds>, RefreshFail) {
+/// 第三元为 4xx 时的上游错误细节（issue #118，如 invalid_grant 及其描述；见 refresh_fail_detail）。
+pub fn refresh_token_once_ex(
+    agent: &ureq::Agent,
+    creds: &Creds,
+) -> (Option<Creds>, RefreshFail, Option<String>) {
     if creds.refresh_token.is_empty() {
-        return (None, RefreshFail::NoRefreshToken);
+        return (None, RefreshFail::NoRefreshToken, None);
     }
     let mut h = build_auth_headers(creds, false);
     h.push(("X-Refresh-Token".to_string(), creds.refresh_token.clone()));
@@ -529,22 +830,23 @@ pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Cred
         "X-Auth-Refresh-Source".to_string(),
         "workbuddy".to_string(),
     ));
-    let (status, body) = post_json(agent, REFRESH_URL, &h, &serde_json::json!({}));
+    let (status, parsed, raw) = post_json_raw(agent, REFRESH_URL, &h, &serde_json::json!({}));
     if status == 0 {
-        return (None, RefreshFail::Network);
+        return (None, RefreshFail::Network, None);
     }
     if (400..500).contains(&status) {
-        return (None, RefreshFail::Auth);
+        let detail = refresh_fail_detail(parsed.as_ref(), &raw);
+        return (None, RefreshFail::Auth, detail);
     }
     if status != 200 {
-        return (None, RefreshFail::Network); // 5xx 等服务端故障：不标记重登录
+        return (None, RefreshFail::Network, None); // 5xx 等服务端故障：不标记重登录
     }
-    let Some(body) = body else {
-        return (None, RefreshFail::BadResponse);
+    let Some(body) = parsed else {
+        return (None, RefreshFail::BadResponse, None);
     };
     let acc = s_of(fs_utils::dig(&body, &["accessToken"]));
     if acc.is_empty() {
-        return (None, RefreshFail::BadResponse);
+        return (None, RefreshFail::BadResponse, None);
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut out = creds.clone();
@@ -556,7 +858,7 @@ pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Cred
     out.expires_at_ms = i_of(fs_utils::dig(&body, &["expiresIn"])).map(|e| now_ms + e * 1000);
     out.refresh_expires_at_ms = i_of(fs_utils::dig(&body, &["refreshExpiresIn"]))
         .map(|e| now_ms + e * 1000);
-    (Some(out), RefreshFail::NoRefreshToken)
+    (Some(out), RefreshFail::NoRefreshToken, None)
 }
 
 /// 标记账号需重新登录（审查 P1-4：刷新凭证失效时回写账号池，
@@ -767,18 +1069,19 @@ pub fn ensure_fresh(
 /// 401 自愈专用加锁刷新（H-1）：串行化「网络刷新→落库」并做二次检查——他人已刷新
 /// 落库（token store 中该账号 access_token 与调用方持有凭证不同）则直接复用新凭证，
 /// 不再重复发网络请求；否则以调用方凭证刷新并落库（调用方无须再自行 save）。
-/// 跨进程抢锁失败 → (None, Some(RefreshFail::Busy))：调用方按非 Auth 处理
+/// 跨进程抢锁失败 → (None, Some(RefreshFail::Busy), None)：调用方按非 Auth 处理
 ///（不误标 needs_relogin，下次自然重试）。
+/// 第三元为 4xx 时的上游错误细节（issue #118，见 refresh_fail_detail）。
 pub fn refresh_token_once_locked(
     state: &AppState,
     agent: &ureq::Agent,
     acct_id: &str,
     stale: &Creds,
-) -> (Option<Creds>, Option<RefreshFail>) {
+) -> (Option<Creds>, Option<RefreshFail>, Option<String>) {
     let lock = refresh_lock_for(acct_id);
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let Some(_cross) = cross_refresh_lock(&state.data_dir, acct_id) else {
-        return (None, Some(RefreshFail::Busy));
+        return (None, Some(RefreshFail::Busy), None);
     };
     // 二次检查：store 权威源中该账号已换新 token（他人刷新落库）→ 直接复用。
     // 仅比对 store 记录（刷新产物只落 store，不落 auth 文件），避免 auth 文件
@@ -789,13 +1092,13 @@ pub fn refresh_token_once_locked(
         .map(creds_of)
         .unwrap_or_default();
     if !store_cur.access_token.is_empty() && store_cur.access_token != stale.access_token {
-        return (Some(store_cur), None);
+        return (Some(store_cur), None, None);
     }
-    let (new, fail) = refresh_token_once_ex(agent, stale);
+    let (new, fail, detail) = refresh_token_once_ex(agent, stale);
     if let Some(n) = &new {
         let _ = save_token_store(state, acct_id, n);
     }
-    (new, Some(fail))
+    (new, Some(fail), detail)
 }
 
 #[cfg(test)]
@@ -859,5 +1162,63 @@ mod tests {
         assert!(get(&empty, "X-Machine-ID").is_none());
         assert!(get(&empty, "X-Session-ID").is_none());
         assert!(get(&empty, "X-Domain").is_none());
+    }
+
+    // ==================== refresh 4xx 透传（issue #118） ====================
+
+    #[test]
+    fn refresh_fail_detail_extracts_oauth_fields() {
+        // OAuth 标准字段：error + error_description 拼接（issue #118 原始报文形态）
+        let v: Value = serde_json::from_str(
+            r#"{"error":"invalid_grant","error_description":"Session doesn't have required client"}"#,
+        )
+        .unwrap();
+        let d = refresh_fail_detail(Some(&v), "").unwrap();
+        assert!(d.contains("invalid_grant") && d.contains("required client"), "{d}");
+
+        // 同文案去重：description 与 error_description 相同时不重复拼接
+        let v: Value =
+            serde_json::from_str(r#"{"error":"invalid_grant","error_description":"gone","description":"gone"}"#)
+                .unwrap();
+        let d = refresh_fail_detail(Some(&v), "").unwrap();
+        assert_eq!(d.matches("gone").count(), 1, "{d}");
+
+        // JSON 无识别字段 → 回退原文；原文为空白 / 缺失 → None
+        let v = serde_json::json!({ "unexpected": 1 });
+        assert_eq!(
+            refresh_fail_detail(Some(&v), "plain gateway error").as_deref(),
+            Some("plain gateway error")
+        );
+        assert_eq!(refresh_fail_detail(Some(&v), "   "), None);
+        assert_eq!(refresh_fail_detail(None, ""), None);
+    }
+
+    #[test]
+    fn refresh_fail_detail_truncates_long_raw_on_char_boundary() {
+        // 300 个多字节汉字：按字符（非字节）边界截断到 160 字符且为严格前缀（不 panic）
+        let raw = "错".repeat(300);
+        let d = refresh_fail_detail(None, &raw).unwrap();
+        assert_eq!(d.chars().count(), 160);
+        assert!(raw.starts_with(&d), "截断结果必须是原文前缀");
+        // ASCII 长文同样按 160 字符截断
+        let d = refresh_fail_detail(None, &"a".repeat(300)).unwrap();
+        assert_eq!(d.chars().count(), 160);
+        // 审查修复：多行 HTML/WAF 原文压缩为单行（不破坏 app_log 单行格式）
+        let d = refresh_fail_detail(None, "<html>\r\n  <body>Blocked\r\n</body>\n</html>").unwrap();
+        assert_eq!(d, "<html> <body>Blocked </body> </html>");
+        // 纯空白原文压缩后为空 → None
+        assert_eq!(refresh_fail_detail(None, " \n\t "), None);
+    }
+
+    #[test]
+    fn refresh_fail_hint_classifies_by_keywords() {
+        // 会话失效类（issue #118 原始场景）
+        assert!(refresh_fail_hint("invalid_grant: Session doesn't have required client").contains("会话已失效"));
+        assert!(refresh_fail_hint("token is not active").contains("会话已失效"));
+        // 封禁关键词优先于会话词：混合文案不得被会话分支误安抚为「重登可恢复」
+        assert!(refresh_fail_hint("Session terminated (account blocked)").contains("禁用"));
+        assert!(refresh_fail_hint("user is banned").contains("禁用"));
+        // 通用拒绝 → 重新登录/导入凭证
+        assert!(refresh_fail_hint("invalid_client").contains("重新登录或重新导入"));
     }
 }

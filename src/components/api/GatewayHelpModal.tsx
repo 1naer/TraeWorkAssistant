@@ -5,30 +5,32 @@
  * table-fixed 定宽防横向滚动，带搜索过滤）。
  * 资源调度说明覆盖三层语义：自定义直达 → 池间选池（smart/priority+回退）→ 池内取号，
  * 并指向「资源总览 → 调度策略中心」调整入口（任务7）。
- * 数据源：unified_models（实时聚合 Trae / Buddy / Qoder / 自定义 多池）+ gateway_settings_get（端口）。
+ * 数据源：unified_models（实时聚合 Trae / Buddy / BuddyAI 国际 / Qoder / 自定义 多池）+ gateway_settings_get（端口）。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { CircleHelp, Copy, Search } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
+import { isPoolVisible } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
-import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
+import type { GatewaySettings, LanIfaceIp, Settings, UnifiedModel } from '../../types';
 
 const POOL_LABELS: Record<string, string> = {
   trae: 'Trae',
   buddy: 'Buddy',
+  'buddy-ai': 'BuddyAI 国际',
   qoder: 'Qoder',
   custom: '自定义',
 };
 
-/** 倍率取当前可用来源池最小值（同一模型多池服务时按最低消耗展示）。
- * 仅统计 enabled 来源：不可用池不承接请求，其倍率不应参与展示，
- * 否则用户会看到实际路由不到的低价（与「实际生效倍率」口径背离）；
+/** 倍率取当前可用且可见来源池最小值（同一模型多池服务时按最低消耗展示）。
+ * 仅统计 enabled 且可见来源：不可用池不承接请求、隐藏池不面向当前用户展示，
+ * 其倍率不应参与展示，否则用户会看到实际路由不到的低价（与「实际生效倍率」口径背离）；
  * 全部不可用或未声明 → null（显示 —） */
-function minRateOf(m: UnifiedModel): number | null {
+function minRateOf(m: UnifiedModel, settings: Settings | null): number | null {
   const rates = m.sources
-    .filter((s) => s.enabled)
+    .filter((s) => s.enabled && isPoolVisible(settings, s.pool))
     .map((s) => s.rate)
     .filter((r): r is number => r != null && Number.isFinite(r));
   return rates.length ? Math.min(...rates) : null;
@@ -46,6 +48,7 @@ function Endpoint({ method, path, note }: { method: string; path: string; note: 
 
 export default function GatewayHelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useAppStore((s) => s.pushToast);
+  const settings = useAppStore((s) => s.settings);
   const [gw, setGw] = useState<GatewaySettings | null>(null);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [query, setQuery] = useState('');
@@ -72,19 +75,30 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
       });
   }, [open]);
 
+  /** 可见模型基座（系统设置「应用显示」联动）：仅保留至少有一个可见来源池的模型 */
+  const visibleModels = useMemo(
+    () => models.filter((m) => m.sources.some((s) => isPoolVisible(settings, s.pool))),
+    [models, settings],
+  );
+  // cURL 示例模型：默认模型属已隐藏池时回落首个可见模型（示例须实际可请求）
+  const exampleModel =
+    gw?.default_model && visibleModels.some((m) => m.id === gw.default_model)
+      ? gw.default_model
+      : (visibleModels[0]?.id ?? '');
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return models;
-    return models.filter(
+    if (!q) return visibleModels;
+    return visibleModels.filter(
       (m) =>
         m.id.toLowerCase().includes(q) ||
         m.display.toLowerCase().includes(q) ||
         m.vendor.toLowerCase().includes(q),
     );
-  }, [models, query]);
+  }, [visibleModels, query]);
 
   const copyCurl = async () => {
-    const m = gw?.default_model || models[0]?.id || 'glm-5.3';
+    const m = exampleModel || 'glm-5.3';
     const example = `curl -X POST ${base}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer your-api-key" \\
@@ -147,7 +161,17 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               <div>
                 <span className="text-slate-400 dark:text-zinc-500">模型：</span>
                 <span className="text-[11px]">
-                  请求按模型 ID 匹配资源池；未指定时用默认模型 <code>{gw?.default_model || '—'}</code>
+                  请求按模型 ID 匹配资源池；未指定时用默认模型{' '}
+                  <code>
+                    {gw?.default_model || '—'}
+                    {gw?.default_model &&
+                    // 复审修复：仅「目录中存在但仅由隐藏池服务」才标注；目录中不存在
+                    // 的存量默认模型不加误导性标注（placeholder 场景另行兜底展示）
+                    models.some((m) => m.id === gw.default_model) &&
+                    !visibleModels.some((m) => m.id === gw.default_model)
+                      ? '（属已隐藏池）'
+                      : ''}
+                  </code>
                 </span>
               </div>
             </div>
@@ -177,7 +201,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             <code className="block break-all text-[11px] leading-relaxed text-slate-500 dark:text-zinc-400">
               curl -X POST {base}/v1/chat/completions \<br />
               &nbsp;&nbsp;-H &quot;Authorization: Bearer your-api-key&quot; \<br />
-              &nbsp;&nbsp;-d &apos;&#123;&quot;model&quot;: &quot;{gw?.default_model || '模型 ID'}&quot;, &quot;messages&quot;:
+              &nbsp;&nbsp;-d &apos;&#123;&quot;model&quot;: &quot;{exampleModel || '模型 ID'}&quot;, &quot;messages&quot;:
               [...&#125;&apos;
             </code>
           </div>
@@ -190,20 +214,21 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 模型名命中启用条目即直达该上游（上游自有计费），不参与跨池回退。
               </p>
               <p>
-                <span className="font-medium text-slate-600 dark:text-zinc-300">多源同名模型（Trae/Buddy/Qoder）：</span>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">多源同名模型（Trae/Buddy/BuddyAI 国际/Qoder）：</span>
                 按「池间调度策略」选池——智能调度（默认）按 积分先到期 → 免费/低倍率 → 积分多 排序，全并列时按池优先级序；
-                固定优先级按序取首选可用池（Qoder 默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
+                固定优先级按序取首选可用池（Qoder / BuddyAI 国际默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
               </p>
               <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">模型目录标注来源池：</span>
                 「资源总览 → 调度策略中心」开启后，/v1/models 目录为多源同名模型附带{' '}
-                <code>trae/xxx</code>、<code>buddy/xxx</code>、<code>qoder/xxx</code> 别名条目（三家同名模型倍率与效果不同），
+                <code>trae/xxx</code>、<code>buddy/xxx</code>、<code>buddy-ai/xxx</code>、<code>qoder/xxx</code>{' '}
+                别名条目（各池同名模型倍率与效果不同），
                 右表「来源」列同步标注模型由哪些池服务；请求使用带池前缀的模型 ID 即点名锁定该池——
                 单池服务、不参与跨池回退，该池不可用时直接报错（前缀优先级高于 Key 绑定与全局策略）；关闭时目录保持原形态。
               </p>
               <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">池内取号：</span>
-                Trae 池 / Buddy 池 / Qoder 池各自独立配置策略（默认积分先过期优先，可选 余额多优先 / 随机 / 三因子加权 / P2C）。
+                Trae 池 / Buddy 池 / BuddyAI 国际池 / Qoder 池各自独立配置策略（默认积分先过期优先，可选 余额多优先 / 随机 / 三因子加权 / P2C）。
               </p>
               <p className="text-slate-400 dark:text-zinc-500">
                 调整入口：「资源总览」Tab → 调度策略中心（内置最佳组合预设一键应用，运行中网关即时生效，无需重启）。
@@ -218,7 +243,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 <span className="font-medium text-slate-600 dark:text-zinc-300">思考档位：</span>
                 统一六档 minimal / low / medium / high / xhigh / max。请求体{' '}
                 <code>reasoning_effort</code>（OpenAI 兼容）或 <code>thinking</code>（Anthropic 兼容）
-                传入后按池自动映射——Trae 三档 light / high / extra_high，Buddy 按上游声明下发，
+                传入后按池自动映射——Trae 三档 light / high / extra_high，
+                Buddy / BuddyAI 国际 按上游声明下发，
                 Qoder 暂不支持档位透传（目录思考档位仅展示）；
                 档位列取多池声明并集（统一档位值）。Trae 侧未实证的模型显式请求档位时按
                 统一映射填充默认下发，未显式请求时走上游默认（默认深度思考 high 仅对已实证模型生效）。
@@ -238,7 +264,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
         <div className="lg:col-span-3">
           <div className="mb-2 flex items-center gap-2">
             <p className="text-xs font-medium text-slate-700 dark:text-zinc-200">
-              支持模型<span className="ml-1 text-slate-400">（{filtered.length}/{models.length}）</span>
+              支持模型<span className="ml-1 text-slate-400">（{filtered.length}/{visibleModels.length}）</span>
             </p>
             <div className="relative ml-auto">
               <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -265,8 +291,10 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               </thead>
               <tbody>
                 {filtered.map((m) => {
-                  const enabled = m.sources.some((s) => s.enabled);
-                  const rate = minRateOf(m);
+                  // 行内来源按可见性过滤（隐藏池徽章不展示，避免泄露；enabled 口径同步取可见来源）
+                  const visibleSources = m.sources.filter((s) => isPoolVisible(settings, s.pool));
+                  const enabled = visibleSources.some((s) => s.enabled);
+                  const rate = minRateOf(m, settings);
                   return (
                     <tr
                       key={m.id}
@@ -312,7 +340,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                       </td>
                       <td className="px-2 py-2">
                         <div className="flex flex-wrap gap-1">
-                          {m.sources.map((s) => (
+                          {visibleSources.map((s) => (
                             <Badge key={s.pool} tone={s.enabled ? 'slate' : 'amber'}>
                               {POOL_LABELS[s.pool] ?? s.pool}
                             </Badge>
@@ -326,7 +354,11 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 {filtered.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-2 py-6 text-center text-slate-400 dark:text-zinc-500">
-                      {models.length === 0 ? '模型目录加载中或为空' : '无匹配模型'}
+                      {models.length === 0
+                        ? '模型目录加载中或为空'
+                        : visibleModels.length === 0
+                          ? '当前可见应用下无支持模型'
+                          : '无匹配模型'}
                     </td>
                   </tr>
                 )}

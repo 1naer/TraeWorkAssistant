@@ -1445,6 +1445,85 @@ pub fn wb_token_store_save_version(s: &Store, version: i64) -> Result<(), String
     s.kv_set_raw("wb_tokens_meta", &version.to_string())
 }
 
+// ── 行文档表泛化原语（token store 通用化：wb / buddy-ai 双命名空间复用）──────
+
+/// 任意 token store 表读取（结构 {version, tokens: {id: rec}}；损坏行过滤）
+pub fn token_store_load(table: &str, s: &Store) -> Value {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all(table)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let meta_key = format!("{table}_meta");
+    let version = s.kv_get_raw(&meta_key).and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 任意 token store 表单账号 UPSERT
+pub fn token_store_upsert(s: &Store, table: &str, id: &str, rec: &Value) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    s.row_upsert(table, id, rec)
+}
+
+/// 任意 token store 表删除单账号（迁移/移除路径）
+pub fn token_store_remove(s: &Store, table: &str, id: &str) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    s.row_delete(table, id)
+}
+
+/// 任意 token store 表整库替换（version 闸门由调用方维持；buddy-ai 迁移/阶段 2 接线用）
+#[allow(dead_code)]
+pub fn token_store_save(table: &str, s: &Store, store_val: &Value) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> =
+        tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace(table, &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw(&format!("{table}_meta"), &v.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Buddy 国际版（buddy-ai）独立池（buddy_ai_accounts / buddy_ai_tokens 表）──
+//
+// §3.4 隔离清单：与 wb 池零共享；账号结构与 WorkBuddyAccount serde 同构
+//（复用序列化形态，落库表独立）。
+
+/// 读 buddy-ai 整池（结构 {accounts: [...]}）
+pub fn buddy_ai_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("buddy_ai_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 写 buddy-ai 整池（pk = 账号 id，缺 id 用序号占位，语义同 wb_pool_save）
+pub fn buddy_ai_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("buddy_ai_accounts", &rows)
+}
+
 // ── API 用量（api_usage.json → api_usage 表，(bucket, day) 行文档）───────────
 
 fn bucket_name(b: UsageBucket) -> &'static str {
@@ -1453,6 +1532,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
+        UsageBucket::BuddyAi => "buddy-ai",
     }
 }
 
@@ -1462,6 +1542,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "wb" => Some(UsageBucket::Wb),
         "custom" => Some(UsageBucket::Custom),
         "qoder" => Some(UsageBucket::Qoder),
+        "buddy-ai" => Some(UsageBucket::BuddyAi),
         _ => None,
     }
 }
@@ -1472,6 +1553,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Wb => &mut f.wb_days,
         UsageBucket::Custom => &mut f.custom_days,
         UsageBucket::Qoder => &mut f.qoder_days,
+        UsageBucket::BuddyAi => &mut f.buddy_ai_days,
     }
 }
 
@@ -1505,6 +1587,10 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         // 四桶对称（审查修复清单 v1.4.9 B8）：漏 Qoder 桶会使 JSON→SQLite 迁移时
         // Qoder 历史用量整表丢弃（api_usage_load 侧 bucket_map_mut 四桶齐全）
         (UsageBucket::Qoder, &f.qoder_days),
+        // 审查修复（M8，国际版）：漏 BuddyAi 桶同因——save 侧丢桶会让
+        // api_usage_load→save 往返及迁移导入静默清空 buddy-ai 历史用量
+        //（load 侧 bucket_map_mut 五桶齐全，save 侧必须对称）
+        (UsageBucket::BuddyAi, &f.buddy_ai_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {
@@ -1905,6 +1991,129 @@ pub fn wb_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
     .or_else(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
         Err(e)
+    })
+}
+
+// ── buddy-ai 每日活跃打卡结果（P2 对齐 wb_checkin_results；镜像同构）──
+
+/// 读回 {results: [...]}（按 id 升序 = 原追加序）
+pub fn buddy_ai_checkin_results_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, time, user_id, name, status, message, reward FROM buddy_ai_checkin_results ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let reward: Option<f64> = r.get(6)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "time": r.get::<_, String>(1)?,
+                        "user_id": r.get::<_, String>(2)?,
+                        "name": r.get::<_, String>(3)?,
+                        "status": r.get::<_, String>(4)?,
+                        "message": r.get::<_, String>(5)?,
+                        "reward": reward,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "results": rows })
+}
+
+/// 整表替换（裁剪由调用方计算）
+pub fn buddy_ai_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("results").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN; DELETE FROM buddy_ai_checkin_results;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO buddy_ai_checkin_results(date, time, user_id, name, status, message, reward) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in arr {
+                let reward = r.get("reward").and_then(Value::as_f64);
+                stmt.execute(rusqlite::params![
+                    r.get("date").and_then(Value::as_str).unwrap_or(""),
+                    r.get("time").and_then(Value::as_str).unwrap_or(""),
+                    r.get("user_id").and_then(Value::as_str).unwrap_or(""),
+                    r.get("name").and_then(Value::as_str).unwrap_or(""),
+                    r.get("status").and_then(Value::as_str).unwrap_or(""),
+                    r.get("message").and_then(Value::as_str).unwrap_or(""),
+                    reward,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+// ── P8：buddy-ai 每日积分快照（镜像 wb_credits_history 同构）───────────────
+
+/// 读回 {snapshots: [...]}（按日期升序）
+pub fn buddy_ai_credits_history_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, ts, total_balance, accounts, earned FROM buddy_ai_credits_history ORDER BY date",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let accounts: String = r.get(3)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "total_balance": r.get::<_, f64>(2)?,
+                        "accounts": serde_json::from_str::<Value>(&accounts)
+                            .unwrap_or(Value::Array(vec![])),
+                        "earned": r.get::<_, Option<f64>>(4)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "snapshots": rows })
+}
+
+/// 同日覆盖 UPSERT（打卡回写/手动同步双挂点调用，当日多账号回写自然收敛为最终态）
+pub fn buddy_ai_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺 date 字段".into());
+    }
+    let ts = snap.get("ts").and_then(Value::as_i64).unwrap_or(0);
+    let total = snap.get("total_balance").and_then(Value::as_f64).unwrap_or(0.0);
+    let accounts = serde_json::to_string(
+        snap.get("accounts").unwrap_or(&Value::Array(vec![])),
+    )
+    .map_err(|e| format!("序列化失败: {e}"))?;
+    let earned = snap.get("earned").and_then(Value::as_f64);
+    s.with_conn(move |c| {
+        c.execute(
+            "INSERT INTO buddy_ai_credits_history(date, ts, total_balance, accounts, earned) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, total_balance = excluded.total_balance, accounts = excluded.accounts, earned = excluded.earned",
+            rusqlite::params![date, ts, total, accounts, earned],
+        )?;
+        Ok(())
+    })
+}
+
+/// 365 天滚动裁剪
+pub fn buddy_ai_credits_history_prune(s: &Store) -> Result<(), String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        c.execute("DELETE FROM buddy_ai_credits_history WHERE date < ?1", [cutoff.as_str()])?;
+        Ok(())
     })
 }
 

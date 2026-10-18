@@ -74,6 +74,15 @@ pub enum TargetApp {
     /// %APPDATA%\com.qodercn.app.stable，根级 Chromium 会话，与豆包多 Profile
     /// 布局不同构 → electron_root 管线）。与 Qoder IDE 为两套独立登录态。
     QoderWork,
+    /// 2026-10-16：BuddyAI 国际版 WorkBuddy AI 客户端（authfile 布局变体：
+    /// 数据目录 ~/.workbuddy-ai，auth 文件同目录异名 workbuddy-desktop-ai.info；
+    /// 池为 buddy_ai_accounts，凭证合成走 buddy-ai token store）
+    WorkBuddyAI,
+    /// 2026-10-16：BuddyAI 国际版 CodeBuddy AI 客户端（与国内 CodeBuddy CN 为
+    /// 两个独立安装：国际 = Programs\CodeBuddy + %APPDATA%\CodeBuddy；国内 =
+    /// Programs\CodeBuddy CN + %APPDATA%\CodeBuddy CN）。登录真源同为客户端
+    /// vscdb（国际 roaming 目录），槽目录独立 profiles_codebuddy_ai
+    CodeBuddyAI,
 }
 
 impl TargetApp {
@@ -89,10 +98,15 @@ impl TargetApp {
             "CodeBuddy" => Ok(TargetApp::CodeBuddy),
             "Qoder" => Ok(TargetApp::Qoder),
             "QoderWork" => Ok(TargetApp::QoderWork),
+            // buddy-ai 国际版：WorkBuddyAI / CodeBuddyAI 均为独立档案
+            //（CodeBuddyAI 修复：此前归一国内 CodeBuddy 档案导致切换走了国内
+            // CN 客户端；两客户端 exe/进程/roaming 数据目录均不同，见 profile.rs）
+            "WorkBuddyAI" => Ok(TargetApp::WorkBuddyAI),
+            "CodeBuddyAI" => Ok(TargetApp::CodeBuddyAI),
             // Err 文案带合法值清单 + 旧值指引（审查 P3）：调用方（CLI/持久化
             // 读取）只报「未知应用类型」时无从排障，TraeWork 旧值需指路
             other => Err(format!(
-                "未知应用类型: {other}（合法值: Trae | Doubao | WorkBuddy | CodeBuddy | Qoder | QoderWork；TraeWork 已于 v3.7.12 并入 Trae，存量数据由启动迁移自动改写，外部配置请改存为 Trae）"
+                "未知应用类型: {other}（合法值: Trae | Doubao | WorkBuddy | CodeBuddy | WorkBuddyAI | CodeBuddyAI | Qoder | QoderWork；TraeWork 已于 v3.7.12 并入 Trae，存量数据由启动迁移自动改写，外部配置请改存为 Trae）"
             )),
         }
     }
@@ -168,7 +182,15 @@ impl Session {
             include_indexeddb: args.include_indexeddb,
             machine_id_override: args.machine_id_override.clone(),
             auth_dir: authfile::wb_auth_dir(),
-            auth_file: authfile::wb_auth_file(),
+            // 国际版 WorkBuddy AI：同目录异名 auth 文件（workbuddy-desktop-ai.info），
+            // 与国内 WorkBuddy 的 workbuddy-desktop.info 共存互不干扰
+            auth_file: match args.target_app {
+                TargetApp::WorkBuddyAI => authfile::wb_ai_auth_file(),
+                // 审查修复（M7）：国际版 CodeBuddy AI 用独立 auth 文件，避免把
+                // 国内 WorkBuddy auth 备份进国际槽位造成语义污染
+                TargetApp::CodeBuddyAI => authfile::cb_ai_auth_file(),
+                _ => authfile::wb_auth_file(),
+            },
             detected_live_uid: None,
             expected_current_uid: args.expected_current_uid.clone(),
             bootstrap_done: false,
@@ -458,15 +480,8 @@ fn save_identity_guard(
             "客户端当前未登录（最新会话日志无登录请求记录），已拒绝保存，\
              避免把未登录现场写入账号 {uid} 的快照；请先在客户端登录账号 {uid} 后再「保存当前登录态」。"
         );
-        // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
-        // 失败仅 Warn，不影响拒绝结果
-        if let Err(e) = proc::start_app(sess, sink) {
-            sink.step(
-                "guard",
-                StepStatus::Warn,
-                &format!("客户端重启失败，请手动打开: {e}"),
-            );
-        }
+        // 审查复审修复：不在守卫内还原现场（原此处 start_app + 外层 W10 Err 分支
+        // start_app 会双重 spawn 客户端）——被 stop 的客户端统一由外层 Err 分支拉回
         sink.step("fatal", StepStatus::Error, &format!("失败: {msg}"));
         return Err(fatal_line(&format!("[fatal] {msg}")));
     }
@@ -479,15 +494,8 @@ fn save_identity_guard(
             // issue #55 审查修复：文案按槽位状态分流（首存指引/污染自愈指引/通用），
             // 不再一律指回「切换」（对无快照账号不可执行、对污染槽位是死循环）
             let msg = save_reject_message(&sess.prof.profiles_dir, uid, &live);
-            // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
-            // 失败仅 Warn，不影响拒绝结果
-            if let Err(e) = proc::start_app(sess, sink) {
-                sink.step(
-                    "guard",
-                    StepStatus::Warn,
-                    &format!("客户端重启失败，请手动打开: {e}"),
-                );
-            }
+            // 审查复审修复：同上，还原现场统一由外层 Err 分支负责，守卫内不再
+            // start_app（避免双重 spawn）
             // 流内 fatal 行（NDJSON 语义：错误终态必有最后一行 fatal）+
             // Err 载荷带 [fatal] 前缀（前端 saveCurrentLogin 失败 toast 按
             // /\[fatal\]\s*(.+)$/ 提取完整原因，与 panic 兜底既有约定一致）
@@ -686,21 +694,55 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
         Action::Switch => switch_flow(&mut sess, uid.trim(), args.expected_current_uid.trim(), sink),
         Action::SaveCurrentLogin => {
             proc::stop_app(&mut sess, sink)?;
-            save_identity_guard(&mut sess, uid.trim(), sink)?;
-            backup_current(&sess, uid.trim(), sink)?;
-            set_current_account(&sess, uid.trim());
-            proc::start_app(&mut sess, sink)?;
-            done(sink, &format!("已保存账号 {} 的当前登录态", uid.trim()))
+            // 审查修复（W10）：save/backup 失败 `?` 直接传播会把停在关机状态的
+            // 客户端丢给用户——失败时先尽力拉回客户端再传播原始错误
+            match save_identity_guard(&mut sess, uid.trim(), sink)
+                .and_then(|()| backup_current(&sess, uid.trim(), sink))
+            {
+                Ok(()) => {
+                    set_current_account(&sess, uid.trim());
+                    proc::start_app(&mut sess, sink)?;
+                    done(sink, &format!("已保存账号 {} 的当前登录态", uid.trim()))
+                }
+                Err(e) => {
+                    // W10：save/backup 失败（含守卫拒绝）时把被 stop 的客户端拉回；
+                    // 还原现场统一在此收敛，避免与守卫内部双重 spawn。失败仅 Warn
+                    if let Err(se) = proc::start_app(&mut sess, sink) {
+                        sink.step(
+                            "guard",
+                            StepStatus::Warn,
+                            &format!("客户端重启失败，请手动打开: {se}"),
+                        );
+                    }
+                    Err(e)
+                }
+            }
         }
         Action::BackupCurrent => {
             // 审查修复：与 SaveCurrentLogin 对齐——先关客户端再读 auth/leveldb/vscdb，
             // 防止文件锁下拷贝静默缺文件生成"看似成功"的坏快照；备份完成后拉回
             proc::stop_app(&mut sess, sink)?;
-            save_identity_guard(&mut sess, uid.trim(), sink)?;
-            backup_current(&sess, uid.trim(), sink)?;
-            set_current_account(&sess, uid.trim());
-            proc::start_app(&mut sess, sink)?;
-            done(sink, "备份完成")
+            // 审查修复（W10）：同上，失败时先尽力拉回客户端再传播原始错误
+            match save_identity_guard(&mut sess, uid.trim(), sink)
+                .and_then(|()| backup_current(&sess, uid.trim(), sink))
+            {
+                Ok(()) => {
+                    set_current_account(&sess, uid.trim());
+                    proc::start_app(&mut sess, sink)?;
+                    done(sink, "备份完成")
+                }
+                Err(e) => {
+                    // W10：同 SaveCurrentLogin，还原现场统一在此收敛（含守卫拒绝）
+                    if let Err(se) = proc::start_app(&mut sess, sink) {
+                        sink.step(
+                            "guard",
+                            StepStatus::Warn,
+                            &format!("客户端重启失败，请手动打开: {se}"),
+                        );
+                    }
+                    Err(e)
+                }
+            }
         }
         Action::RestoreOnly => {
             // 与 Switch 的区别：只做「以目标快照覆盖当前」，不把当前登录态备份到
@@ -810,7 +852,9 @@ fn bootstrap_snapshot_from_token_store(
     uid: &str,
     sink: &dyn ProgressSink,
 ) -> Option<String> {
-    if sess.prof.app_name != "WorkBuddy" {
+    // 仅 authfile 布局的 WorkBuddy 系可合成（CodeBuddy 登录真源在客户端加密
+    // vscdb，工具侧无法离线合成；国际 WorkBuddy AI 走 buddy-ai token store）
+    if !matches!(sess.prof.app_name, "WorkBuddy" | "WorkBuddy AI") {
         return None;
     }
     sink.step(
@@ -818,7 +862,12 @@ fn bootstrap_snapshot_from_token_store(
         StepStatus::Info,
         &format!("目标账号 {uid} 无快照，尝试用工具侧凭证副本合成最小登录态…"),
     );
-    let store = crate::tasks::wb_common::token_store_load_secure(&sess.data_dir);
+    // 国际版凭证在 buddy-ai token store（独立表 + buddy-ai vault 命名空间）
+    let store = if sess.target == TargetApp::WorkBuddyAI {
+        crate::tasks::wb_common::buddy_ai_token_store_load(&sess.data_dir)
+    } else {
+        crate::tasks::wb_common::token_store_load_secure(&sess.data_dir)
+    };
     let Some(rec) = store.get("tokens").and_then(|t| t.get(uid)) else {
         sink.step(
             "bootstrap",
@@ -843,8 +892,12 @@ fn bootstrap_snapshot_from_token_store(
         return None;
     }
     // 真实 uid 以账号池条目为准（uid 是 uuid 体系，槽名 wb-<hash> 只是池 id）；
-    // 池缺失时回退凭证记录里的 uid
-    let pool = crate::store::docs::wb_pool_load(&crate::store::db(&sess.data_dir));
+    // 池缺失时回退凭证记录里的 uid。国际版查 buddy-ai 独立池
+    let pool = if sess.target == TargetApp::WorkBuddyAI {
+        crate::store::docs::buddy_ai_pool_load(&crate::store::db(&sess.data_dir))
+    } else {
+        crate::store::docs::wb_pool_load(&crate::store::db(&sess.data_dir))
+    };
     let pool_uid = pool
         .get("accounts")
         .and_then(|a| a.as_array())
@@ -897,7 +950,7 @@ fn switch_flow(
         };
         let Some(bootstrap_uid) = bootstrap_uid else {
             let msg = match (sess.prof.layout, sess.prof.app_name) {
-                (Layout::Authfile, "CodeBuddy") => format!(
+                (Layout::Authfile, "CodeBuddy" | "CodeBuddy AI") => format!(
                     "目标账号 {uid} 无快照，且 CodeBuddy 登录真源在客户端加密数据库（vscdb），\
                      工具无法自动合成。这是「切换要快照、快照要保存、保存又被当前登录不一致拒绝」\
                      的冷启动闭环：请先在客户端手动登录账号 {uid}（旧账号暂不退出也可直接切换登录），\
@@ -988,7 +1041,27 @@ fn switch_flow(
     }
 
     // 恢复目标账号的登录态
-    restore_profile(sess, uid, sink)?;
+    // 审查修复（W9）：主恢复 Err 直接 `?` 传播时，客户端已在前置步骤被 stop 关闭、
+    // last 备份已完成——把停在关机状态的现场丢给用户。失败时从 last 槽回滚 +
+    // 重启客户端再报 fatal（对齐下方快照无效路径的处理）
+    if let Err(e) = restore_profile(sess, uid, sink) {
+        sink.step(
+            "restore",
+            StepStatus::Warn,
+            &format!("恢复账号 {uid} 登录态失败，将从 last 槽回滚到切换前状态…: {e}"),
+        );
+        // 审查复审修复（W9）：回滚自身失败时不能只传播回滚错误——原始错误并入
+        // 消息，两条错误都可见（原实现原始错误仅留在上方 Warn 行）
+        restore_profile(sess, "last", sink).map_err(|re| {
+            format!("恢复账号 {uid} 登录态失败（{e}），且回滚到切换前状态也失败: {re}")
+        })?;
+        proc::start_app(sess, sink)?;
+        let msg = format!(
+            "恢复账号 {uid} 登录态失败，已回滚到切换前状态并重启客户端；请重试或重新「保存当前登录态」: {e}"
+        );
+        sink.step("fatal", StepStatus::Error, &msg);
+        return Err(fatal_line(&msg));
+    }
 
     // 恢复后校验（issue #9，仅 icube/electron_root）：①0 项恢复=快照空/损坏；
     // ②恢复后数据目录缺关键登录态文件 = 快照不含登录态或布局漂移。两种情况

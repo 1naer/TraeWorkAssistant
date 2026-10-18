@@ -230,6 +230,17 @@ impl Store {
             Ok(())
         })
     }
+
+    /// 单行删除（白名单表；buddy-ai 迁移/账号移除路径用）
+    pub fn row_delete(&self, table: &str, pk: &str) -> Result<(), String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        self.with_conn(|c| {
+            c.execute(&format!("DELETE FROM [{table}] WHERE pk = ?1"), rusqlite::params![pk])?;
+            Ok(())
+        })
+    }
 }
 
 /// 损坏库隔离：主库/-wal/-shm 改名 `<原名>.corrupt-<时间戳>`（保留现场，不删除），

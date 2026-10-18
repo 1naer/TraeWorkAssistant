@@ -502,8 +502,13 @@ pub fn refresh_access_token(
         .send_string("{}");
     let body: serde_json::Value = match resp {
         Ok(r) => r.into_json().unwrap_or_default(),
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"))
+        Err(ureq::Error::Status(code, r)) => {
+            // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
+            return Err(wb_common::refresh_fail_msg(
+                code,
+                r,
+                &format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"),
+            ));
         }
         Err(e) => return Err(format!("刷新请求失败: {e}")),
     };
@@ -565,11 +570,201 @@ pub fn refresh_access_token(
             }
             rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        // 凭证收敛（P0-1）：secure upsert（敏感字段进 vault、DB 占位；失败仅日志——
-        // 401 刷新是网关后台路径，报错无 UI 可达，且下一次刷新会重试收敛）
-        if let Err(e) = crate::tasks::wb_common::token_store_upsert_secure(data_dir, account_id, &r)
-        {
-            fs_utils::app_log(data_dir, &format!("wb 网关刷新回写失败（已落占位）: {e}"));
+        // 凭证收敛（P0-1）：secure upsert（敏感字段进 vault、DB 占位）。
+        // 审查修复（M10）：回写失败原实现仅日志并照常返回新 token——刷新端点可能
+        // 一次性轮换 refresh_token，新 rt 只存在于本函数局部变量，返回 Ok 即随栈帧
+        // 永久丢失：下一轮 401 用 store 里的旧 rt 刷新必然失败，账号被迫重新登录。
+        // 修复：先退避重试消化 vault/DB 瞬时故障；重试耗尽后按 rt 是否被轮换分流——
+        // 已轮换 → 上抛 Err（调用方换号/禁用是正确语义，该账号下次刷新注定失败）；
+        // 未轮换 → 仅丢 access 更新，下轮 401 重新刷新即可自愈，维持仅日志（原场景）
+        let mut upsert_err: Option<String> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+            }
+            match crate::tasks::wb_common::token_store_upsert_secure(data_dir, account_id, &r) {
+                Ok(()) => {
+                    upsert_err = None;
+                    break;
+                }
+                Err(e) => upsert_err = Some(e),
+            }
+        }
+        if let Some(e) = upsert_err {
+            let rt_rotated = new_refresh
+                .as_deref()
+                .is_some_and(|nr| !nr.is_empty() && nr != refresh);
+            let msg = format!("wb 网关刷新回写失败（重试 3 次后）: {e}");
+            if rt_rotated {
+                let fatal =
+                    format!("{msg}；refresh token 已被服务端轮换且无法持久化，账号需重新登录");
+                fs_utils::app_log(data_dir, &fatal);
+                return Err(fatal);
+            }
+            fs_utils::app_log(data_dir, &msg);
+        }
+    }
+    Ok(new_access)
+}
+
+/// 池感知续期入口（审查 H1 修复）：CN 池走 [`refresh_access_token`]（wb_tokens 表 +
+/// CN 刷新端点），buddy-ai 国际池走 buddy_ai_tokens 表 + workbuddy.ai 刷新端点。
+/// 原实现 wb_route 三处执行路径统一调 CN 版：buddy-ai 账号 401 时查 wb_tokens
+/// 必然无凭证（同 token 双池导入时更会用国内侧 rt 打 CN 端点——跨池凭证串扰），
+/// 刷新永不成功 → 账号被错误冷却/禁用
+pub fn refresh_access_token_for(
+    data_dir: &std::path::Path,
+    account_id: &str,
+    stale_access: Option<&str>,
+    intl: bool,
+) -> Result<String, String> {
+    if intl {
+        refresh_access_token_intl(data_dir, account_id, stale_access)
+    } else {
+        refresh_access_token(data_dir, account_id, stale_access)
+    }
+}
+
+/// buddy-ai（国际池）网关 401 续期：镜像 [`refresh_access_token`] 的锁序与二次检查，
+/// 表（buddy_ai_tokens + buddy-ai vault ns）/ 端点 / UA 全部国际档。
+/// 回写为合并式（保留 rec 其他字段——`last_daily_chat` 打卡幂等戳 / uid 兜底不得抹除）
+fn refresh_access_token_intl(
+    data_dir: &std::path::Path,
+    account_id: &str,
+    stale_access: Option<&str>,
+) -> Result<String, String> {
+    use crate::tasks::wb_common::{buddy_ai_token_store_load, buddy_ai_token_store_upsert};
+    // 与 CN 版同款：进程内每账号刷新锁 → 跨进程命名互斥体（GUI/CLI 双进程）
+    let lock = wb_common::refresh_lock_for(account_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(_cross) =
+        crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(data_dir, "buddy-ai", account_id, 5000).0
+    else {
+        return Err(ERR_PEER_REFRESHING.to_string());
+    };
+    let (store_access, refresh) = {
+        let rec = buddy_ai_token_store_load(data_dir)
+            .get("tokens")
+            .and_then(|t| t.get(account_id))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let access = rec
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let refresh = rec
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?
+            .to_string();
+        (access, refresh)
+    };
+    // 持锁二次检查：他人已刷新落库（store access ≠ 调用方失效凭证）→ 直接复用
+    if let Some(stale) = stale_access {
+        if !store_access.is_empty() && store_access != stale {
+            return Ok(store_access);
+        }
+    }
+    // 红线：X-Refresh-Token 仅出现在 refresh 端点；国际端点经 region_refresh_url 解析
+    let resp = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .post(wb_common::region_refresh_url(wb_common::REGION_GLOBAL.chat_base))
+        .set("Authorization", "Bearer")
+        .set("User-Agent", wb_common::REGION_GLOBAL.ua)
+        .set("X-Refresh-Token", &refresh)
+        .set("X-Auth-Refresh-Source", "workbuddy")
+        .set("Content-Type", "application/json")
+        .send_string("{}");
+    let body: serde_json::Value = match resp {
+        Ok(r) => r.into_json().unwrap_or_default(),
+        Err(ureq::Error::Status(code, r)) => {
+            // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
+            return Err(wb_common::refresh_fail_msg(
+                code,
+                r,
+                &format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"),
+            ));
+        }
+        Err(e) => return Err(format!("刷新请求失败: {e}")),
+    };
+    let dig_str = |v: &serde_json::Value, keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| v.get(k).and_then(|x| x.as_str())).map(str::to_string)
+    };
+    let new_access = dig_str(&body, &["accessToken"]).or_else(|| {
+        body.get("data")
+            .and_then(|d| dig_str(d, &["accessToken"]))
+    }).ok_or("刷新响应中无 accessToken")?;
+    let new_refresh = dig_str(&body, &["refreshToken"]).or_else(|| {
+        body.get("data").and_then(|d| dig_str(d, &["refreshToken"]))
+    });
+    let expires_in = body
+        .pointer("/expiresIn")
+        .or_else(|| body.pointer("/data/expiresIn"))
+        .and_then(|v| v.as_i64());
+    let refresh_expires_in = body
+        .pointer("/refreshExpiresIn")
+        .or_else(|| body.pointer("/data/refreshExpiresIn"))
+        .and_then(|v| v.as_i64());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // 合并写回：锁外重读最新 store，在其上更新四键（并发刷新/打卡幂等戳互不覆盖），
+    // rt 轮换响应缺失时保留旧值
+    {
+        let mut r = buddy_ai_token_store_load(data_dir)
+            .get("tokens")
+            .and_then(|t| t.get(account_id))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        if let Some(rm) = r.as_object_mut() {
+            rm.insert("access_token".into(), serde_json::json!(new_access));
+            if let Some(nr) = &new_refresh {
+                if !nr.is_empty() {
+                    rm.insert("refresh_token".into(), serde_json::json!(nr));
+                }
+            }
+            if let Some(s) = expires_in {
+                rm.insert("expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
+            }
+            if let Some(s) = refresh_expires_in {
+                rm.insert("refresh_expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
+            }
+            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
+        }
+        // secure upsert（敏感字段进 buddy-ai vault 命名空间、DB 占位）。
+        // 审查修复（M10）：同 CN 版——回写失败不能仅日志后照常返回新 token，
+        // rt 被服务端轮换且未落盘时新 rt 随栈帧丢失、账号被迫重登；先退避重试，
+        // 重试耗尽后按 rt 是否轮换分流（已轮换上抛 Err，未轮换仅日志可自愈）
+        let mut upsert_err: Option<String> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+            }
+            match buddy_ai_token_store_upsert(data_dir, account_id, &r) {
+                Ok(()) => {
+                    upsert_err = None;
+                    break;
+                }
+                Err(e) => upsert_err = Some(e),
+            }
+        }
+        if let Some(e) = upsert_err {
+            let rt_rotated = new_refresh
+                .as_deref()
+                .is_some_and(|nr| !nr.is_empty() && nr != refresh);
+            let msg = format!("buddy-ai 网关刷新回写失败（重试 3 次后）: {e}");
+            if rt_rotated {
+                let fatal =
+                    format!("{msg}；refresh token 已被服务端轮换且无法持久化，账号需重新登录");
+                fs_utils::app_log(data_dir, &fatal);
+                return Err(fatal);
+            }
+            fs_utils::app_log(data_dir, &msg);
         }
     }
     Ok(new_access)

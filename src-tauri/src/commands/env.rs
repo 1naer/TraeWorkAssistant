@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
@@ -77,7 +77,8 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
-    cmd.spawn().map_err(|e| format!("启动 Trae 失败: {e}"))?;
+    // 静默子进程 stdio：客户端自身日志不混入应用控制台（客户端有自己的日志文件）
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("启动 Trae 失败: {e}"))?;
     Ok(())
 }
 
@@ -257,6 +258,37 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             user_data_dir: format!("{home}\\.workbuddy"),
             settings_key: Some("workbuddy_path"),
         },
+        // WorkBuddy AI 国际版客户端（buddy-ai 独立应用顶栏/环境配置专用档案，P1 审查修复）。
+        // 2026-10-17 并存实测：国际版安装器与国内共用 %LOCALAPPDATA%\Programs\WorkBuddy\，
+        // 以独立 exe 名 WorkBuddyAI.exe 区分（未落 WorkBuddyAI\ 独立目录）——候选表
+        // 独立目录形态在前（标准布局优先），共享目录并存路径兜底；reg_exe_names 剔除
+        // 国内 "WorkBuddy.exe" 防注册表/回查串台；注册表模式串收窄为 "WorkBuddyAI"/
+        // "WorkBuddy AI"，避免误匹配国内 "WorkBuddy" 卸载项
+        "workbuddy_ai" => AppProfile {
+            display: "WorkBuddy AI",
+            reg_patterns: &["WorkBuddyAI", "WorkBuddy AI"],
+            reg_exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe"],
+            exe_candidates: &[
+                "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe",
+                "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddy AI.exe",
+                "%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddyAI.exe",
+            ],
+            proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
+            user_data_dir: format!("{home}\\.workbuddy-ai"),
+            settings_key: Some("workbuddy_ai_path"),
+        },
+        // CodeBuddy AI 国际客户端档案：用户实测与 codebuddy 同目录
+        //（%LOCALAPPDATA%\Programs\CodeBuddy\CodeBuddy.exe），独立档案仅为
+        // BuddyAI 应用上下文语义清晰（徽标/打开文案标注 AI，避免与国内页共用探测口径混淆）
+        "codebuddy_ai" => AppProfile {
+            display: "CodeBuddy AI",
+            reg_patterns: &["CodeBuddy"],
+            reg_exe_names: &["CodeBuddy.exe"],
+            exe_candidates: &["%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe"],
+            proc_names: &["CodeBuddy"],
+            user_data_dir: format!("{home}\\.codebuddy"),
+            settings_key: Some("codebuddy_ai_path"),
+        },
         // CodeBuddy IDE 独立探测（顶栏安装徽标/打开客户端）：默认路径同 WorkBuddy 的 Electron 惯例。
         // 本机实测（2026-09-12）：安装形态为 CodeBuddy CN（带空格），exe/进程名均为 "CodeBuddy CN"，
         // 注册表 DisplayName=CodeBuddy CN (User)，故 exe/进程/注册表候选同时覆盖不带 CN 的通用形态
@@ -264,11 +296,19 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             display: "CodeBuddy",
             reg_patterns: &["CodeBuddy"],
             reg_exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
+            // 2026-10-16（双客户端并存实测）：CN exe 优先——国际版 CodeBuddy.exe 读
+            // %APPDATA%\CodeBuddy，环境探测/重置/「打开 CodeBuddy」若选它会操作错端；
+            // 国际路径仅作老单安装布局兜底（国际版走 codebuddy_ai 档案）
             exe_candidates: &[
-                "%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe",
                 "%LOCALAPPDATA%\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe",
+                "%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe",
             ],
             proc_names: &["CodeBuddy", "CodeBuddy CN"],
+            // W7 审查注记（2026-10-16 并存实测）：proc_names 仅第 4 级探测消费，而
+            // CN 在盘时 exe_candidates 首位必先命中——"CodeBuddy" 映像名在并存布局
+            // 下归属国际版的交叉仅影响 CN exe 缺失的极端现场（此时机器只装了国际
+            // 端，兜底认国际 exe 是唯一可用语义）；运行态归属仲裁见 is_running_codebuddy
+            // 的 codebuddy_cn_installed 收窄与切换器侧 ImageArk（switcher/profile.rs）
             user_data_dir: format!("{home}\\.codebuddy"),
             settings_key: Some("codebuddy_path"),
         },
@@ -324,35 +364,71 @@ pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Resul
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
-    cmd.spawn().map_err(|e| format!("启动豆包失败: {e}"))?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("启动豆包失败: {e}"))?;
     Ok(())
 }
 
 // ── Buddy 双应用（WorkBuddy / CodeBuddy）打开与环境检测 ────────────────────
 
-/// 打开 WorkBuddy 桌面版：复用 app_locate workbuddy 档案四级探测取 exe。
-/// 分离启动（spawn 不等待），不注入代理、不做三级关闭。
+/// 打开 WorkBuddy AI 国际版客户端（buddy-ai 应用顶栏/环境配置，P1 审查修复）：
+/// 走 workbuddy_ai 独立档案探测（Programs\WorkBuddyAI），不再误开国内 WorkBuddy。
+/// 代理运行中传 proxy_port 以 `--proxy-server` 启动（对齐 Trae/豆包同款注入，
+/// workbuddy.ai 流量必走本地 MITM 代理——模型目录 /v3/config 等官网请求可抓）。
 #[tauri::command(async)]
-pub fn open_workbuddy_app(state: State<AppState>) -> Result<(), String> {
-    open_buddy_app(&state, "workbuddy", "WorkBuddy")
+pub fn open_workbuddy_ai_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "workbuddy_ai", "WorkBuddy AI", proxy_port, "WorkBuddy AI")
+}
+
+/// 打开 CodeBuddy AI 国际客户端（buddy-ai 应用上下文；探测同 codebuddy 目录）。
+/// 审查修复（M6）：kill_kind 传 "CodeBuddy AI"（映像表仅国际 CodeBuddy.exe），
+/// 原传 "CodeBuddy" 在双客户端并存时会连带关闭国内 "CodeBuddy CN.exe" 实例。
+#[tauri::command(async)]
+pub fn open_codebuddy_ai_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "codebuddy_ai", "CodeBuddy AI", proxy_port, "CodeBuddy AI")
+}
+
+/// 打开 WorkBuddy 桌面版：复用 app_locate workbuddy 档案四级探测取 exe。
+/// 代理运行中传 proxy_port 以 `--proxy-server` 启动（copilot.tencent.com/codebuddy.cn/
+/// workbuddy.cn 已入解密白名单，客户端侧流量可抓包观察）。
+#[tauri::command(async)]
+pub fn open_workbuddy_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "workbuddy", "WorkBuddy", proxy_port, "WorkBuddy")
 }
 
 /// 打开 CodeBuddy 桌面版：复用 app_locate codebuddy 档案四级探测取 exe。
-/// 分离启动（spawn 不等待），不注入代理、不做三级关闭。
+/// 代理注入同 open_workbuddy_app。
 #[tauri::command(async)]
-pub fn open_codebuddy_app(state: State<AppState>) -> Result<(), String> {
-    open_buddy_app(&state, "codebuddy", "CodeBuddy")
+pub fn open_codebuddy_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    open_buddy_app(&state, "codebuddy", "CodeBuddy", proxy_port, "CodeBuddy")
 }
 
-/// Buddy 双应用打开共用实现（open_doubao_app 的极简版：无代理注入、无进程关闭）
-fn open_buddy_app(state: &State<AppState>, app: &str, display: &str) -> Result<(), String> {
+/// Buddy 双应用打开共用实现。CN 双应用（open_workbuddy_app/open_codebuddy_app）
+/// 传 proxy_port=None 走极简路径；国际双应用代理运行中注入 `--proxy-server`
+/// （对齐 open_doubao_app：直开前清理残留系统代理；注入前三级关闭既有进程——
+/// Electron/Chromium 单实例会忽略新启动参数）。
+fn open_buddy_app(
+    state: &State<AppState>,
+    app: &str,
+    display: &str,
+    proxy_port: Option<u16>,
+    kill_kind: &str,
+) -> Result<(), String> {
     let loc = app_locate_inner(state, app);
     let exe = loc
         .exe
         .ok_or_else(|| format!("未检测到 {display} 客户端，请先安装或手动指定路径"))?;
-    Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("启动 {display} 失败: {e}"))?;
+    // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(state);
+    }
+    if proxy_port.is_some() {
+        crate::commands::process::graceful_kill_app(kill_kind)?;
+    }
+    let mut cmd = Command::new(&exe);
+    if let Some(port) = proxy_port {
+        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("启动 {display} 失败: {e}"))?;
     Ok(())
 }
 
@@ -397,9 +473,30 @@ pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
 
 /// CodeBuddy 进程检测：同时覆盖通用形态 CodeBuddy.exe 与本机实测的 "CodeBuddy CN.exe"。
 /// 原实现逐个名字跑 tasklist 子进程（未运行时 2 次 ≈ 520ms），改 sysinfo 进程表一次枚举
-/// （见 `switcher::proc::any_running`）
+/// （见 `switcher::proc::any_running`）。
+/// 审查修复（W8，2026-10-16 双客户端并存实测）：CN 拆分形态在盘时只认 "CodeBuddy CN"——
+/// 映像名 "CodeBuddy" 被国际版客户端与国内老单安装共用，并存时国际进程在跑会让
+/// 国内环境检测误报 running=true；CN 不在盘（老单安装布局）保持两形态全认。
 fn is_running_codebuddy() -> bool {
-    crate::switcher::proc::any_running(&["CodeBuddy CN", "CodeBuddy"])
+    if codebuddy_cn_installed() {
+        crate::switcher::proc::any_running(&["CodeBuddy CN"])
+    } else {
+        crate::switcher::proc::any_running(&["CodeBuddy CN", "CodeBuddy"])
+    }
+}
+
+/// CN 拆分形态安装判定（exe 候选首位同款路径）：用于区分共用映像名 "CodeBuddy"
+/// 的归属——在盘 = 并存布局，国际进程属国际版；不在盘 = 老单布局，归国内。
+fn codebuddy_cn_installed() -> bool {
+    std::env::var("LOCALAPPDATA")
+        .map(|l| {
+            std::path::Path::new(&l)
+                .join("Programs")
+                .join("CodeBuddy CN")
+                .join("CodeBuddy CN.exe")
+                .is_file()
+        })
+        .unwrap_or(false)
 }
 
 /// 兜底两级（注册表搜索 / 进程反查）结果短 TTL 缓存（P1 去重）。
@@ -445,6 +542,8 @@ pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate 
             "doubao_path" => settings.doubao_path,
             "workbuddy_path" => settings.workbuddy_path,
             "codebuddy_path" => settings.codebuddy_path,
+            "workbuddy_ai_path" => settings.workbuddy_ai_path,
+            "codebuddy_ai_path" => settings.codebuddy_ai_path,
             _ => None,
         };
         if let Some(p) = custom {
@@ -531,6 +630,7 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
             let mut icon: Option<String> = None;
             let mut loc: Option<String> = None;
             let mut name_ok = false;
+            let mut cur_key: Option<String> = None;
             for line in s.lines() {
                 let line = line.trim();
                 if line.starts_with("HKEY_") {
@@ -538,10 +638,20 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
                         if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
                             return Some(hit);
                         }
+                        // reg query /f 输出只含匹配值行（2026-10-17 实测：DisplayName
+                        // 命中时同键的 DisplayIcon/InstallLocation 往往不在 /f 输出），
+                        // 按键路径回查该键全部值再解析一次
+                        if let Some(k) = cur_key.as_deref() {
+                            let (i2, l2) = reg_query_key_values(k);
+                            if let Some(hit) = resolve_reg_profile_candidate(&i2, &l2, profile) {
+                                return Some(hit);
+                            }
+                        }
                     }
                     icon = None;
                     loc = None;
                     name_ok = false;
+                    cur_key = Some(line.to_string());
                     continue;
                 }
                 if let Some(v) = line.strip_prefix("DisplayName") {
@@ -564,6 +674,12 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
                 if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
                     return Some(hit);
                 }
+                if let Some(k) = cur_key.as_deref() {
+                    let (i2, l2) = reg_query_key_values(k);
+                    if let Some(hit) = resolve_reg_profile_candidate(&i2, &l2, profile) {
+                        return Some(hit);
+                    }
+                }
             }
         }
     }
@@ -579,7 +695,21 @@ fn resolve_reg_profile_candidate(
     if let Some(icon) = icon {
         // DisplayIcon 可能带 ",0" 图标索引后缀
         let clean = icon.split(',').next().unwrap_or(icon).trim().to_string();
-        if clean.to_lowercase().ends_with(".exe") && std::path::Path::new(&clean).is_file() {
+        // icon 文件名须精确命中档案白名单：国内档案 reg_patterns 含 "WorkBuddy"
+        // 会 contains 匹配国际键 "WorkBuddyAI (User)"，无白名单则其 DisplayIcon
+        // （WorkBuddyAI.exe）被国内档案误收，注册表级串台
+        let fname_ok = std::path::Path::new(&clean)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|f| {
+                let f = f.to_lowercase();
+                profile.reg_exe_names.iter().any(|n| n.to_lowercase() == f)
+            })
+            .unwrap_or(false);
+        if fname_ok
+            && clean.to_lowercase().ends_with(".exe")
+            && std::path::Path::new(&clean).is_file()
+        {
             return Some(clean);
         }
     }
@@ -592,6 +722,33 @@ fn resolve_reg_profile_candidate(
         }
     }
     None
+}
+
+/// 按键路径回查单个卸载键的全部值（DisplayIcon / InstallLocation）。
+/// `reg query <key>`（无 /f）输出该键所有值行；失败静默返回空。
+fn reg_query_key_values(key: &str) -> (Option<String>, Option<String>) {
+    let Ok(out) = Command::new("reg")
+        .args(["query", key])
+        .creation_flags(0x08000000)
+        .output()
+    else {
+        return (None, None);
+    };
+    let mut icon = None;
+    let mut loc = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("DisplayIcon") {
+            if let Some(val) = v.split("REG_SZ").nth(1) {
+                icon = Some(val.trim().to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("InstallLocation") {
+            if let Some(val) = v.split("REG_SZ").nth(1) {
+                loc = Some(val.trim().to_string());
+            }
+        }
+    }
+    (icon, loc)
 }
 
 /// 运行进程反查 exe 路径（应用运行中时最准）：精确映像名匹配，取首个带路径的进程。

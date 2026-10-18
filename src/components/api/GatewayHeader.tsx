@@ -3,11 +3,12 @@
  * 启停按钮 + 常驻指标行（运行状态 / 总请求数 / 当前并发数 / API Key 数量）。
  * 数据源：api_server_status（含 inflight）、api_keys_list；3s 轮询刷新。
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Play, Square } from 'lucide-react';
 import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
+import { getVisiblePoolText } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
 import GatewayHelpModal, { GatewayHelpButton } from './GatewayHelpModal';
 import type { ApiServiceStatus, LanIfaceIp } from '../../types';
@@ -26,6 +27,7 @@ function Metric({ label, value, hint }: { label: string; value: string | number;
 
 export default function GatewayHeader() {
   const toast = useAppStore((s) => s.pushToast);
+  const settings = useAppStore((s) => s.settings);
   const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [keyCount, setKeyCount] = useState(0);
   const [starting, setStarting] = useState(false);
@@ -90,12 +92,15 @@ export default function GatewayHeader() {
 
   const running = status?.running ?? false;
 
+  // 头部说明文案随「应用显示」联动（隐藏池不再出现在文案中；四池全隐藏时回退通用表述）
+  const poolText = useMemo(() => getVisiblePoolText(settings), [settings]);
+
   return (
     <div className="card p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <p className="text-sm font-medium text-slate-800 dark:text-zinc-100">
-            OpenAI / Anthropic 兼容接口，通过 Trae / Buddy / Qoder 资源池智能调度实现多账号负载均衡
+            OpenAI / Anthropic 兼容接口，通过{poolText ? ` ${poolText}` : '已启用'}资源池智能调度实现多账号负载均衡
           </p>
           <p className="mt-0.5 break-all text-xs text-slate-400 dark:text-zinc-500">
             统一网关 127.0.0.1:{status?.port ?? 7864}

@@ -29,6 +29,7 @@ pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
+pub mod buddy_ai_checkin;
 pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
@@ -141,6 +142,47 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "qoder-refresh" => qoder_refresh::run_task(state),
         // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）
         "qoder-catalog-sync" => qoder_catalog::run_task(state),
+        // Buddy 国际版积分数据同步 / 凭证兜底续期 / 模型目录同步（调度器/CLI 共用；
+        // runtime=None：CLI 独立进程无网关运行态，仅落库不做运行池拨新）
+        "buddy-ai-credits-sync" => crate::commands::workbuddy::buddy_ai_credits_sync_impl(state, None)
+            .map(|v| serde_json::json!({ "ok": true, "accounts": v.len() })),
+        "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(state),
+        "buddy-ai-catalog-sync" => crate::commands::workbuddy::buddy_ai_catalog_sync_impl(state)
+            .map(|n| serde_json::json!({ "ok": true, "models": n })),
+        // Buddy 国际版每日活跃打卡（T4 审查修复：调度器有 buddy-ai-checkin 分支，
+        // run_cli_task 却无对应分发——`--task-run buddy-ai-checkin` 落入未知任务
+        // 报错退出）。口径对齐 scheduler.rs 同名分支：抢轮次锁与 UI 路径互斥
+        // （skipped_busy 幂等跳过）；存在失败账号返 Err（退出码可见，NDJSON 事件
+        // 已逐行打印失败明细）。不设 permanent 剔除：buddy-ai 凭证 401 可经续期/
+        // 401 自愈轮换新值重试成功（T7 归一语义），CLI 无冷却重试链、次日调度覆盖
+        "buddy-ai-checkin" => {
+            match crate::commands::workbuddy::try_acquire_buddy_ai_round() {
+                Ok(_round) => {
+                    let done = buddy_ai_checkin::run_checkin_round(state, &mut print_progress);
+                    let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let already = done
+                        .get("already")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let failed = done
+                        .get("failed")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    if failed > 0 {
+                        Err(format!(
+                            "buddy-ai 打卡：{ok} 成功 / {already} 已完成 / {failed} 失败"
+                        ))
+                    } else {
+                        Ok(done)
+                    }
+                }
+                Err(_) => Ok(serde_json::json!({
+                    "ok": true,
+                    "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过",
+                    "skipped_busy": true
+                })),
+            }
+        }
         // Trae JWT 定时续期（issue #27；调度器/CLI 共用批量惰性刷新）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(state),
         // Trae 每日签到：vault 解密全量账号跑单轮

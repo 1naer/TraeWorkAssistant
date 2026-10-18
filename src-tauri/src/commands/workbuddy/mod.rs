@@ -15,6 +15,7 @@
 //! - `env_reset`：环境重置 / 彻底登出
 
 mod accounts;
+mod buddy_ai;
 mod chatdata;
 pub(crate) mod checkin;
 mod cli;
@@ -26,6 +27,7 @@ mod oauth;
 
 // 对外 API 与拆分前单文件模块完全一致（main.rs 的 commands::workbuddy::xxx 全部不变）。
 pub use accounts::*;
+pub use buddy_ai::*;
 pub use chatdata::*;
 pub use checkin::*;
 pub use cli::*;

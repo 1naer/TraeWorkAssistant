@@ -126,6 +126,9 @@ export default function BuddyApiService() {
     wbToolExec: false,
     wbBgDowngrade: false,
     wbLongctxDowngrade: false,
+    // buddy-ai（国际版独立池，阶段 2）：显式开启制，默认关
+    buddyAiEnabled: false,
+    buddyAiStickyEnabled: false,
   });
   const [wbParams, setWbParams] = useState({ ...WB_PARAM_DEFAULTS });
   // Buddy 池入池白名单（wb-<hash> 账号 id = a.id，与网关池键/PoolStatus.uid 同域；
@@ -192,6 +195,8 @@ export default function BuddyApiService() {
           wbToolExec: pf.wb_tool_exec ?? false,
           wbBgDowngrade: pf.wb_bg_downgrade ?? false,
           wbLongctxDowngrade: pf.wb_longctx_downgrade ?? false,
+          buddyAiEnabled: pf.buddy_ai_enabled ?? false,
+          buddyAiStickyEnabled: pf.buddy_ai_sticky_enabled ?? false,
         });
         setWbParams({
           wbHedgeThresholdMs: pf.wb_hedge_threshold_ms ?? WB_PARAM_DEFAULTS.wbHedgeThresholdMs,
@@ -289,6 +294,14 @@ export default function BuddyApiService() {
         600,
       );
       pushToast('success', '账号池选择、资源开关与调度参数已保存（服务运行中即时生效）');
+      // 保存后重新拉取池快照（审查残留项修复）：本页保存原样回传加载时的
+      // enabled_uids/strategy/groups，页面停留期间若他端（全局 API 管理弹窗等）
+      // 改动了池配置，旧快照回传会覆盖回去——保存成功后立即同步最新快照收窄窗口
+      try {
+        setPool(await api.apiServer.poolList());
+      } catch {
+        /* 快照同步失败不阻塞保存结果，下次刷新自愈 */
+      }
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -622,6 +635,9 @@ export default function BuddyApiService() {
                     </span>
                   </label>
                 ))}
+
+                {/* 国际版（buddy-ai）开关已迁至 BuddyAI · 资源调度页（资源开关与调度参数节），
+                    此处不再重复；wbFlags 仍加载/回传 buddyAi* 键，保存国内开关不会清掉国际档配置 */}
               </div>
 
               {/* 调度参数（F-76②/③/F-77：数值热参数，保存即热生效） */}

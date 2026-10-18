@@ -1010,6 +1010,71 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
     workbuddy_token_stats_impl(&state, fresh.unwrap_or(false))
 }
 
+/// BuddyAI 国际版本地 Token 统计（BuddyAI 积分看板 Token Tab「本地」源）：
+/// 扫描 ~/.workbuddy-ai/projects 会话 jsonl（国际客户端与国内 ~/.workbuddy 同格式
+/// 存储，2026-10-16 实机确认）。单根目录；文件级增量缓存独立 kv 键
+///（buddy_ai_token_stats_files，不与国内 token_stats_files 混居）；结果内存缓存
+/// 10 分钟（Tab 切换不打回扫）。单根目录体量小，过期同步重扫即可，不做 SWR。
+#[tauri::command(async)]
+pub fn buddy_ai_token_stats(state: State<AppState>, fresh: Option<bool>) -> Value {
+    buddy_ai_token_stats_impl(&state, fresh.unwrap_or(false))
+}
+
+/// 实现（命令与调度器 buddy-ai-credits-sync 共用；fresh=false 走 10min 结果缓存）
+pub(crate) fn buddy_ai_token_stats_impl(state: &AppState, fresh: bool) -> Value {
+    static RESULT: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+    const TTL_SECS: u64 = 600;
+    let fresh = fresh;
+    if !fresh {
+        if let Ok(guard) = RESULT.lock() {
+            if let Some((at, v)) = guard.as_ref() {
+                if at.elapsed().as_secs() < TTL_SECS {
+                    return v.clone();
+                }
+            }
+        }
+    }
+    let t = Instant::now();
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let cutoff = cutoff_date_str();
+    // 重扫体持表级互斥（对齐国内 workbuddy_token_stats_impl）：async 命令并发
+    // （Tab 打开 + 手动重扫）load→scan→save 无锁会互相覆盖丢增量文件条目
+    let _guard = TOKEN_STATS_FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache: HashMap<String, FileCacheEntry> =
+        crate::store::db(&state.data_dir).kv_get("buddy_ai_token_stats_files");
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut v = scan_root(
+        &Path::new(&home).join(".workbuddy-ai").join("projects"),
+        "workbuddy-ai",
+        &cutoff,
+        &mut cache,
+        &mut seen,
+    );
+    // 已删除文件的缓存条目清理（对齐国内）：否则旧 jsonl 的缓存条目永驻 kv 无限增长
+    cache.retain(|k, _| seen.contains(k));
+    let _ = crate::store::db(&state.data_dir).kv_set("buddy_ai_token_stats_files", &cache);
+    v["generated_at"] = json!(chrono::Utc::now().timestamp_millis());
+    v["window_days"] = json!(WINDOW_DAYS);
+    v["fresh"] = json!(fresh);
+    v["scan_ms"] = json!(t.elapsed().as_millis() as u64);
+    if let Ok(mut guard) = RESULT.lock() {
+        *guard = Some((Instant::now(), v.clone()));
+    }
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "[buddy-ai-token] 扫描 {:.2}s：文件 {}（命中 {} / 解析 {}），缓存条目 {}，解析错误 {}",
+            t.elapsed().as_millis() as f64 / 1000.0,
+            v.get("files_scanned").and_then(Value::as_u64).unwrap_or(0),
+            v.get("cache_hit_files").and_then(Value::as_u64).unwrap_or(0),
+            v.get("files_parsed").and_then(Value::as_u64).unwrap_or(0),
+            cache.len(),
+            v.get("parse_errors").and_then(Value::as_u64).unwrap_or(0),
+        ),
+    );
+    v
+}
+
 /// token_stats_files 表级读改写互斥（审查 P3-8）：GUI 同步重扫 / 调度器 Token 同步 /
 /// SWR 后台重扫线程三路并发时，kv load→scan→save 互相覆盖丢增量文件条目。
 /// 持锁覆盖全量重扫体（scan 可达秒级，重扫请求串行化；fresh=false 只读路径不持锁）。

@@ -248,11 +248,13 @@ pub fn unified_models_whitelisted(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, false)
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None, false)
 }
 
 /// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
-/// Qoder 目录（p3-3：HTTP /v1/models 端点传入，管理端/测试传 None）。
+/// Qoder 目录（p3-3：HTTP /v1/models 端点传入，管理端/测试传 None）；
+/// `buddy_ai = Some((开关, 池健康))` 时合并 buddy-ai 国际静态目录（阶段 2 审查修复：
+/// Intl 专属模型入对外目录，白名单可管理；传 None = 既有调用方/测试零变化）；
 /// `qoder_flash_free`：Qwen3.8-Flash 免费活动覆盖开关（issue #111，与取号/
 /// 排序同口径，旧签名包装传 false 测试零变化）
 pub fn unified_models_whitelisted_ex(
@@ -261,10 +263,19 @@ pub fn unified_models_whitelisted_ex(
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    buddy_ai: Option<(bool, bool)>,
     qoder_flash_free: bool,
 ) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder, qoder_flash_free)
+    unified_models_ex(
+        data_dir,
+        wb_enabled,
+        trae_ok,
+        buddy_ok,
+        qoder,
+        buddy_ai,
+        qoder_flash_free,
+    )
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
         .collect()
@@ -387,11 +398,13 @@ pub fn unified_models(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, false)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None, false)
 }
 
 /// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
-/// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康。
+/// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康；
+/// `buddy_ai = Some((开关, 池健康))` 时合并 buddy-ai 国际静态目录（审查修复：
+/// Intl 专属模型入统一目录，同 id 双区条目仅追加来源标记）；
 /// `qoder_flash_free`：Qwen3.8-Flash 免费活动覆盖（issue #111，旧签名包装传 false）
 pub fn unified_models_ex(
     data_dir: &Path,
@@ -399,6 +412,7 @@ pub fn unified_models_ex(
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    buddy_ai: Option<(bool, bool)>,
     qoder_flash_free: bool,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
@@ -412,6 +426,9 @@ pub fn unified_models_ex(
     let enabled_of = |pool: TargetPool| match pool {
         TargetPool::Trae => trae_ok,
         TargetPool::Buddy => wb_enabled && buddy_ok,
+        // buddy-ai（阶段 2 审查修复）：旗标由调用方传入（HTTP 端点/管理端），
+        // 徽章 = 开关 && 池健康（qoder 同款口径）；未提供旗标（旧包装/测试）不参与聚合
+        TargetPool::BuddyAi => buddy_ai.map_or(false, |(e, ok)| e && ok),
         // 自定义模型可用性 = 条目 enabled（find_enabled 只回 enabled 条目）
         TargetPool::Custom => true,
         // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
@@ -538,6 +555,80 @@ pub fn unified_models_ex(
                         manual: false,
                     },
                 );
+            }
+        }
+    }
+
+    // 源2.5：buddy-ai（国际版目录）：调用方提供旗标时并入（旧签名包装传 None =
+    // 测试面与既有调用方零变化）。CN 目录已有条目仅追加来源标记（R-9 同账号体系
+    // 同名模型双区可服务）；Intl 专属 id 建新条目。倍率静态占位（1.0 待人工核对
+    // 回填）不进展示——rate 记 None（未声明，显示 —），防假定价；条目始终入表
+    //（镜像 Qoder 语义），`enabled` 徽章 = 开关 && 池健康。
+    // 目录源修复（审查 P1）：消费动态目录 buddy_ai_load（kv buddy_ai_model_catalog，
+    // 与 dispatch 取号/资源调度页同源）——原用 builtin 静态表，「同步官网模型」新增的
+    // Intl 模型不出现在 /v1/models 与管理端目录，上游下架的模型仍展示为可路由
+    if buddy_ai.is_some() {
+        // 倍率来源判定（审查修复配套）：动态目录（kv buddy_ai_model_catalog）存在才
+        // 透传真实倍率——kv 缺失时 buddy_ai_load 回落 builtin 占位 1.0，维持 None
+        // 防假定价（与「静态占位不进展示」原口径一致）
+        let dynamic_catalog = crate::store::db(data_dir)
+            .kv_get_raw(super::wb_catalog::BUDDY_AI_CATALOG_KEY)
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        let rate_of = |m: &super::wb_catalog::WbModel| {
+            if dynamic_catalog && m.rate.is_finite() {
+                Some(m.rate)
+            } else {
+                None
+            }
+        };
+        for m in super::wb_catalog::buddy_ai_load(data_dir) {
+            let canonical = canonical_id(&m.id);
+            if canonical.is_empty() {
+                continue;
+            }
+            let bai_enabled = enabled_of(TargetPool::BuddyAi);
+            match acc.get_mut(&canonical) {
+                Some(u) => {
+                    if u.sources.iter().any(|s| s.pool == "buddy-ai") {
+                        continue;
+                    }
+                    u.sources.push(UnifiedSource {
+                        pool: "buddy-ai",
+                        rate: None,
+                        enabled: bai_enabled,
+                    });
+                }
+                None => {
+                    order.push(canonical.clone());
+                    acc.insert(
+                        canonical.clone(),
+                        UnifiedModel {
+                            id: m.id.clone(),
+                            display: if m.display.is_empty() {
+                                m.id.clone()
+                            } else {
+                                m.display.clone()
+                            },
+                            vendor: String::new(),
+                            region: None,
+                            // 动态目录自带真实倍率（credits "x1.39" 解析；NaN=元数据缺失
+                            // 哨兵与 builtin 回落均保持 None 防假定价）
+                            rate: rate_of(&m),
+                            efforts: m.supported_efforts.clone(),
+                            max_mode: false,
+                            context_length: (m.context_length > 0).then_some(m.context_length),
+                            max_tokens: (m.max_tokens > 0).then_some(m.max_tokens),
+                            supports_image: Some(m.supports_image),
+                            sources: vec![UnifiedSource {
+                                pool: "buddy-ai",
+                                rate: rate_of(&m),
+                                enabled: bai_enabled,
+                            }],
+                            manual: false,
+                        },
+                    );
+                }
             }
         }
     }
@@ -1026,6 +1117,34 @@ mod tests {
         let list = unified_models(&f.dir, true, false, true);
         let g = find(&list, "glm-5.3");
         assert!(!g.sources.iter().find(|s| s.pool == "trae").unwrap().enabled);
+    }
+
+    /// 阶段 2 审查修复：buddy-ai 静态目录并入统一目录（提供旗标时）。
+    /// Intl 专属 id 新条目；CN 目录已有条目仅追加来源标记；开关关闭徽章置灰
+    /// 条目仍在（镜像 Qoder 语义）；未提供旗标（旧包装）不合并零变化
+    #[test]
+    fn t_buddy_ai_source_merged() {
+        let f = fixture(&[("glm-5.3", None)], &["glm-5.3"], None);
+        let list = unified_models_ex(&f.dir, true, true, true, None, Some((true, true)), false);
+        // Intl 专属 id：deepseek-v4.1-flash 新条目，来源 buddy-ai 且 enabled
+        let d = find(&list, "deepseek-v4.1-flash");
+        let ds = d.sources.iter().find(|s| s.pool == "buddy-ai").expect("Intl 专属条目应带 buddy-ai 源");
+        assert!(ds.enabled);
+        assert_eq!(d.rate, None, "静态占位倍率不进展示（未声明显示 —）");
+        // CN 已有条目：buddy + buddy-ai 双来源标记
+        let g = find(&list, "glm-5.3");
+        assert!(g.sources.iter().any(|s| s.pool == "buddy"));
+        assert!(g.sources.iter().any(|s| s.pool == "buddy-ai"));
+        // 开关关闭 → 徽章置灰，条目仍在
+        let list2 = unified_models_ex(&f.dir, true, true, true, None, Some((false, true)), false);
+        let d2 = find(&list2, "deepseek-v4.1-flash");
+        assert!(!d2.sources.iter().find(|s| s.pool == "buddy-ai").unwrap().enabled);
+        // 未提供旗标（旧签名包装语义）→ 不合并
+        let list3 = unified_models(&f.dir, true, true, true);
+        assert!(
+            list3.iter().all(|m| canonical_id(&m.id) != "deepseek-v4.1-flash"),
+            "未提供旗标不得合并 buddy-ai 目录"
+        );
     }
 
     /// 双源 context_length 跟随命中侧/启用池（issue #38-4）：WB 池未启用时

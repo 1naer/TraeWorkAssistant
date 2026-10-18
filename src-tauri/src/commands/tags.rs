@@ -78,9 +78,10 @@ fn heal_orphan_bindings(state: &AppState, store: &crate::store::Store, bound_uid
         return;
     }
     // 源表读失败（rows_all Err）→ 清点不可信，宁可不清理也不误删
-    let (Ok(wb_rows), Ok(qoder_rows)) = (
+    let (Ok(wb_rows), Ok(qoder_rows), Ok(buddy_ai_rows)) = (
         store.rows_all("wb_accounts"),
         store.rows_all("qoder_accounts"),
+        store.rows_all("buddy_ai_accounts"),
     ) else {
         return;
     };
@@ -110,12 +111,13 @@ fn heal_orphan_bindings(state: &AppState, store: &crate::store::Store, bound_uid
     };
     let wb = pool_ids(wb_rows);
     let qoder = pool_ids(qoder_rows);
-    if trae.is_empty() && wb.is_empty() && qoder.is_empty() {
-        return; // 三池全空：真空库（无需清理）或读取降级，跳过防整表误删
+    let buddy_ai = pool_ids(buddy_ai_rows);
+    if trae.is_empty() && wb.is_empty() && qoder.is_empty() && buddy_ai.is_empty() {
+        return; // 全池空：真空库（无需清理）或读取降级，跳过防整表误删
     }
     let orphans: Vec<String> = bound_uids
         .into_iter()
-        .filter(|u| !trae.contains(u) && !wb.contains(u) && !qoder.contains(u))
+        .filter(|u| !trae.contains(u) && !wb.contains(u) && !qoder.contains(u) && !buddy_ai.contains(u))
         .collect();
     if orphans.is_empty() {
         return;
@@ -252,6 +254,7 @@ fn delete_inner(
             &mut pool_file.trae_tag_ids,
             &mut pool_file.wb_tag_ids,
             &mut pool_file.qoder_tag_ids,
+            &mut pool_file.buddy_ai_tag_ids,
         ] {
             if ids.iter().any(|t| t == id) {
                 ids.retain(|t| t != id);
@@ -367,6 +370,7 @@ mod tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };

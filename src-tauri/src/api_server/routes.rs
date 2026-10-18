@@ -108,7 +108,18 @@ fn resolve_wb_target(
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    if wb_catalog::find(&catalog, &r.model).is_none() {
+    // Intl 目录动态化（2026-10-15）：动态抓取结果优先，缺失回落内置静态表
+    let intl_catalog = wb_catalog::buddy_ai_load(&state.data_dir);
+    // 审查修复：CN 目录未命中并查 Intl 目录（/v1/responses 同 dispatch 源判定，
+    // Intl 专属 id 如 deepseek-v4.1-flash 不得 404）；Intl 专属命中跳过 CN 目录降级
+    //（降级候选发往 buddy-ai 池上游不存在）
+    let intl_only = wb_catalog::find(&catalog, &r.model).is_none()
+        && (wb_catalog::find(&intl_catalog, &r.model).is_some()
+            || wb_catalog::find(&intl_catalog, model).is_some());
+    if wb_catalog::find(&catalog, &r.model).is_none()
+        && wb_catalog::find(&intl_catalog, &r.model).is_none()
+        && wb_catalog::find(&intl_catalog, model).is_none()
+    {
         return None;
     }
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
@@ -116,11 +127,13 @@ fn resolve_wb_target(
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
     let whitelist = unified_catalog::load_whitelist(&state.data_dir);
     let in_wl = |m: &str| unified_catalog::whitelist_allows(&whitelist, m);
-    let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+    let final_model = if !intl_only
+        && state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
         wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
-    } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+    } else if !intl_only
+        && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
@@ -267,7 +280,7 @@ fn inject_trae_outbound(
 
 /// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
 fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) -> Response {
-    let rem = wb_route::model_cooling_remaining(state, model).unwrap_or(0);
+    let rem = wb_route::model_cooling_remaining_wb(state, model).unwrap_or(0);
     let msg = format!("model {} cooling down, retry after {}s", model, rem);
     match proto {
         Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
@@ -369,6 +382,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     let pool_ref = match pool {
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
+        TargetPool::BuddyAi => &state.buddy_ai_pool,
         TargetPool::Qoder => &state.qoder_pool,
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
@@ -475,7 +489,10 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
     let wb_ok = wb_enabled && state.wb_pool.has_selectable();
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = qoder_enabled && state.qoder_pool.has_selectable();
-    if solo_ok || wb_ok || qoder_ok {
+    // buddy-ai 独立池（§3.4 隔离清单）：healthz 四池化——仅部署 Intl 账号时探活同样正常
+    let buddy_ai_enabled = state.buddy_ai_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_ok = buddy_ai_enabled && state.buddy_ai_pool.has_selectable();
+    if solo_ok || wb_ok || qoder_ok || buddy_ai_ok {
         (
             StatusCode::OK,
             axum::Json(json!({
@@ -483,6 +500,7 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
                 "solo_available": solo_ok,
                 "wb_available": wb_ok,
                 "qoder_available": qoder_ok,
+                "buddy_ai_available": buddy_ai_ok,
             })),
         )
             .into_response()
@@ -550,14 +568,8 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "err_count": p.err_count, "state": p.state, "inflight": p.inflight,
         })
     }).collect();
-    // F-77：per-account 并发列表（活跃账号 [{uid, name, inflight}]），
-    // 供前端池状态页实时展示 busy/idle 分布（active_uid 单值的超集）
-    let active_accounts: Vec<Value> = pool
-        .iter()
-        .chain(wb_pool.iter())
-        .filter(|p| p.inflight > 0)
-        .map(|p| json!({ "uid": p.uid, "name": p.name, "inflight": p.inflight }))
-        .collect();
+    // F-77：per-account 并发列表（活跃账号 [{uid, name, inflight}]）——
+    // 见下方 buddy-ai 画像块（三池合并后统一构造）
     let model_cooldowns: Vec<Value> = {
         let map = safe_lock(&state.model_cooldowns);
         map.iter()
@@ -567,6 +579,37 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             }))
             .collect()
     };
+
+    // buddy-ai 独立池画像（阶段 2，§3.1 失败域隔离：与 wb 画面完全独立）
+    let buddy_ai_pool_status = state.buddy_ai_pool.status_list();
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_accounts: Vec<Value> = buddy_ai_pool_status.iter().map(|p| {
+        json!({
+            "uid": p.uid, "name": p.name, "credits": p.credits,
+            "cooling": p.cooling, "cooldown_until": p.cooldown_until,
+            "cooldown_reason": p.cooldown_reason, "disabled": p.disabled,
+            "err_count": p.err_count, "state": p.state, "inflight": p.inflight,
+        })
+    }).collect();
+    let buddy_ai_model_cooldowns: Vec<Value> = {
+        let map = safe_lock(&state.buddy_ai_model_cooldowns);
+        map.iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(m, (until, fails))| json!({
+                "model": m, "until": until, "remaining_s": until - now, "fails": fails,
+            }))
+            .collect()
+    };
+    // buddy-ai 活跃账号并入 busy 画像（同一网关出口，并发可视性对齐三池）
+    let active_accounts: Vec<Value> = pool
+        .iter()
+        .chain(wb_pool.iter())
+        .chain(buddy_ai_pool_status.iter())
+        .filter(|p| p.inflight > 0)
+        .map(|p| json!({ "uid": p.uid, "name": p.name, "inflight": p.inflight }))
+        .collect();
 
     Json(json!({
         "running": true,
@@ -595,6 +638,17 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "probe_ok": state.wb_probe_ok.load(std::sync::atomic::Ordering::Relaxed),
             "probe_ts_ms": state.wb_probe_ts_ms.load(std::sync::atomic::Ordering::Relaxed),
         },
+        "buddy_ai": {
+            "enabled": buddy_ai_enabled,
+            "total_accounts": buddy_ai_pool_status.len(),
+            "accounts": buddy_ai_accounts,
+            "model_cooldowns": buddy_ai_model_cooldowns,
+            "sticky_sessions": state.buddy_ai_sticky.len(),
+            // 上游健康探针（G8 审查修复）：与 wb 块同口径对齐，前端/监控可按
+            // 池区分上游可达性；-1 未探测 / 0 不可达 / 1 在线
+            "probe_ok": state.buddy_ai_probe_ok.load(std::sync::atomic::Ordering::Relaxed),
+            "probe_ts_ms": state.buddy_ai_probe_ts_ms.load(std::sync::atomic::Ordering::Relaxed),
+        },
     }))
 }
 
@@ -611,14 +665,20 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
+    // buddy-ai 源旗标（阶段 2 审查修复）：Intl 静态目录入统一目录（Intl 专属 id
+    // 可被发现/加入白名单），徽章 = 开关 && 池健康
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_ok = state.buddy_ai_pool.has_selectable();
     // Qwen3.8-Flash 免费活动覆盖（issue #111）：目录展示与取号/排序同口径
     let qoder_flash_free = state
         .qoder_flash_free_rate
         .load(std::sync::atomic::Ordering::Relaxed);
     let data_dir = state.data_dir.clone();
     // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
-    // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
-    // 客户端（如 CC Switch）可在同名模型间区分来源池（三家倍率与效果不同）
+    // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / buddy-ai/xxx
+    // / qoder/xxx），客户端（如 CC Switch）可在同名模型间区分来源池（各池倍率与效果不同）
     let source_labels = dispatch::load_policy(&data_dir).model_source_labels;
     let list = tokio::task::spawn_blocking(move || {
         // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
@@ -628,15 +688,24 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             trae_ok,
             buddy_ok,
             Some((qoder_enabled, qoder_ok)),
+            Some((buddy_ai_enabled, buddy_ai_ok)),
             qoder_flash_free,
         )
     })
     .await
     .unwrap_or_default();
-    // wb_enabled=false：仅 Buddy 源的模型过滤，双源模型保留（仍可由 Trae 源服务 §3.4）
+    // wb_enabled=false：仅 WB 系源（buddy / buddy-ai）的模型过滤，多源模型保留
+    //（仍可由 Trae 源服务 §3.4；buddy-ai 开启时 CN 目录模型经 buddy-ai 池仍可路由，
+    // 不得在准入目录层被滤掉——与 dispatch available 门控同口径）
     let mut data: Vec<Value> = list
         .iter()
-        .filter(|m| wb_enabled || !m.sources.iter().all(|s| s.pool == "buddy"))
+        .filter(|m| {
+            wb_enabled
+                || buddy_ai_enabled
+                || !m.sources
+                    .iter()
+                    .all(|s| s.pool == "buddy" || s.pool == "buddy-ai")
+        })
         .map(|m| {
             json!({
                 "id": m.id,
@@ -755,15 +824,17 @@ pub async fn chat_completions(
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
-            TargetPool::Buddy => {
+            // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
                 let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
+                let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -884,15 +955,29 @@ pub async fn responses_api(
             );
         }
     };
-    if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    // buddy-ai（阶段 2）：wb 档关闭且国际档开启时走国际池（与 /v1/chat 的
+    // priority 语义一致：buddy 优先、buddy-ai 兜底；wb 开时保持现状 CN 路径）
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let buddy_ai = !wb_enabled && buddy_ai_enabled;
+    if !wb_enabled && !buddy_ai_enabled {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "wb_upstream_disabled",
             "WB 上游未启用（api_pool.json wb_enabled）",
         );
     }
-    if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
-        return model_cooling_response(&state, &resolved_model, Protocol::Responses);
+    {
+        let view = if buddy_ai {
+            wb_route::WbView::intl(state.clone())
+        } else {
+            wb_route::WbView::wb(state.clone())
+        };
+        if wb_route::model_cooling_remaining(&view, &resolved_model).is_some() {
+            return model_cooling_response(&state, &resolved_model, Protocol::Responses);
+        }
     }
 
     let mut chat_body = chat_body;
@@ -902,6 +987,7 @@ pub async fn responses_api(
     {
         return wb_route::wb_tool_exec_chat(
             state_clone,
+            buddy_ai,
             chat_body,
             resolved_model,
             stream,
@@ -919,9 +1005,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools)
+        wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, encoded_tools).await
+        wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, encoded_tools).await
     }
 }
 
@@ -945,8 +1031,9 @@ fn strip_bracket_1m(name: &str) -> Option<&str> {
     }
 }
 
-/// 三池可路由判定（Anthropic 入口兜底专用）：Custom 直达命中 /
-/// WB 路由解析命中目录且上游启用 / Trae 模型列表 canonical 命中
+/// 可路由判定（Anthropic 入口兜底专用）：Custom 直达命中 /
+/// WB 路由解析命中目录且上游启用 / buddy-ai Intl 目录命中且国际档启用 /
+/// Trae 模型列表 canonical 命中
 fn anthropic_model_servable(state: &ApiSharedState, model: &str) -> bool {
     if super::custom_models::find_enabled(&state.data_dir, model).is_some() {
         return true;
@@ -958,6 +1045,22 @@ fn anthropic_model_servable(state: &ApiSharedState, model: &str) -> bool {
         && wb_catalog::find(&catalog, &r.model).is_some()
     {
         return true;
+    }
+    // G6 审查修复：buddy-ai 国际档对称判定——/v1/messages 经 dispatch 已可路由
+    // Intl 目录模型（TargetPool::BuddyAi），本判定原先只认 CN 目录，纯国际档
+    // 用户（wb 关、intl 开）被误判不可路由，分类器名一律回落默认模型。仅按
+    // 请求原名直查 Intl 目录：Intl 专属 id（如 deepseek-v4.1-flash）不经 CN
+    // 四段路由映射，原名即 dispatch 路由名。不可用 r.model（L1043 CN 目录
+    // resolve 结果，claude-* 系会被映射成 CN 模型名）查 Intl 目录——映射名
+    // 恰在 Intl 目录时会产生假阳性，分类器名被误判「可路由」而跳过回落
+    if state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let intl_catalog = wb_catalog::buddy_ai_load(&state.data_dir);
+        if wb_catalog::find(&intl_catalog, model).is_some() {
+            return true;
+        }
     }
     super::models_sync::load_models(&state.data_dir)
         .iter()
@@ -1094,15 +1197,17 @@ pub async fn messages(
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
-            TargetPool::Buddy => {
+            // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
                 let explicit = peek.get("thinking").map_or(false, |t| !t.is_null());
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
+                let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
@@ -1248,14 +1353,16 @@ pub async fn completions(
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
-            TargetPool::Buddy => {
+            // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考（text completions 无 effort 字段 → 默认思考直接生效）
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
+                let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
@@ -1557,7 +1664,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-        let templates = super::wb_route::load_templates(&state);
+        let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
 
         for _ in 0..MAX_ROTATE {
             // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽。
@@ -2103,7 +2210,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-        let templates = super::wb_route::load_templates(&state);
+        let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
 
         for _ in 0..MAX_ROTATE {
             // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
@@ -3078,6 +3185,7 @@ mod tests {
             qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -3091,6 +3199,8 @@ mod tests {
             usage_dirty: std::sync::Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
             trae_enabled: std::sync::atomic::AtomicBool::new(true),
             qoder_pool: super::super::pool::ApiPool::new(),
@@ -3100,6 +3210,12 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),
+            buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            buddy_ai_pool: super::super::pool::ApiPool::new(),
+            buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         WlFixture { dir, state }
@@ -3220,6 +3336,26 @@ mod tests {
     async fn fallback_keeps_claude_when_wb_routes_it() {
         let f = wl_fixture("claude_wb"); // fixture 默认 wb_enabled=true，builtin 目录含 glm-5.3
         assert!(anthropic_model_fallback(&f.state, "claude-sonnet-5[1m]").is_none());
+    }
+
+    /// G6 审查修复：纯 buddy-ai 用户（wb 关、intl 开）——Intl 目录模型可路由，
+    /// 原样保留（原先 servable 只认 CN 目录被误判，Intl 专属 id 被迫回落默认模型）
+    #[tokio::test]
+    async fn servable_includes_buddy_ai_intl_catalog() {
+        let f = wl_fixture("claude_intl");
+        f.state
+            .wb_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        f.state
+            .buddy_ai_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Intl 专属 id（内置静态表兜底）：原名直查 Intl 目录命中
+        assert!(anthropic_model_servable(&f.state, "deepseek-v4.1-flash"));
+        // claude 系分类器名 Intl 目录无映射 → 仍回落默认模型（行为不变）
+        assert_eq!(
+            anthropic_model_fallback(&f.state, "claude-sonnet-5[1m]").as_deref(),
+            Some("deepseek-v4-flash")
+        );
     }
 
     /// 基名在目录（原名带 [1m] 不在）→ 剥标记用基名

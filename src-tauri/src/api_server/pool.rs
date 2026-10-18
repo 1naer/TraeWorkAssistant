@@ -54,6 +54,12 @@ impl PoolStrategy {
         Self::resolve_wb(strategy, qoder_strategy)
     }
 
+    /// Buddy 国际版（buddy-ai）池生效策略：buddy_ai_strategy 独立配置优先；
+    /// 空 = 跟随 Trae 池策略（与 Buddy/Qoder 同语义；启动与 pool_set 热应用共用）
+    pub fn resolve_buddy_ai(strategy: &str, buddy_ai_strategy: &str) -> Self {
+        Self::resolve_wb(strategy, buddy_ai_strategy)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",

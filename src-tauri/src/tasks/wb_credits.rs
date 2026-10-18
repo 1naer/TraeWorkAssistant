@@ -432,7 +432,7 @@ fn fetch_credits_once(
     if saw_auth && pkgs.is_empty() && balance.is_none() {
         // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
         //（原 refresh_token_once + 调用方 save，两步分离存在并发覆盖丢 token 面）
-        if let (Some(nc), _) = wb_common::refresh_token_once_locked(state, agent, aid, creds) {
+        if let (Some(nc), _, _) = wb_common::refresh_token_once_locked(state, agent, aid, creds) {
             let headers2 = wb_common::build_auth_headers(&nc, true);
             let (p2, b2, _saw2, _nd2) = fetch_round(agent, &headers2, (&summary_url, &paid_url, &free_url));
             pkgs = p2;
@@ -807,6 +807,7 @@ mod wb_credits_tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }

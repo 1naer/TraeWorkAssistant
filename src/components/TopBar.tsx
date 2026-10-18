@@ -226,8 +226,10 @@ function BuddyTopBar() {
     const label = which === 'wb' ? 'WorkBuddy' : 'CodeBuddy';
     setLaunching(which);
     try {
-      if (which === 'wb') await api.env.openWorkbuddyApp();
-      else await api.env.openCodebuddyApp();
+      // 代理运行中时注入 --proxy-server：客户端流量必走本地 MITM 代理（国内 Buddy 域抓包）
+      const port = proxy.running ? proxy.port : undefined;
+      if (which === 'wb') await api.env.openWorkbuddyApp(port);
+      else await api.env.openCodebuddyApp(port);
       pushToast('success', `已启动 ${label}`);
     } catch (err) {
       const msg = String(err);
@@ -429,6 +431,119 @@ function QoderTopBar() {
   );
 }
 
+/**
+ * BuddyAI 专区顶栏（buddy-ai 国际版，六页子导航对齐 Buddy 产品形态）：
+ * 左列 WorkBuddy AI / CodeBuddy AI 国际客户端安装徽标 + 证书/代理/API 网关状态，
+ * 右列 打开WorkBuddy AI / 打开CodeBuddy AI / 启动代理 / 启动API网关。
+ * P1 审查修复：国际客户端与国内为不同安装目录（Programs\WorkBuddyAI 与
+ * Programs\WorkBuddy），探测/打开走 workbuddy_ai / codebuddy_ai 独立档案，
+ * 不再复用国内命令误开国内客户端。
+ */
+function BuddyAiTopBar() {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const certInstalled = useAppStore((s) => s.certInstalled);
+  const proxy = useAppStore((s) => s.proxy);
+  const apiStatus = useAppStore((s) => s.apiStatus);
+  const startProxy = useAppStore((s) => s.startProxy);
+  const stopProxy = useAppStore((s) => s.stopProxy);
+  const [wbLocate, setWbLocate] = useState<AppLocate | null>(null);
+  const [cbLocate, setCbLocate] = useState<AppLocate | null>(null);
+  const [launching, setLaunching] = useState<'wb' | 'cb' | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.env
+      .locate('workbuddy_ai')
+      .then((r) => alive && setWbLocate(r))
+      .catch(() => {});
+    api.env
+      .locate('codebuddy_ai')
+      .then((r) => alive && setCbLocate(r))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const launchApp = async (which: 'wb' | 'cb') => {
+    if (launching) return;
+    const label = which === 'wb' ? 'WorkBuddy AI' : 'CodeBuddy AI';
+    setLaunching(which);
+    try {
+      // 代理运行中时注入 --proxy-server：客户端流量必走本地 MITM 代理，
+      // workbuddy.ai 官网请求（模型目录 /v3/config 等）可抓包
+      const port = proxy.running ? proxy.port : undefined;
+      if (which === 'wb') await api.env.openWorkbuddyAiApp(port);
+      else await api.env.openCodebuddyAiApp(port);
+      pushToast('success', `已启动 ${label}`);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('未检测到')) pushToast('warn', msg);
+      else pushToast('error', `打开 ${label} 失败：${msg}`);
+    } finally {
+      setLaunching(null);
+    }
+  };
+
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        {wbLocate?.exe ? (
+          <Badge tone="green" title={wbLocate.version ? `WorkBuddy AI 当前版本：v${wbLocate.version}` : 'WorkBuddy AI 国际版客户端'}>
+            <MonitorCheck size={13} /> WorkBuddy AI已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> WorkBuddy AI未检测到
+          </Badge>
+        )}
+        {cbLocate?.exe ? (
+          <Badge tone="green" title={cbLocate.version ? `CodeBuddy AI 当前版本：v${cbLocate.version}` : 'CodeBuddy AI 国际客户端'}>
+            <MonitorCheck size={13} /> CodeBuddy AI已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> CodeBuddy AI未检测到
+          </Badge>
+        )}
+        {certInstalled ? (
+          <Badge tone="green">
+            <ShieldCheck size={13} /> 证书已信任
+          </Badge>
+        ) : (
+          <Badge tone="amber">
+            <ShieldAlert size={13} /> 证书未信任
+          </Badge>
+        )}
+        <Badge tone={proxy.running ? 'blue' : 'slate'}>
+          <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
+        </Badge>
+        <Badge tone={apiStatus?.running ? 'green' : 'slate'}>
+          <Server size={13} /> {apiStatus?.running ? `API网关运行中 :${apiStatus.port}` : 'API网关未启动'}
+        </Badge>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={() => void launchApp('wb')} className="btn-outline" disabled={launching != null}>
+          {launching === 'wb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开WorkBuddy AI
+        </button>
+        <button onClick={() => void launchApp('cb')} className="btn-outline" disabled={launching != null}>
+          {launching === 'cb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开 CodeBuddy AI
+        </button>
+        {proxy.running ? (
+          <button onClick={stopProxy} className="btn-outline">
+            <PowerOff size={15} /> 停止代理
+          </button>
+        ) : (
+          <button onClick={startProxy} className="btn-outline">
+            <Power size={15} /> 启动代理
+          </button>
+        )}
+        <GatewayButton />
+      </div>
+    </>
+  );
+}
+
 export default function TopBar() {
   const activeApp = useAppStore((s) => s.activeApp);
   return (
@@ -439,6 +554,8 @@ export default function TopBar() {
         <BuddyTopBar />
       ) : activeApp === 'qoder' ? (
         <QoderTopBar />
+      ) : activeApp === 'buddy-ai' ? (
+        <BuddyAiTopBar />
       ) : (
         <TraeTopBar />
       )}

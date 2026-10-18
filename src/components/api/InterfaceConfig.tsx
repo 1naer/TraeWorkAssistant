@@ -5,11 +5,12 @@
  * issue #26 全局模型白名单：白名单非空 = 仅放行名单内模型（/v1/models 过滤 + 推理端点准入），
  * 空 = 不限；编辑弹框为三源全量多选，管理端目录（unifiedModels）不过滤白名单。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Copy, Globe, ListFilter, Pencil, Save, Search, X } from 'lucide-react';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
+import { getVisiblePoolText, isPoolVisible } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
 import { Badge, Modal } from '../ui';
 import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
@@ -17,27 +18,42 @@ import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
 /** 与后端 canonical_id 一致：trim + 小写（§3.3 #1） */
 const canonical = (id: string) => id.trim().toLowerCase();
 
-/** 来源池徽章配色（与 API Keys 管理的池徽标一致） */
+/** 来源池徽章配色（与 API Keys 管理的池徽标一致）；应用已隐藏的池置灰标注「已隐藏」（管理界面可见，数据保留生效） */
 function PoolBadges({ pools }: { pools: string[] }) {
+  const settings = useAppStore((s) => s.settings);
   return (
     <>
-      {pools.map((p) =>
-        p === 'trae' ? (
-          <Badge key={p} tone="blue">Trae</Badge>
-        ) : p === 'buddy' ? (
-          <Badge key={p} tone="violet">Buddy</Badge>
-        ) : p === 'qoder' ? (
-          <Badge key={p} tone="green">Qoder</Badge>
-        ) : (
-          <Badge key={p} tone="amber">自定义</Badge>
-        ),
-      )}
+      {pools.map((p) => {
+        const label =
+          p === 'trae' ? 'Trae' : p === 'buddy' ? 'Buddy' : p === 'buddy-ai' ? 'BuddyAi' : p === 'qoder' ? 'Qoder' : '自定义';
+        if (!isPoolVisible(settings, p)) {
+          return (
+            <Badge
+              key={p}
+              tone="slate"
+              className="opacity-60"
+              title="该池对应应用已在系统设置中隐藏（配置保留生效）"
+            >
+              {label}（已隐藏）
+            </Badge>
+          );
+        }
+        return (
+          <Badge
+            key={p}
+            tone={p === 'trae' ? 'blue' : p === 'buddy' ? 'violet' : p === 'buddy-ai' ? 'cyan' : p === 'qoder' ? 'green' : 'amber'}
+          >
+            {label}
+          </Badge>
+        );
+      })}
     </>
   );
 }
 
 export default function InterfaceConfig() {
   const toast = useAppStore((s) => s.pushToast);
+  const settings = useAppStore((s) => s.settings);
   const [gw, setGw] = useState<GatewaySettings | null>(null);
   const [port, setPort] = useState(7864);
   const [host, setHost] = useState('127.0.0.1');
@@ -196,11 +212,21 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
     }
   };
 
-  // 默认模型不在目录中时（如目录尚未聚合），前置占位避免显示错位
+  // 应用可见性联动：默认模型下拉只列出「任一来源池可见」的模型（隐藏池模型不出现在选项中，
+  // 但已保存的默认模型经占位兜底保留可选，仍按原配置生效）
+  const visibleModels = useMemo(
+    () => models.filter((m) => m.sources.some((s) => isPoolVisible(settings, s.pool))),
+    [models, settings],
+  );
+
+  // 默认模型不在可见目录中时（如目录尚未聚合 / 模型仅由已隐藏池服务），前置占位避免显示错位
   const modelOptions =
-    models.some((m) => m.id === model) || !model
-      ? models
-      : [{ id: model, display: model, rate: null, efforts: [], max_mode: false, context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
+    visibleModels.some((m) => m.id === model) || !model
+      ? visibleModels
+      : [{ id: model, display: model, rate: null, efforts: [], max_mode: false, context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...visibleModels];
+
+  // 说明文案随「应用显示」联动（隐藏池不再出现在目录说明中）
+  const visiblePoolText = useMemo(() => getVisiblePoolText(settings), [settings]);
 
   // 网关 host 环回判定（按已保存设置）：环回（127.0.0.1/localhost/::1）时局域网接入
   // 仅展示「仅本机可访问」提示；非环回才列出各网卡 IP（审查 G1：原写死 0.0.0.0 与实际不符）
@@ -287,8 +313,17 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
               ))}
             </select>
             <p className="mt-1 text-xs text-slate-400">
-              统一目录（Trae / Buddy / Qoder 聚合）；用于 CC Switch 注册与未指定 model 的请求
+              统一目录（{visiblePoolText || '无可见应用'}聚合）；用于 CC Switch 注册与未指定 model 的请求
             </p>
+            {modelsLoaded && gw?.default_model &&
+              // 复审修复：仅「目录中存在但仅由隐藏池服务」才提示；目录中不存在的
+              // 存量默认模型走上方占位选项兜底，不误报为隐藏池专属
+              models.some((m) => m.id === gw.default_model) &&
+              !visibleModels.some((m) => m.id === gw.default_model) ? (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                当前默认模型仅由已隐藏应用的资源池服务，仍按原配置生效；如需更换请在上方重新选择。
+              </p>
+            ) : null}
           </div>
         </div>
 

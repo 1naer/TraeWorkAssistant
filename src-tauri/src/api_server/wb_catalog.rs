@@ -77,6 +77,333 @@ impl WbModel {
     }
 }
 
+/// Buddy 国际版（buddy-ai）内置静态目录（§4.4；2026-10-15 起作为动态目录的兜底）。
+///
+/// 来源：R-5 探测 + workbuddy2api-hub 附录 A——Intl 17 个模型清单（`GET /v3/config`
+/// `agents[cli].models`，UA 带 CLI 段才下发全量）。倍率为**占位值 1.0**（官网实际
+/// 倍率由 [`buddy_ai_fetch_and_replace`] 直连 /v3/config 动态抓取覆盖，抓取失败时
+/// 本表兜底）；能力字段（上下文/模态/effort）上游未探测确认前保守留空，仅用于
+/// 目录展示与「国际档可用模型」语义，不参与 credits 成本估算（buddy-ai 池路由走
+/// 独立记账桶，阶段 3b 打卡轮再对齐）。
+pub fn builtin_buddy_ai() -> Vec<WbModel> {
+    // (id, 展示名)
+    const INTL_MODELS: [(&str, &str); 17] = [
+        ("hy4-preview-f", "Hunyuan 4 Preview (Fast)"),
+        ("hy3", "Hunyuan 3"),
+        ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+        ("gpt-6-astra", "GPT-6 Astra"),
+        ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+        ("gpt-5.5", "GPT-5.5"),
+        ("gpt-5.4", "GPT-5.4"),
+        ("grok-4.7", "Grok 4.7"),
+        ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+        ("glm-5.3-flash", "GLM 5.3 Flash"),
+        ("glm-5.3", "GLM 5.3"),
+        ("glm-5.2", "GLM 5.2"),
+        ("kimi-k3", "Kimi K3"),
+        ("kimi-k2.6", "Kimi K2.6"),
+        ("kimi-k2.8-preview", "Kimi K2.8 Preview"),
+    ];
+    INTL_MODELS
+        .iter()
+        .map(|(id, display)| WbModel {
+            id: id.to_string(),
+            display: display.to_string(),
+            context_length: 0,
+            max_tokens: 0,
+            supports_image: false,
+            supported_efforts: Vec::new(),
+            effort_override: None,
+            rate: 1.0, // 占位：官网实际值待人工核对回填（§4.4 静态配置原则）
+        })
+        .collect()
+}
+
+// ==================== Buddy 国际版目录动态抓取（2026-10-15）====================
+// （内置静态表 builtin_buddy_ai 保留为兜底：动态目录缺失时 buddy_ai_load 回落到此）
+
+/// buddy-ai 目录 kv 键（与 CN `wb_model_catalog` 分键——两池目录独立，
+/// §3.1 硬约束 2 配置分键；CN 动态替换不得覆盖 Intl 目录，反之亦然）
+pub const BUDDY_AI_CATALOG_KEY: &str = "buddy_ai_model_catalog";
+
+/// 加载 buddy-ai 目录：kv 动态抓取结果优先，缺失/为空回落内置静态表。
+/// dispatch /v1/chat 与 routes /v1/responses 的 Intl 源判定均走本函数
+/// （config_cache 5s TTL 热路径缓存，写路径 invalidate 即时生效，与 CN load 同款）。
+pub fn buddy_ai_load(data_dir: &Path) -> Vec<WbModel> {
+    super::config_cache::get_or_load(data_dir, BUDDY_AI_CATALOG_KEY, || {
+        crate::store::db(data_dir)
+            .kv_get_raw(BUDDY_AI_CATALOG_KEY)
+            .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
+            .filter(|f| !f.models.is_empty())
+            .map(|f| f.models)
+            .unwrap_or_else(builtin_buddy_ai)
+    })
+}
+
+/// `GET /v3/config` 响应 → Intl 模型列表（宽容解析 + 元数据富集）。
+/// **2026-10-16 实抓两段式结构**（CLI 首抓，原文落 `logs/intl_v3_config_raw.json`）：
+/// ① `data.agents[cli].models` 为**字符串 id 数组**（模型清单+权威顺序）；
+/// ② `data.models` 为**对象数组**（元数据），`credits` 字符串 `"x1.39"` 即
+/// 消耗倍率（与官方客户端 UI 完全一致，免费档 `"x0.00"`；另有路由槽位
+/// default-model/fast-model 等混入其中，按 [`is_noise_model_id`] 剔除）。
+/// 解析：id 清单按序遍历 → data.models 富集（倍率/档位/上下文/图片）→
+/// 元数据缺失的条目由 [`merge_static_fallback`] 按内置静态表回填。
+/// 同时保留对象形态兼容（若上游把清单直接升级为对象数组）。
+pub fn parse_v3_config(body: &Value) -> Vec<WbModel> {
+    // data 信封（实抓形态）优先，兼容无信封直出
+    let root = body.get("data").filter(|d| d.is_object()).unwrap_or(body);
+
+    // 元数据富集源：data.models 对象数组（复用 CN 侧同构解析器
+    // model_from_item——credits "x0.05 credits"/"x1.39" 字符串倍率、
+    // reasoning.supportedEfforts 嵌套档位、supportsImages±disabledMultimodal 全覆盖）
+    let mut meta: std::collections::HashMap<String, WbModel> = std::collections::HashMap::new();
+    if let Some(arr) = root.get("models").and_then(Value::as_array) {
+        for item in arr {
+            if looks_like_model(item) {
+                if let Some(m) = model_from_item(item) {
+                    meta.entry(m.id.clone()).or_insert(m);
+                }
+            }
+        }
+    }
+
+    let models_val = root
+        .get("agents")
+        .and_then(|a| {
+            if let Some(cli) = a.get("cli") {
+                return Some(cli.clone());
+            }
+            if let Some(arr) = a.as_array() {
+                let cli_el = arr.iter().find(|e| {
+                    e.get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase().contains("cli"))
+                        .unwrap_or(false)
+                        || e.get("id").and_then(|v| v.as_str()) == Some("cli")
+                });
+                return cli_el
+                    .cloned()
+                    .or_else(|| arr.iter().find(|e| e.get("models").is_some()).cloned());
+            }
+            None
+        })
+        .and_then(|cli| cli.get("models").cloned())
+        .or_else(|| root.get("models").cloned()) // 兜底：顶层 models 数组
+        .and_then(|m| m.as_array().cloned())
+        .unwrap_or_default();
+    let mut out: Vec<WbModel> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in models_val {
+        // 字符串形态（实抓）：元素即模型 id，元数据从 data.models 富集
+        let str_id = e.as_str().map(|s| s.trim().to_lowercase());
+        let m = if let Some(id) = str_id {
+            match meta.get(&id) {
+                Some(meta_m) => {
+                    let mut m = meta_m.clone();
+                    m.id = id; // 大小写与清单归一
+                    m
+                }
+                // 元数据缺失（data.models 未覆盖的清单条目）：rate 用 NaN 哨兵，
+                // 由 merge_static_fallback 决定内置表继承或 1.0 占位
+                None => WbModel {
+                    id,
+                    display: String::new(),
+                    context_length: 0,
+                    max_tokens: 0,
+                    supports_image: false,
+                    supported_efforts: Vec::new(),
+                    effort_override: None,
+                    rate: f64::NAN,
+                },
+            }
+        } else if let Some(m) = model_from_item(&e) {
+            // 对象形态（兼容上游升级）：优先复用元数据解析器——supportsImages/
+            // disabledMultimodal/credits 倍率全覆盖（原手写链 supports_image 硬编码
+            // false，图片能力声明全丢且 merge_static_fallback 不回填）
+            if m.id.is_empty()
+                || !seen.insert(m.id.clone())
+                || is_noise_model_id(&m.id)
+            {
+                continue;
+            }
+            out.push(m);
+            continue;
+        } else {
+            // 对象形态兜底：字段链宽容取值（解析器未命中 id 时）
+            let id = ["id", "model", "name"]
+                .iter()
+                .find_map(|k| e.get(*k).and_then(|v| v.as_str()))
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default();
+            let num = |keys: &[&str]| -> f64 {
+                keys.iter()
+                    .find_map(|k| e.get(*k).and_then(|v| v.as_f64()))
+                    .unwrap_or(0.0)
+            };
+            let sval = |keys: &[&str]| -> String {
+                keys.iter()
+                    .find_map(|k| e.get(*k).and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let efforts: Vec<String> = ["supportedEfforts", "efforts", "reasoningEfforts", "reasoning_efforts"]
+                .iter()
+                .find_map(|k| e.get(*k).and_then(|v| v.as_array()).cloned())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let rate = num(&["rate", "ratio", "costRatio", "cost_ratio", "multiplier", "price", "creditRate"]);
+            let rate = if rate != 0.0 {
+                rate
+            } else {
+                // credits 字符串倍率（"x1.39" / "x0.34 credits"）兜底
+                e.get("credits")
+                    .and_then(|c| match c {
+                        Value::Number(n) => n.as_f64(),
+                        Value::String(s) => s
+                            .trim()
+                            .trim_start_matches(['x', 'X'])
+                            .trim()
+                            .split_whitespace()
+                            .next()
+                            .and_then(|n| n.parse().ok()),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0)
+            };
+            WbModel {
+                id,
+                display: sval(&["name", "title", "display", "displayName"]),
+                context_length: num(&["contextLength", "context_length", "contextWindow", "maxContextTokens", "maxContextLength"]) as u64,
+                max_tokens: num(&["maxOutputTokens", "maxTokens", "max_tokens", "maxOutput"]) as u64,
+                supports_image: false,
+                supported_efforts: efforts,
+                effort_override: None,
+                rate,
+            }
+        };
+        if m.id.is_empty()
+            || !seen.insert(m.id.clone())
+            || is_noise_model_id(&m.id)
+        {
+            continue; // 无 id 剔除 / 重复 id 保留首个 / 路由别名黑名单
+        }
+        out.push(m);
+    }
+    merge_static_fallback(out)
+}
+
+/// 动态目录静态回填（2026-10-16 实抓配套）：仅对动态解析**缺失**的字段
+/// 按 id 从内置静态表继承（display/上下文/档位/effort 修正层/rate）；
+/// 动态实抓值（含免费档 credits "x0.00"）永远优先，不被内置快照覆盖。
+/// rate 的 NaN 哨兵 = 元数据缺失，内置命中继承内置倍率、未命中 1.0 占位
+/// （目录不参与 buddy-ai credits 成本估算，仅展示与可用性语义）。
+fn merge_static_fallback(models: Vec<WbModel>) -> Vec<WbModel> {
+    let builtin = builtin_buddy_ai();
+    models
+        .into_iter()
+        .map(|mut m| {
+            let b = builtin.iter().find(|b| b.id == m.id);
+            if m.display.is_empty() {
+                m.display = b.map(|b| b.display.clone()).unwrap_or_else(|| m.id.clone());
+            }
+            if m.context_length == 0 {
+                m.context_length = b.map(|b| b.context_length).unwrap_or(0);
+            }
+            if m.max_tokens == 0 {
+                m.max_tokens = b.map(|b| b.max_tokens).unwrap_or(0);
+            }
+            if m.supported_efforts.is_empty() {
+                m.supported_efforts = b.map(|b| b.supported_efforts.clone()).unwrap_or_default();
+            }
+            if m.effort_override.is_none() {
+                m.effort_override = b.and_then(|b| b.effort_override.clone());
+            }
+            if m.rate.is_nan() {
+                m.rate = b.map(|b| b.rate).unwrap_or(1.0);
+            }
+            m
+        })
+        .collect()
+}
+
+/// 从 `GET {BILLING_BASE_GLOBAL}/v3/config` 拉取 Intl 全量目录并落盘
+/// （kv [`BUDDY_AI_CATALOG_KEY`]，T5.1/F-37 同款「失败保持本地不动」口径）。
+/// 鉴权与 UA 对齐 R-5/R-3：Bearer（buddy-ai 池账号 token）+ X-User-Id +
+/// REGION_GLOBAL.ua（自带 CLI 段，51 全量的前提）。
+pub fn buddy_ai_fetch_and_replace(data_dir: &Path, uid: &str, token: &str) -> Result<usize, String> {
+    use crate::tasks::wb_common::{BILLING_BASE_GLOBAL, REGION_GLOBAL};
+    let url = format!("{BILLING_BASE_GLOBAL}/v3/config");
+    let req = super::wb_upstream::wb_agent()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("X-User-Id", uid)
+        .set("User-Agent", REGION_GLOBAL.ua)
+        .set("Accept", "application/json")
+        .set("Origin", BILLING_BASE_GLOBAL)
+        .set("Referer", &format!("{BILLING_BASE_GLOBAL}/"));
+    let body: Value = match req.call() {
+        Ok(r) => {
+            r.into_json().map_err(|e| format!("Intl 目录响应解析失败: {e}"))?
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            let excerpt: String = text.chars().take(200).collect();
+            return Err(format!("Intl 目录接口 HTTP {code}: body 摘要: {excerpt}"));
+        }
+        Err(e) => return Err(format!("Intl 目录请求失败: {e}")),
+    };
+    let models = parse_v3_config(&body); // 内部已含静态回填
+    if models.is_empty() {
+        let text = serde_json::to_string(&body).unwrap_or_else(|_| format!("{body:?}"));
+        let excerpt: String = text.chars().take(200).collect();
+        return Err(format!(
+            "Intl 目录解析产出 0 个模型（agents[cli].models 结构不符预期，body 摘要: {excerpt}），本地目录保持不变"
+        ));
+    }
+    // 质量守门（与 CN fetch_and_replace 同款）：全零目录 = 字段链漂移信号，拒绝落盘。
+    // 豁免（审查修复）：全部 id 命中内置静态表 → 结构可信（元数据链漂移但清单真实），
+    // 放行落盘——否则「全免费档 x0.00 + data.models 元数据缺失」的合法目录会被误杀，
+    // 每次同步都失败且本地目录永远停在旧快照
+    let builtin = builtin_buddy_ai();
+    let builtin_ids: std::collections::HashSet<&str> =
+        builtin.iter().map(|b| b.id.as_str()).collect();
+    if models
+        .iter()
+        .all(|m| m.rate == 0.0 && m.supported_efforts.is_empty() && m.context_length == 0)
+        && !models.iter().all(|m| builtin_ids.contains(m.id.as_str()))
+    {
+        return Err(format!(
+            "Intl 目录 {} 个条目能力字段全空（倍率/档位/上下文均未解析到，字段链疑似漂移），本地目录保持不变",
+            models.len()
+        ));
+    }
+    let count = models.len();
+    crate::store::db(data_dir)
+        .kv_set(
+            BUDDY_AI_CATALOG_KEY,
+            &WbCatalogFile {
+                models,
+                fetched_at: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                ),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("写 Intl 目录失败: {e}"))?;
+    super::config_cache::invalidate(data_dir, "buddy_ai_model_catalog");
+    Ok(count)
+}
+
 /// 内置静态兜底目录（15 模型，§5.6；倍率为 2026-09 WorkBuddy 客户端截图快照，
 /// 多界面并列时取最低：hy4-preview / hy3 限时免费 0.00x，deepseek-v4-flash 0.03x，
 /// glm-5.3 / glm-5.2 0.78x，deepseek-v4-pro 0.51x，kimi-k3 / kimi-k3-1 1.62x，
@@ -212,9 +539,22 @@ fn looks_like_model(item: &Value) -> bool {
 /// - "default"：通用路由别名（vendor v，兜底倍率 x2.20）；
 /// - "auto"：AutoMode 元模型（客户端由 productFeatures.AutoMode 开关单独渲染，非菜单项）；
 /// - "hunyuan-chat"：无定价内部条目（仅 supportsToolCall + 尺寸字段）。
+/// - "default-model"/"fast-model"/"balanced-model"/"primary-model"/"deep-model"：
+///   Intl /v3/config 路由槽位别名（2026-10-16 实抓，data.agents[cli].models 前 4 项 +
+///   data.models 里的混合倍率条目，非真实模型，客户端 UI 亦不展示）。
 /// "hunyuan-image-v3.0"（画图条目，零能力字段）已由 looks_like_model 剔除，无需入名单。
 fn is_noise_model_id(id: &str) -> bool {
-    matches!(id, "auto" | "default" | "hunyuan-chat")
+    matches!(
+        id,
+        "auto"
+            | "default"
+            | "hunyuan-chat"
+            | "default-model"
+            | "fast-model"
+            | "balanced-model"
+            | "primary-model"
+            | "deep-model"
+    )
 }
 
 /// 官方客户端过滤逻辑逆向（2026-09-19 抓包实证）：客户端模型菜单 =
@@ -355,8 +695,10 @@ fn model_from_item(item: &Value) -> Option<WbModel> {
         )
         .unwrap_or_else(|| {
             item.get("contextWindow")
-                .and_then(|c| c.get("defaultLength"))
-                .and_then(Value::as_u64)
+                .and_then(|c| {
+                    // contextWindow 双形态：对象 {defaultLength}（上游嵌套）或扁平数字
+                    c.as_u64().or_else(|| c.get("defaultLength").and_then(Value::as_u64))
+                })
                 .unwrap_or(0)
         }),
         max_tokens: dig_u64(item, &["maxTokens", "max_tokens", "maxOutputTokens"]).unwrap_or(0),
@@ -607,6 +949,144 @@ mod tests {
     }
 
     // ==================== T5.1/F-37 动态解析 ====================
+
+    // ==================== Intl /v3/config 解析（2026-10-15）====================
+
+    /// 合成锚点：对象形态 agents.cli.models + 多候选字段宽容取值。
+    /// 真实响应的字段名以实抓为准（R-5 锚点：UA 带 CLI 段下发 agents[cli].models）；
+    /// 本测试锁定解析契约：id 小写归一 / display 回落 / rate 多候选 / efforts 数组。
+    #[test]
+    fn parse_v3_config_object_shape_tolerant_fields() {
+        let body: Value = serde_json::json!({
+            "agents": { "cli": { "models": [
+                {
+                    "id": "DeepSeek-V4.1-Flash",
+                    "name": "DeepSeek V4.1 Flash",
+                    "contextLength": 131072,
+                    "maxOutputTokens": 8192,
+                    "rate": 0.03,
+                    "supportedEfforts": ["low", "medium"]
+                },
+                {
+                    "model": "gpt-6-astra",
+                    "title": "GPT-6 Astra",
+                    "contextWindow": 262144,
+                    "creditRate": 1.5,
+                    "efforts": ["high"]
+                },
+                { "name": "no-id-entry" },
+                { "id": "DeepSeek-V4.1-Flash", "rate": 9.9 }
+            ]}}
+        });
+        let m = parse_v3_config(&body);
+        // 4 条目 → 按 id 去重 1 条 = 3（no-id-entry 以 name 兜底为 id，保留）
+        assert_eq!(m.len(), 3);
+        let ds = m.iter().find(|x| x.id == "deepseek-v4.1-flash").unwrap();
+        assert_eq!(ds.display, "DeepSeek V4.1 Flash");
+        assert_eq!(ds.context_length, 131072);
+        assert_eq!(ds.max_tokens, 8192);
+        assert_eq!(ds.rate, 0.03);
+        assert_eq!(ds.supported_efforts, vec!["low".to_string(), "medium".to_string()]);
+        let gpt = m.iter().find(|x| x.id == "gpt-6-astra").unwrap();
+        // id 字段缺失回落 model 键；倍率回落 creditRate 候选
+        assert_eq!(gpt.rate, 1.5);
+        assert_eq!(gpt.context_length, 262144);
+        assert_eq!(gpt.supported_efforts, vec!["high".to_string()]);
+    }
+
+    /// 数组形态 agents[{id:"cli",models}] + 顶层 models 兜底均可达；
+    /// 结构不符（空对象）产 0 条（由 buddy_ai_fetch_and_replace 拒绝落盘）
+    #[test]
+    fn parse_v3_config_array_shape_and_degenerate() {
+        let arr: Value = serde_json::json!({
+            "agents": [ { "id": "cli", "models": [ { "id": "kimi-k3", "rate": 1.62 } ] } ]
+        });
+        let m = parse_v3_config(&arr);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].id, "kimi-k3");
+        assert_eq!(m[0].rate, 1.62);
+
+        let top: Value = serde_json::json!({ "models": [ { "id": "glm-5.3", "ratio": 0.78 } ] });
+        let m2 = parse_v3_config(&top);
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].rate, 0.78);
+
+        assert!(parse_v3_config(&serde_json::json!({})).is_empty());
+        assert!(parse_v3_config(&serde_json::json!({"agents": {"cli": {"models": []}}})).is_empty());
+    }
+
+    /// **实抓锚点（2026-10-16 CLI 首抓）**：data 信封 + agents 数组（description
+    /// "cli agent"，无 id 键）+ models 字符串数组清单 + data.models 元数据对象数组
+    /// （credits 字符串倍率，与客户端 UI 完全一致）。锁定：倍率实抓优先、
+    /// 免费档 x0.00 不被静态回填覆盖、路由槽位别名剔除、缺失字段静态回填。
+    #[test]
+    fn parse_v3_config_eats_real_2026_10_16_capture() {
+        let body: Value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "$schema": "product-schema.json",
+                "agents": [
+                    {
+                        "commands": ["init", "compact"],
+                        "description": "cli agent",
+                        "instructions": "cli-agent-prompt",
+                        "modelTags": ["craft"],
+                        "models": ["default-model", "deepseek-v4.1-flash", "glm-5.3", "kimi-k3"]
+                    }
+                ],
+                "models": [
+                    {"credits": "x0.34 credits", "id": "default-model", "name": "Default"},
+                    {"credits": "x0.00", "id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash",
+                     "maxInputTokens": 131072, "supportsImages": true},
+                    {"credits": "x0.79", "id": "glm-5.3", "name": "GLM-5.3",
+                     "reasoning": {"canDisableThinking": false, "defaultEffort": "medium",
+                                   "summary": "auto", "supportedEfforts": ["low", "medium", "high"]}},
+                    {"credits": "x1.62", "id": "kimi-k3", "name": "Kimi K3",
+                     "maxInputTokens": 200000, "maxOutputTokens": 48000}
+                ]
+            }
+        });
+        let m = parse_v3_config(&body);
+        // 路由槽位 default-model 按黑名单剔除 = 3 条
+        assert_eq!(m.len(), 3);
+        assert!(m.iter().all(|x| x.id != "default-model"), "路由别名不入目录");
+        // 倍率实抓：credits 字符串直读，与客户端 UI 一致
+        let glm = m.iter().find(|x| x.id == "glm-5.3").unwrap();
+        assert!((glm.rate - 0.79).abs() < 1e-9);
+        assert_eq!(glm.display, "GLM-5.3", "动态 name 优先于内置 display");
+        assert_eq!(glm.supported_efforts, vec!["low", "medium", "high"], "reasoning 嵌套档位");
+        // 免费档 x0.00：实抓 0.0 保留，不被内置倍率/1.0 占位覆盖
+        let ds = m.iter().find(|x| x.id == "deepseek-v4.1-flash").unwrap();
+        assert!((ds.rate - 0.0).abs() < 1e-9);
+        assert_eq!(ds.context_length, 131072, "maxInputTokens 上下文");
+        assert!(ds.supports_image);
+        // data.models 覆盖完整时内置表不回填（kimi-k3 命中元数据）
+        let k3 = m.iter().find(|x| x.id == "kimi-k3").unwrap();
+        assert!((k3.rate - 1.62).abs() < 1e-9);
+        assert_eq!(k3.max_tokens, 48000);
+    }
+
+    /// 元数据缺失兜底（data.models 未覆盖 / 旧形态纯 id 清单）：
+    /// 内置表命中 → 继承 display/rate/上下文；未命中 → 1.0 占位（NaN 哨兵路径）
+    #[test]
+    fn parse_v3_config_static_fallback_for_missing_metadata() {
+        let body: Value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "agents": [
+                    {"description": "cli agent",
+                     "models": ["deepseek-v4.1-flash", "glm-5.3", "brand-new-model"]}
+                ]
+            }
+        });
+        let m = parse_v3_config(&body);
+        assert_eq!(m.len(), 3);
+        let ds = m.iter().find(|x| x.id == "deepseek-v4.1-flash").unwrap();
+        assert_eq!(ds.display, "DeepSeek V4.1 Flash", "内置表继承 display");
+        let k3 = m.iter().find(|x| x.id == "brand-new-model").unwrap();
+        assert_eq!(k3.display, "brand-new-model");
+        assert!((k3.rate - 1.0).abs() < 1e-9, "未命中内置表 → 1.0 占位");
+    }
 
     #[test]
     fn parse_upstream_catalog_three_container_shapes() {

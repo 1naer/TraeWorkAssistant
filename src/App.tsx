@@ -27,6 +27,12 @@ import QoderAccounts from './pages/qoder/QoderAccounts';
 import QoderCheckin from './pages/qoder/QoderCheckin';
 import QoderApiService from './pages/qoder/QoderApiService';
 import QoderSettings from './pages/qoder/QoderSettings';
+import BuddyAiOverview from './pages/buddyai/BuddyAiOverview';
+import BuddyAiAccounts from './pages/buddyai/BuddyAiAccounts';
+import BuddyAiCheckin from './pages/buddyai/BuddyAiCheckin';
+import BuddyAiCredits from './pages/buddyai/BuddyAiCredits';
+import BuddyAiApiService from './pages/buddyai/BuddyAiApiService';
+import BuddyAiSettings from './pages/buddyai/BuddyAiSettings';
 import ApiManagerModal from './components/api/ApiManagerModal';
 import TraeWorkMigrationGuide from './components/TraeWorkMigrationGuide';
 
@@ -78,6 +84,18 @@ function renderView(view: string) {
       return <QoderApiService key="qoder-api-service" />;
     case 'qoder-settings':
       return <QoderSettings />;
+    case 'buddyai-overview':
+      return <BuddyAiOverview />;
+    case 'buddyai-accounts':
+      return <BuddyAiAccounts />;
+    case 'buddyai-checkin':
+      return <BuddyAiCheckin />;
+    case 'buddyai-credits':
+      return <BuddyAiCredits />;
+    case 'buddyai-api-service':
+      return <BuddyAiApiService />;
+    case 'buddyai-settings':
+      return <BuddyAiSettings />;
     default:
       return <Dashboard />;
   }

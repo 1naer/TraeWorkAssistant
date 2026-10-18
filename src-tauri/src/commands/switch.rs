@@ -198,6 +198,9 @@ pub fn switch_account(
     // Live Cookies 里验证到登录会话——uid 检测可能被快照 localStorage 残留骗过，
     // Cookie 存在性无法伪造）；icube 布局（Trae）走本机使用证据推导（见下）
     let is_buddy = matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy"));
+    // buddy-ai 国际版（2026-10-16）：WorkBuddyAI 独立客户端档案；CodeBuddyAI 在
+    // TargetApp::parse 归一为 CodeBuddy 档案（同客户端同目录），池归属由本层区分
+    let is_buddy_ai = matches!(target_app.as_deref(), Some("WorkBuddyAI") | Some("CodeBuddyAI"));
     let buddy_app = match target_app.as_deref() {
         Some("CodeBuddy") => BuddyApp::CodeBuddy,
         _ => BuddyApp::WorkBuddy,
@@ -211,6 +214,27 @@ pub fn switch_account(
         // 证据带偏。推导失败（None）→ 维持空串 fail-open 不阻断切换
         let kind = target_app.as_deref().unwrap_or("Trae");
         crate::commands::trae_apps::live_cloud_uid(kind, &state.data_dir).unwrap_or_default()
+    } else if is_buddy_ai {
+        // buddy-ai 国际版切换守卫：登录信号按端——WorkBuddy AI = 国际 auth 文件
+        // （workbuddy-desktop-ai.info）uid → buddy-ai 池反查；CodeBuddy AI = 国际
+        // 客户端 live storage.json genie.uid（%APPDATA%\CodeBuddy）→ buddy-ai 池反查。
+        // 桥标记（profiles_workbuddy_ai / profiles_codebuddy_ai current_account.txt）
+        // 兜底。取不到 → 空串 fail-open
+        let by_live = match target_app.as_deref() {
+            Some("CodeBuddyAI") => super::workbuddy::codebuddy_ai_live_uid(),
+            _ => crate::switcher::authfile::auth_file_uid(
+                &crate::switcher::authfile::wb_ai_auth_file(),
+            ),
+        }
+        .and_then(|uid| super::workbuddy::buddy_ai_pool_account_id_by_uid(&state, &uid));
+        by_live
+            .or_else(|| {
+                super::workbuddy::current_account_marker(
+                    &state,
+                    target_app.as_deref().unwrap_or("WorkBuddyAI"),
+                )
+            })
+            .unwrap_or_default()
     } else if is_buddy {
         // F1-3/F2-5 authfile 布局切换守卫：按端取「当前登录账号 id」——
         // WorkBuddy 由共享 auth 文件驱动 → auth 文件 uid 在池反查优先，桥标记兜底；
@@ -382,6 +406,36 @@ pub fn save_current_login(
     // 登录信号：WorkBuddy = 共享 auth 文件 uid → 池反查；CodeBuddy = live storage.json
     // genie.userId → 池反查。检测不可用（未登录/解析失败/池中无此 uid）→ fail-open
     // 放行，交由备份流程既有兜底（auth 缺失整体跳过等）。
+    // buddy-ai 国际版保存守卫（F2-5 同型）：WorkBuddy AI = 国际 auth 文件 uid →
+    // buddy-ai 池反查；CodeBuddy AI = live genie.uid → buddy-ai 池反查。
+    // 检测不可用 → fail-open 放行（备份流程既有兜底）
+    if matches!(target_app.as_deref(), Some("WorkBuddyAI") | Some("CodeBuddyAI")) {
+        let live_id = match target_app.as_deref() {
+            Some("CodeBuddyAI") => crate::commands::workbuddy::codebuddy_ai_live_uid()
+                .and_then(|uid| {
+                    crate::commands::workbuddy::buddy_ai_pool_account_id_by_uid(&state, &uid)
+                }),
+            _ => crate::switcher::authfile::auth_file_uid(
+                &crate::switcher::authfile::wb_ai_auth_file(),
+            )
+            .and_then(|uid| {
+                crate::commands::workbuddy::buddy_ai_pool_account_id_by_uid(&state, &uid)
+            }),
+        };
+        if let Some(live) = live_id {
+            if !live.is_empty() && live != user_id.trim() {
+                let profiles_dir = crate::switcher::profile::profile_for(
+                    TargetApp::parse(target_app.as_deref().unwrap_or("WorkBuddyAI"))?,
+                    &state.data_dir,
+                )
+                .profiles_dir;
+                let msg = crate::switcher::save_reject_message(&profiles_dir, user_id.trim(), &live);
+                fs_utils::app_log(&state.data_dir, &format!("保存登录态被守卫拦截: {msg}"));
+                return Err(msg);
+            }
+        }
+    }
+
     if matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy")) {
         let live_id = match target_app.as_deref() {
             Some("CodeBuddy") => crate::commands::workbuddy::codebuddy_live_uid()

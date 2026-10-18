@@ -74,7 +74,7 @@ fn uids_by_gid_all(state: &AppState) -> std::collections::HashMap<String, Vec<St
     // Buddy / Qoder：行文档 group_id 字段（读失败留痕后按空池处理——列表只读展示
     // 与原 pool_members 的 fail-open 口径一致，B5 的 fail-closed 仅约束删除路径；
     // 但按 log_dedup_dropped 先例，静默跳过须 app_log 落痕）
-    for table in ["wb_accounts", "qoder_accounts"] {
+    for table in ["wb_accounts", "qoder_accounts", "buddy_ai_accounts"] {
         match store.rows_all(table) {
             Ok(rows) => {
                 for (_, data) in rows {
@@ -206,6 +206,7 @@ pub(crate) fn delete_inner(
     // 预检通过后 ①b/①c 改 raw 读（rows_all 直读，失败 `?` 上抛不再静默空集）
     store.rows_all("wb_accounts")?;
     store.rows_all("qoder_accounts")?;
+    store.rows_all("buddy_ai_accounts")?;
     // ①a Trae 成员回落：直接删 group_members 行（缺失 = 未分组，幂等）
     store.with_conn(|c| {
         c.execute("DELETE FROM group_members WHERE group_id = ?1", [id])?;
@@ -267,6 +268,24 @@ pub(crate) fn delete_inner(
             crate::store::docs::qoder_pool_save(&store, &pool)?;
         }
     }
+    // ①d Buddy 国际版成员回落（持 buddy_ai_pool_lock；锁序 wb→buddy 与迁移路径一致）：
+    // 原遗漏会让 buddy_ai_accounts.group_id 悬空指向已删分组
+    {
+        let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = crate::store::docs::buddy_ai_pool_load(&store);
+        let mut changed = false;
+        if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
+            for a in arr.iter_mut() {
+                if a.get("group_id").and_then(|v| v.as_str()) == Some(id) {
+                    a["group_id"] = serde_json::json!("");
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            crate::store::docs::buddy_ai_pool_save(&store, &pool)?;
+        }
+    }
     // ③ 清引用：api_pool 三池分组筛选 + api_keys.allowed_groups
     // api_pool RMW 持 POOL_CFG_LOCK（B1，配置叶子锁；此时池/org 锁均已释放）
     let refs_changed = {
@@ -279,6 +298,7 @@ pub(crate) fn delete_inner(
             &mut pool_file.group_ids,
             &mut pool_file.wb_group_ids,
             &mut pool_file.qoder_group_ids,
+            &mut pool_file.buddy_ai_group_ids,
         ] {
             if ids.iter().any(|g| g == id) {
                 ids.retain(|g| g != id);
@@ -338,6 +358,7 @@ mod tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };

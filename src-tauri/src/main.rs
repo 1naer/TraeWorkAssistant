@@ -155,6 +155,8 @@ fn main() {
             commands::env::open_trae_cn_app,
             commands::env::open_workbuddy_app,
             commands::env::open_codebuddy_app,
+            commands::env::open_workbuddy_ai_app,
+            commands::env::open_codebuddy_ai_app,
             commands::env::codebuddy_env_check,
             commands::cert::cert_status,
             commands::cert::cert_install,
@@ -230,6 +232,7 @@ fn main() {
             commands::api_server::pool_status,
             commands::api_server::wb_pool_status,
             commands::api_server::qoder_pool_status,
+            commands::api_server::buddy_ai_pool_status,
             commands::api_server::qoder_catalog_sync,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
@@ -240,12 +243,15 @@ fn main() {
             commands::api_server::api_models_sync,
             commands::api_server::api_usage_stats,
             commands::api_server::api_wb_usage_stats,
+            commands::api_server::api_buddy_ai_usage_stats,
             commands::api_server::api_custom_usage_stats,
             commands::api_server::api_qoder_usage_stats,
             commands::api_server::api_keys_list,
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,
             commands::api_server::api_wb_catalog_list,
+            // Buddy 国际版（buddy-ai）模型目录（阶段 3：静态配置）
+            commands::api_server::api_buddy_ai_catalog_list,
             commands::wb_config::wb_route_config_get,
             commands::wb_config::wb_route_config_set,
             commands::wb_config::wb_template_map_get,
@@ -352,6 +358,28 @@ fn main() {
             commands::workbuddy::workbuddy_accounts_export,
             commands::workbuddy::workbuddy_accounts_import,
             commands::workbuddy::workbuddy_oauth_login,
+            // Buddy 国际版（buddy-ai）独立池（阶段 1）
+            commands::workbuddy::buddy_ai_oauth_login,
+            commands::workbuddy::buddy_ai_account_import_creds,
+            commands::workbuddy::buddy_ai_accounts_list,
+            commands::workbuddy::buddy_ai_account_remove,
+            commands::workbuddy::buddy_ai_refresh_token,
+            // Buddy 国际版每日活跃打卡（阶段 3b）
+            commands::workbuddy::buddy_ai_checkin_start,
+            commands::workbuddy::buddy_ai_checkin_results,
+            commands::workbuddy::buddy_ai_account_save,
+            commands::workbuddy::buddy_ai_account_toggle,
+            commands::workbuddy::buddy_ai_credits_history,
+            commands::workbuddy::buddy_ai_accounts_export,
+            commands::workbuddy::buddy_ai_accounts_import,
+            commands::workbuddy::buddy_ai_local_scan,
+            commands::workbuddy::buddy_ai_env_reset,
+            commands::workbuddy::buddy_ai_request_usage,
+            commands::workbuddy::buddy_ai_usage_official_all,
+            commands::workbuddy::buddy_ai_sessions_query,
+            commands::workbuddy::buddy_ai_credits_fetch,
+            commands::workbuddy::buddy_ai_open_data_dir,
+            commands::workbuddy::buddy_ai_catalog_sync,
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,
@@ -360,6 +388,7 @@ fn main() {
             commands::workbuddy::workbuddy_sessions_query,
             commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
+            commands::workbuddy_stats::buddy_ai_token_stats,
             // Qoder（F-80 M1：签到 MVP 闭环 + 最小积分通道）
             commands::qoder::qoder_env_check,
             commands::qoder::qoder_open_ide,
@@ -670,6 +699,23 @@ fn main() {
                 let app2 = app.handle().clone();
                 let st = app.state::<AppState>();
                 commands::workbuddy::startup_auto_checkin(&app2, &st);
+            }
+
+            // buddy-ai 存量迁移（§4.7）：wb 池混居的 global_region=true 账号一次性
+            // 迁入 buddy-ai 独立池（kv 标记幂等；失败不置位下次重试，不阻断启动）
+            {
+                let st = app.state::<AppState>();
+                if let Err(e) = commands::workbuddy::migrate_wb_global_accounts(&st) {
+                    fs_utils::app_log(&st.data_dir, &format!("buddy-ai: 存量迁移失败（下次启动重试）: {e}"));
+                }
+            }
+
+            // buddy-ai 启动打卡补跑（阶段 3b，对齐 startup_auto_checkin 形态；
+            // 独立开关 buddy_ai_checkin_enabled 默认关，抢不到轮次锁幂等跳过）
+            {
+                let app2 = app.handle().clone();
+                let st = app.state::<AppState>();
+                commands::workbuddy::startup_auto_checkin_buddy_ai(&app2, &st);
             }
 
             // Qoder 启动自动补签（F-80，F-55 同款模式）：独立开关，与 WB 补签互不影响

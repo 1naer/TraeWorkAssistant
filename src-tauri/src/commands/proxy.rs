@@ -446,6 +446,13 @@ pub(crate) fn cleanup_stale_local_proxy(state: &AppState) {
     let Some(port) = last_port else { return };
     let ours = format!("127.0.0.1:{port}");
     if server.contains(&ours) {
+        // 审查修复：本地代理仍在监听时系统代理是有效在用状态，不得清除——
+        // 否则代理运行中直开应用会掐断正在工作的抓包链路。150ms TCP 探测判活。
+        if let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok() {
+                return;
+            }
+        }
         match clear_win_proxy() {
             Ok(()) => fs_utils::app_log(
                 &state.data_dir,

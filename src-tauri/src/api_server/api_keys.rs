@@ -55,15 +55,15 @@ pub enum KeyCheck {
 pub struct ResolvedKey {
     pub id: String,
     /// 限定上游账号 uid 白名单；空 = 不限。
-    /// bind=""（跟随全局调度）时条目可带池前缀 `trae:`/`buddy:`（issue #30 混合
-    /// 白名单）；绑定池时为对应池裸 uid；旧数据全裸 uid = 仅约束 buddy 池
+    /// bind=""（跟随全局调度）时条目可带池前缀 `trae:`/`buddy:`/`buddy-ai:`/`qoder:`
+    /// （issue #30 混合白名单）；绑定池时为对应池裸 uid；旧数据全裸 uid = 仅约束 buddy 池
     pub allowed_accounts: Vec<String>,
     /// expire_first | dedicated
     pub schedule_mode: String,
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；混合白名单时
     /// 同样可带池前缀（专一锁定其归属池，排除另一池）
     pub dedicated_account: String,
-    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
+    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "buddy-ai" | "qoder"
     pub bind_pool: String,
     /// 共享分组 id 白名单（未展开；鉴权时经 org_index 展开并入 allowed_accounts）
     pub allowed_groups: Vec<String>,
@@ -123,7 +123,8 @@ impl ResolvedKey {
         self.allowed_accounts.extend(extra);
     }
 
-    /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")；空或非法 = None）
+    /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")/Some("buddy-ai")/
+    /// Some("qoder")；空或非法 = None）
     pub fn bind_pool(&self) -> Option<&'static str> {
         parse_bind_pool(&self.bind_pool)
     }
@@ -223,11 +224,12 @@ impl ResolvedKey {
     }
 }
 
-/// 解析 bind_pool 字段为静态池标识（空/非法→None）
+/// 解析 bind_pool 字段为静态池标识（空/非法→None）；buddy-ai（国际版独立池）随阶段 2 放行
 pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
+        "buddy-ai" => Some("buddy-ai"),
         "qoder" => Some("qoder"),
         _ => None,
     }

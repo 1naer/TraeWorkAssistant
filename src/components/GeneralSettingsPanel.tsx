@@ -169,7 +169,8 @@ export default function GeneralSettingsPanel() {
         <div className="grid gap-x-8 gap-y-2 sm:grid-cols-2">
           <div className="space-y-2">
             <label className="label">固定应用（始终显示）</label>
-            {APP_TABS.map((tab) => (
+            {/* buddy-ai（国际版）默认隐藏、不参与固定应用（Sidebar 同口径；后端 state.rs 脏值回落 trae） */}
+            {APP_TABS.filter((t) => t.key !== 'buddy-ai').map((tab) => (
               <label key={tab.key} className="flex items-center gap-2">
                 <input
                   type="radio"
@@ -185,8 +186,10 @@ export default function GeneralSettingsPanel() {
           <div className="space-y-2">
             <label className="label">侧边栏显示</label>
             {APP_TABS.map((tab) => {
+              const isBuddyAi = tab.key === 'buddy-ai';
               const pinned = form.pinned_app === tab.key;
-              const visible = pinned || !form.hidden_apps.includes(tab.key);
+              // buddy-ai 可见性走独立 opt-in 开关（默认 false = 不展示），不进 hidden_apps
+              const visible = isBuddyAi ? form.buddy_ai_visible === true : pinned || !form.hidden_apps.includes(tab.key);
               const customizedName = form.app_icons[tab.key];
               const Current = resolveAppIcon(customizedName) ?? tab.icon;
               return (
@@ -205,10 +208,13 @@ export default function GeneralSettingsPanel() {
                       type="checkbox"
                       checked={visible}
                       disabled={pinned}
-                      onChange={() => toggleAppVisible(tab.key)}
+                      onChange={() =>
+                        isBuddyAi ? update('buddy_ai_visible', !(form.buddy_ai_visible === true)) : toggleAppVisible(tab.key)
+                      }
                     />
                     {tab.label}
                     {pinned ? <span className="text-xs text-slate-400">（固定应用，不可隐藏）</span> : null}
+                    {isBuddyAi ? <span className="text-xs text-slate-400">（国际版，默认不展示）</span> : null}
                   </label>
                 </div>
               );

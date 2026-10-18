@@ -12,24 +12,34 @@ import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
+import { isPoolVisible } from '../../lib/appVisibility';
 import type { ApiKeyEntry, GroupView, PoolStatus, TagView, UsageDayView } from '../../types';
 
 /** issue #30 混合白名单：候选账号平台标记 */
-type CandidatePool = 'trae' | 'buddy' | 'qoder';
+type CandidatePool = 'trae' | 'buddy' | 'buddy-ai' | 'qoder';
 /** 调度配置候选：上游账号 + 所属池标记 */
 interface PoolCandidate extends PoolStatus {
   pool: CandidatePool;
 }
 
 /** 池标记 → 徽标/文案映射（候选列表与专一/限定上游文案共用） */
-const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 'violet' }> = {
+const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 'violet' | 'cyan' }> = {
   trae: { label: 'Trae', tone: 'blue' },
   buddy: { label: 'Buddy', tone: 'green' },
+  'buddy-ai': { label: 'BuddyAI', tone: 'cyan' },
   qoder: { label: 'Qoder', tone: 'violet' },
 };
 /** 绑定池 → 展示文案（空串由调用方处理为跨池文案） */
 const bindPoolLabel = (p: string) =>
-  p === 'trae' ? 'Trae 池' : p === 'buddy' ? 'Buddy 池' : p === 'qoder' ? 'Qoder 池' : 'Trae/Buddy/Qoder 池';
+  p === 'trae'
+    ? 'Trae 池'
+    : p === 'buddy'
+      ? 'Buddy 池'
+      : p === 'buddy-ai'
+        ? 'BuddyAI 国际池'
+        : p === 'qoder'
+          ? 'Qoder 池'
+          : 'Trae/Buddy/Qoder/BuddyAI 国际池';
 
 export default function ApiKeysManager({
   onSubModalChange,
@@ -38,6 +48,8 @@ export default function ApiKeysManager({
   onSubModalChange?: (open: boolean) => void;
 }) {
   const toast = useAppStore((s) => s.pushToast);
+  // 系统设置「应用显示」联动（隐藏不停功能：存量 Key 的隐藏池绑定/白名单仍可管理）
+  const settings = useAppStore((s) => s.settings);
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([]);
   const [authDisabled, setAuthDisabled] = useState(false);
   const [keysSaving, setKeysSaving] = useState(false);
@@ -58,7 +70,7 @@ export default function ApiKeysManager({
   const [orgPreview, setOrgPreview] = useState<Record<string, number> | null>(null);
   // key 列表行的覆盖账号数批量预览（仅对配置了组/标签的 key 计算）
   const [listOrgPreview, setListOrgPreview] = useState<Record<string, Record<string, number>>>({});
-  // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
+  // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "buddy-ai" | "qoder"
   const [editBindPool, setEditBindPool] = useState('');
   // issue #30：打开弹框时的原始白名单/专一值（未归一）。保存时若用户未改动勾选
   // （归一化后等价），写回原值——旧裸 uid 数据保持旧语义，避免「仅打开保存一次」
@@ -69,17 +81,20 @@ export default function ApiKeysManager({
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
   // F8：关闭鉴权二次确认（全局安全开关，误触即放行所有无 Key 请求；重新开启不确认）
   const [authConfirmOpen, setAuthConfirmOpen] = useState(false);
-  // 子 Key 配置候选（三池上游账号；打开弹框时刷新）：
+  // 子 Key 配置候选（四池上游账号；打开弹框时刷新）：
   // poolStatus = Trae 池（invoke pool_status），buddyPoolStatus = Buddy/WB 池，
-  // qoderPoolStatus = Qoder 池（fail-open 全量含凭证账号）
+  // buddyAiPoolStatus = BuddyAI 国际池，qoderPoolStatus = Qoder 池（fail-open 全量含凭证账号）
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [buddyPoolStatus, setBuddyPoolStatus] = useState<PoolStatus[]>([]);
+  const [buddyAiPoolStatus, setBuddyAiPoolStatus] = useState<PoolStatus[]>([]);
   const [qoderPoolStatus, setQoderPoolStatus] = useState<PoolStatus[]>([]);
   // 今日按 Key 的 token 用量（「今日已用」列展示；四桶分账记账，跨桶合并后按 Key 聚合）
   const [usage, setUsage] = useState<UsageDayView[][]>([]);
   // Qoder 上游开关（对齐方案 §5.3 警告徽标数据源，已交付归档）：
   // Key 绑定 Qoder 池但未启用时显式告警；null = 未知（不告警）
   const [qoderEnabled, setQoderEnabled] = useState<boolean | null>(null);
+  // BuddyAI 国际上游开关（同上口径）：Key 绑定 buddy-ai 池但未启用时显式告警
+  const [buddyAiEnabled, setBuddyAiEnabled] = useState<boolean | null>(null);
 
   // ---- 多 API Key 管理（原 ApiService.tsx 逻辑原样搬移） ----
   const loadKeys = useCallback(async () => {
@@ -150,6 +165,9 @@ export default function ApiKeysManager({
       toast('error', 'Key 值与现有条目重复');
       return;
     }
+    // 新增 Key 的资源池选择：选中池所属应用被隐藏时回落全局（新增不选隐藏池）
+    const effNewBindPool =
+      newBindPool === '' || isPoolVisible(settings, newBindPool) ? newBindPool : '';
     const entry: ApiKeyEntry = {
       id: crypto.randomUUID(),
       name,
@@ -162,7 +180,7 @@ export default function ApiKeysManager({
       allowed_accounts: [],
       schedule_mode: 'expire_first',
       dedicated_account: '',
-      bind_pool: newBindPool,
+      bind_pool: effNewBindPool,
       allowed_groups: [],
       allowed_tags: [],
       daily_stats: [],
@@ -198,7 +216,8 @@ export default function ApiKeysManager({
     setEditKey(k);
     // issue #30：bind="" 旧数据裸 uid 显示时归一为 buddy: 前缀（与候选编码对齐，
     // UI 勾选状态与实际限定一致）；原值存入 editOrigRef，保存时未改动则写回原值
-    const norm = (v: string) => (!k.bind_pool && v && !/^(trae|buddy|qoder):/i.test(v) ? `buddy:${v}` : v);
+    const norm = (v: string) =>
+      !k.bind_pool && v && !/^(trae|buddy|buddy-ai|qoder):/i.test(v) ? `buddy:${v}` : v;
     editOrigRef.current = { allowed: k.allowed_accounts, dedicated: k.dedicated_account || '' };
     setEditAllowed(new Set(k.allowed_accounts.map(norm)));
     setEditMode(k.schedule_mode || 'expire_first');
@@ -217,7 +236,7 @@ export default function ApiKeysManager({
       .list()
       .then(setSharedTags)
       .catch(() => toast('error', '标签候选加载失败：请关闭弹框后重新打开重试'));
-    // 服务可能刚启动，三池候选列表即时刷新
+    // 服务可能刚启动，四池候选列表即时刷新
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
@@ -227,6 +246,12 @@ export default function ApiKeysManager({
     api.apiServer
       .wbPoolStatus()
       .then(setBuddyPoolStatus)
+      .catch(() => {
+        /* 保留上次候选 */
+      });
+    api.apiServer
+      .buddyAiPoolStatus()
+      .then(setBuddyAiPoolStatus)
       .catch(() => {
         /* 保留上次候选 */
       });
@@ -242,7 +267,7 @@ export default function ApiKeysManager({
     if (!editKey) return;
     // issue #30：归一化比较——用户未改动白名单/专一（仅打开弹框触发的前缀归一）
     // 时写回原值，旧裸 uid 保持旧语义（trae 不限）；改动过才落前缀编码（升级语义）
-    const stripTag = (v: string) => v.replace(/^(trae|buddy|qoder):/i, '');
+    const stripTag = (v: string) => v.replace(/^(trae|buddy|buddy-ai|qoder):/i, '');
     const normSig = (arr: string[]) =>
       arr
         .map(stripTag)
@@ -358,7 +383,7 @@ export default function ApiKeysManager({
   useEffect(() => {
     void loadKeys();
     generateKeyValue();
-    // 上游账号候选（服务未运行时为空列表）：Trae 池 + Buddy 池 + Qoder 池
+    // 上游账号候选（服务未运行时为空列表）：Trae 池 + Buddy 池 + BuddyAI 国际池 + Qoder 池
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
@@ -372,23 +397,34 @@ export default function ApiKeysManager({
         /* 保留空列表 */
       });
     api.apiServer
+      .buddyAiPoolStatus()
+      .then(setBuddyAiPoolStatus)
+      .catch(() => {
+        /* 保留空列表 */
+      });
+    api.apiServer
       .qoderPoolStatus()
       .then(setQoderPoolStatus)
       .catch(() => {
         /* 保留空列表 */
       });
-    // 今日 token 用量（读落盘数据，仅取当日条目）：四桶并拉——key_tokens 按池分账
-    // （Trae/Buddy/Qoder/Custom 各自的 DayStats），只读 Trae 桶会漏记非 Trae 流量的 Key 用量
+    // 今日 token 用量（读落盘数据，仅取当日条目）：五桶并拉——key_tokens 按池分账
+    // （Trae/Buddy/BuddyAI 国际/Qoder/Custom 各自的 DayStats），只读 Trae 桶会漏记
+    // 非 Trae 流量的 Key 用量
     Promise.all([
       api.apiServer.usageStats(14).catch(() => [] as UsageDayView[]),
       api.apiServer.wbUsageStats(14).catch(() => [] as UsageDayView[]),
+      api.apiServer.buddyAiUsageStats(14).catch(() => [] as UsageDayView[]),
       api.apiServer.customUsageStats(14).catch(() => [] as UsageDayView[]),
       api.apiServer.qoderUsageStats(14).catch(() => [] as UsageDayView[]),
-    ]).then(([trae, wb, custom, qoder]) => setUsage([trae, wb, custom, qoder]));
-    // Qoder 上游开关（Key 绑定 Qoder 池的警告徽标数据源）
+    ]).then(([trae, wb, buddyAi, custom, qoder]) => setUsage([trae, wb, buddyAi, custom, qoder]));
+    // Qoder / BuddyAI 国际上游开关（Key 绑定对应池的警告徽标数据源）
     api.apiServer
       .poolList()
-      .then((p) => setQoderEnabled(p.qoder_enabled ?? false))
+      .then((p) => {
+        setQoderEnabled(p.qoder_enabled ?? false);
+        setBuddyAiEnabled(p.buddy_ai_enabled ?? false);
+      })
       .catch(() => {
         /* 未知状态不告警 */
       });
@@ -400,7 +436,7 @@ export default function ApiKeysManager({
   }, [editKey, deleteForKey, authConfirmOpen, onSubModalChange]);
 
   // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
-  // 四桶合并：同一 Key 的请求可能落 Trae/Buddy/Qoder/Custom 任一桶，按 Key 名跨桶求和
+  // 五桶合并：同一 Key 的请求可能落 Trae/Buddy/BuddyAI/Qoder/Custom 任一桶，按 Key 名跨桶求和
   const todayKey = new Date().toLocaleDateString('sv-SE');
   const todayKeyTokens = useMemo(() => {
     const m = new Map<string, { prompt: number; completion: number }>();
@@ -418,16 +454,23 @@ export default function ApiKeysManager({
   }, [usage, todayKey]);
 
   // issue #25 资源池绑定 + issue #30 混合白名单：限定上游/专一候选按绑定池切换数据源。
-  // 跟随全局调度（bind=""）合并展示 Trae + Buddy + Qoder 三池账号并标记平台，可跨池勾选；
-  // 绑定池时仅展示对应池（trae → Trae 池；buddy → Buddy 池；qoder → Qoder 池）。
+  // 跟随全局调度（bind=""）合并展示 Trae + Buddy + BuddyAI 国际 + Qoder 四池账号并标记
+  // 平台，可跨池勾选；绑定池时仅展示对应池（trae → Trae 池；buddy → Buddy 池；
+  // buddy-ai → BuddyAI 国际池；qoder → Qoder 池）。
   // 修复历史问题：原候选列表拉的是 Trae 池，而后端白名单只作用于 WB 池
   const editCandidates: PoolCandidate[] = useMemo(() => {
     const tag = (pool: CandidatePool, list: PoolStatus[]) => list.map((p) => ({ ...p, pool }));
     if (editBindPool === 'trae') return tag('trae', poolStatus);
     if (editBindPool === 'buddy') return tag('buddy', buddyPoolStatus);
+    if (editBindPool === 'buddy-ai') return tag('buddy-ai', buddyAiPoolStatus);
     if (editBindPool === 'qoder') return tag('qoder', qoderPoolStatus);
-    return [...tag('trae', poolStatus), ...tag('buddy', buddyPoolStatus), ...tag('qoder', qoderPoolStatus)];
-  }, [editBindPool, poolStatus, buddyPoolStatus, qoderPoolStatus]);
+    return [
+      ...tag('trae', poolStatus),
+      ...tag('buddy', buddyPoolStatus),
+      ...tag('buddy-ai', buddyAiPoolStatus),
+      ...tag('qoder', qoderPoolStatus),
+    ];
+  }, [editBindPool, poolStatus, buddyPoolStatus, buddyAiPoolStatus, qoderPoolStatus]);
 
   // issue #30 编码：跟随全局调度时白名单/专一值携带池前缀（trae:/buddy:），
   // 后端按前缀分池作用域；绑定池时存裸 uid（与旧格式一致）
@@ -435,6 +478,13 @@ export default function ApiKeysManager({
     (pool: CandidatePool, uid: string) => (editBindPool === '' ? `${pool}:${uid}` : uid),
     [editBindPool],
   );
+
+  // 可见池名串（限定上游提示文案用；全部隐藏时兜底占位）
+  const visiblePoolsText =
+    (['trae', 'buddy', 'qoder', 'buddy-ai'] as CandidatePool[])
+      .filter((p) => isPoolVisible(settings, p))
+      .map((p) => POOL_TAG[p].label)
+      .join(' + ') || '无可见池';
 
   const switchBindPool = (p: string) => {
     if (p === editBindPool) return;
@@ -454,9 +504,10 @@ export default function ApiKeysManager({
         </span>
       </div>
 
-      {/* 新增表单 */}
-      <div className="mb-3 flex flex-wrap items-end gap-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
-        <div className="w-36">
+      {/* 新增表单（单行紧凑布局：Key 值定宽不占满，资源池按钮自适应，不折叠换行；
+          窄窗口横向滚动兜底，不裁剪控件） */}
+      <div className="mb-3 flex flex-nowrap items-end gap-2 overflow-x-auto rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+        <div className="w-32 shrink-0">
           <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">名称</label>
           <input
             className="input"
@@ -465,7 +516,7 @@ export default function ApiKeysManager({
             onChange={(e) => setNewKeyName(e.target.value)}
           />
         </div>
-        <div className="min-w-64 flex-1">
+        <div className="w-64 shrink-0">
           <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">Key 值</label>
           <input
             className="input font-mono text-xs"
@@ -474,27 +525,31 @@ export default function ApiKeysManager({
           />
         </div>
         <button
-          className="btn-ghost flex items-center gap-1 !p-2 text-xs"
+          className="btn-ghost flex shrink-0 items-center gap-1 !p-2 text-xs"
           onClick={generateKeyValue}
           title="重新生成 Key 值"
         >
           <RefreshCw size={13} />
           重新生成
         </button>
-        <div className="w-36">
-          <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
-            日限额/次（0=不限）
+        <div className="w-32 shrink-0">
+          <label
+            className="mb-1 block text-xs text-slate-500 dark:text-zinc-400"
+            title="每日请求次数上限，0 = 不限"
+          >
+            日限额/次
           </label>
           <input
             type="number"
             min={0}
             className="input"
+            title="0 = 不限"
             value={newKeyLimit}
             onChange={(e) => setNewKeyLimit(parseInt(e.target.value) || 0)}
           />
         </div>
-        <div className="w-56">
-          <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
+        <div className="shrink-0">
+          <label className="mb-1 block whitespace-nowrap text-xs text-slate-500 dark:text-zinc-400">
             资源池<span className="ml-1 font-normal text-slate-400">（优先走所选池）</span>
           </label>
           <div className="flex gap-1">
@@ -502,11 +557,13 @@ export default function ApiKeysManager({
               { key: '', label: '全局', title: '不绑定，按系统策略选池' },
               { key: 'trae', label: 'Trae', title: '优先走 Trae，异常可回退' },
               { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
+              { key: 'buddy-ai', label: 'BuddyAI', title: '优先走 BuddyAI 国际池，异常可回退' },
               { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
-            ].map((p) => (
+              // 应用显隐联动：新增 Key 不提供隐藏应用的池选项
+            ].filter((p) => p.key === '' || isPoolVisible(settings, p.key)).map((p) => (
               <button
                 key={p.key}
-                className={`flex-1 rounded-lg border px-2 py-1.5 text-xs font-medium transition-colors ${
+                className={`shrink-0 whitespace-nowrap rounded-lg border px-2 py-1.5 text-xs font-medium transition-colors ${
                   newBindPool === p.key
                     ? 'border-indigo-400 bg-indigo-50 text-indigo-600 dark:border-indigo-500 dark:bg-indigo-500/10 dark:text-indigo-300'
                     : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400'
@@ -520,7 +577,7 @@ export default function ApiKeysManager({
           </div>
         </div>
         <button
-          className="btn-outline flex items-center gap-1 !px-3 text-xs"
+          className="btn-outline flex shrink-0 items-center gap-1 !px-3 text-xs"
           onClick={addKey}
           disabled={keysSaving}
         >
@@ -631,12 +688,22 @@ export default function ApiKeysManager({
                       {/* issue #25 资源池绑定徽标 */}
                       {k.bind_pool === 'trae' && <Badge tone="blue" className="ml-1">Trae 池</Badge>}
                       {k.bind_pool === 'buddy' && <Badge tone="green" className="ml-1">Buddy 池</Badge>}
+                      {k.bind_pool === 'buddy-ai' && <Badge tone="cyan" className="ml-1">BuddyAI 国际池</Badge>}
                       {k.bind_pool === 'qoder' && <Badge tone="violet" className="ml-1">Qoder 池</Badge>}
                       {/* §5.3 保存后校验提示：绑定 Qoder 池但上游未启用 → 警告徽标 */}
                       {k.bind_pool === 'qoder' && qoderEnabled === false && (
                         <span
                           className="ml-1 inline-flex align-middle"
                           title="Qoder 上游未启用：该 Key 的请求将显式报错；开启入口在 Qoder「资源调度」页或全局 API 管理·调度策略中心"
+                        >
+                          <Badge tone="amber">上游未启用</Badge>
+                        </span>
+                      )}
+                      {/* 同上口径：绑定 BuddyAI 国际池但上游未启用 → 警告徽标 */}
+                      {k.bind_pool === 'buddy-ai' && buddyAiEnabled === false && (
+                        <span
+                          className="ml-1 inline-flex align-middle"
+                          title="BuddyAI 国际上游未启用：该 Key 的请求将显式报错；开启入口在 BuddyAI 国际「资源调度」页"
                         >
                           <Badge tone="amber">上游未启用</Badge>
                         </span>
@@ -742,14 +809,22 @@ export default function ApiKeysManager({
                 { key: '', label: '跟随全局调度', desc: '不绑定，按系统策略选池' },
                 { key: 'trae', label: 'Trae 池', desc: '优先走 Trae，异常可回退' },
                 { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
+                { key: 'buddy-ai', label: 'BuddyAI 池', desc: '优先走 BuddyAI，异常可回退' },
                 { key: 'qoder', label: 'Qoder 池', desc: '优先走 Qoder，异常可回退' },
+                // 应用显隐联动：保留全量按钮（存量 bind_pool 指向隐藏池时需有选中态），
+                // 隐藏池加「已隐藏」徽标——隐藏不停功能、不删数据
               ].map((p) => (
                 <button
                   key={p.key}
                   className={`flex-1 rounded-lg border p-2.5 text-left text-xs ${editBindPool === p.key ? 'border-indigo-400 bg-indigo-50 dark:bg-indigo-500/10' : 'border-slate-200 dark:border-zinc-700'}`}
                   onClick={() => switchBindPool(p.key)}
                 >
-                  <div className="font-medium">{p.label}</div>
+                  <div className="font-medium">
+                    {p.label}
+                    {p.key !== '' && !isPoolVisible(settings, p.key) && (
+                      <Badge tone="slate" className="ml-1 !px-1.5 !text-[10px]">已隐藏</Badge>
+                    )}
+                  </div>
                   <div className="mt-0.5 text-slate-400">{p.desc}</div>
                 </button>
               ))}
@@ -759,6 +834,13 @@ export default function ApiKeysManager({
               <p className="mt-1.5 text-xs text-amber-500">
                 Qoder 上游当前未启用：保存后该 Key 的请求将显式报错；请先到 Qoder「资源调度」页
                 或上方「调度策略中心」开启「启用 Qoder 上游」。
+              </p>
+            )}
+            {/* 同上口径：绑定 BuddyAI 国际池但上游未启用 → 弹框内即时提示 */}
+            {editBindPool === 'buddy-ai' && buddyAiEnabled === false && (
+              <p className="mt-1.5 text-xs text-amber-500">
+                BuddyAI 国际上游当前未启用：保存后该 Key 的请求将显式报错；请先到
+                BuddyAI 国际「资源调度」页开启「启用 BuddyAI 国际上游」。
               </p>
             )}
           </div>
@@ -785,7 +867,7 @@ export default function ApiKeysManager({
               <span className="mb-1 block text-xs font-medium text-slate-500">
                 专一账号
                 <span className="ml-1 font-normal text-slate-400">
-                  （{editBindPool ? bindPoolLabel(editBindPool) : 'Trae/Buddy/Qoder 池'}账号）
+                  （{editBindPool ? bindPoolLabel(editBindPool) : visiblePoolsText.replace(/ \+ /g, '/')}账号）
                 </span>
               </span>
               <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
@@ -793,6 +875,7 @@ export default function ApiKeysManager({
                 {editCandidates.map((c) => (
                   <option key={encodeUid(c.pool, c.uid)} value={encodeUid(c.pool, c.uid)}>
                     [{POOL_TAG[c.pool].label}] {c.name || c.uid}
+                    {!isPoolVisible(settings, c.pool) ? '（已隐藏池）' : ''}
                     {c.credits != null ? `（${c.credits.toFixed(1)} 积分）` : ''}
                   </option>
                 ))}
@@ -806,7 +889,7 @@ export default function ApiKeysManager({
             <div className="mb-1.5 text-xs font-medium text-slate-500">
               限定上游
               <span className="ml-1 font-normal text-slate-400">
-                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : 'Trae + Buddy + Qoder 池账号'}
+                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : `${visiblePoolsText}账号`}
                 ；不勾选 = 使用全部上游账号）
               </span>
             </div>
@@ -831,6 +914,9 @@ export default function ApiKeysManager({
                       <Badge tone={POOL_TAG[c.pool].tone} className="!px-1.5 !text-[10px]">
                         {POOL_TAG[c.pool].label}
                       </Badge>
+                      {!isPoolVisible(settings, c.pool) && (
+                        <Badge tone="slate" className="!px-1.5 !text-[10px]">已隐藏</Badge>
+                      )}
                       <span className="truncate">{c.name || c.uid}</span>
                       {c.credits != null && <span className="ml-auto tabular-nums text-slate-400">{c.credits.toFixed(1)}</span>}
                     </label>
@@ -915,6 +1001,7 @@ export default function ApiKeysManager({
               覆盖账号数（实时展开）：{orgPreview.total}
               {orgPreview.trae ? ` · Trae ${orgPreview.trae}` : ''}
               {orgPreview.buddy ? ` · Buddy ${orgPreview.buddy}` : ''}
+              {orgPreview['buddy-ai'] ? ` · BuddyAI 国际 ${orgPreview['buddy-ai']}` : ''}
               {orgPreview.qoder ? ` · Qoder ${orgPreview.qoder}` : ''}
               {orgPreview.total === 0 && ' ⚠ 展开为空集：该 Key 将无任何可取号账号，请调整分组/标签组合'}
             </p>

@@ -79,18 +79,31 @@ pub struct ApiSharedState {
     pub wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// Qoder 池粘性 TTL 秒（per-pool，默认 300）
     pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// buddy-ai（国际版）池粘性 TTL 秒（per-pool，默认 300；§4.2 粘性按池独立）
+    pub buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// buddy-ai 竞速对冲阈值毫秒（per-pool 独立配置，0 = 关闭；WbView::route_hedge_ms
+    /// 按 CN/Intl 档取值）
+    pub buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
+    /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
+    pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
     /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
     /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
     /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
     pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
+    /// buddy-ai 显式会话粘性存储（§4.2：`g:` 前缀命名空间，与 wb/qoder/trae 互不串绑）
+    pub buddy_ai_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
     /// session_key → (上次成功服务的资源池, 过期时间 Unix 秒)，TTL 60s 软粘
     pub pool_sticky: Mutex<std::collections::HashMap<String, (dispatch::TargetPool, i64)>>,
     /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，
     /// 优先级高于 Key 级冷却
     pub model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// buddy-ai（国际版）模型级冷却独立实例（§4.2：Intl 池冷却表独立——同名模型
+    /// 跨区不混轮，CN 侧模型故障不得冷却 Intl 池同型号，反之亦然）
+    pub buddy_ai_model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -112,6 +125,11 @@ pub struct ApiSharedState {
     pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
     /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
     pub wb_probe_ok: std::sync::atomic::AtomicI64,
+    /// buddy-ai（国际版）上游健康探针（G8 审查修复）：与 wb_probe 同频控口径，
+    /// 探测 BILLING_BASE_GLOBAL（workbuddy.ai）；-1 未探测 / 0 不可达 / 1 在线
+    pub buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64,
+    /// buddy-ai（国际版）上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
+    pub buddy_ai_probe_ok: std::sync::atomic::AtomicI64,
     /// 跨池回退日志节流（审查中等项 + 二审细化）：key = "model|reason"，
     /// value = 上次落盘 Unix 毫秒；60s 窗口内同 model 同因回退只落盘一次，
     /// 防逐请求刷盘放大；不同 model/reason 互不抑制
@@ -147,6 +165,13 @@ pub struct ApiSharedState {
     /// Qoder 会话粘性存储（F-80-余 v2）：与 wb_sticky 共用 sticky_bindings 表，
     /// 键命名空间 "q:" 隔离，互不串绑
     pub qoder_sticky: wb_sticky::StickyStore,
+    // ── Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）─────────────────────
+    /// buddy-ai 上游账号池：与 wb 池并列的独立池实例（§3.1 硬约束 1：禁止混居；
+    /// 阶段 1 仅注册 + healthz selectable，dispatch 接线在阶段 2）
+    pub buddy_ai_pool: ApiPool,
+    /// buddy-ai 上游开关（api_pool.json.buddy_ai_enabled；默认关——dispatch
+    /// 「buddy-ai」档显式开启制，由用户在 API 服务页显式开启国际档）
+    pub buddy_ai_enabled: std::sync::atomic::AtomicBool,
     /// Trae 池会话粘性存储（per-pool 会话粘性批次新增）：与 wb/qoder sticky 共用
     /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
     ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
@@ -212,6 +237,58 @@ impl ApiSharedState {
         );
         // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
         let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
+        let day = usage::today_key();
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((bucket, day));
+    }
+
+    /// 记录一次请求用量（按桶，buddy-ai 档记账分区用，§3.1 硬约束 5）；落盘策略同 record_usage
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_bucket(
+        &self,
+        bucket: usage::UsageBucket,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        self.record_usage_bucket_ttfb(
+            bucket, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, None,
+        );
+    }
+
+    /// 记录一次请求用量（按桶 + TTFT）：wb_route 池视图分流记账的唯一入口
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_bucket_ttfb(
+        &self,
+        bucket: usage::UsageBucket,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_in_ttfb(
+            bucket, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms,
+        );
+        // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
         let day = usage::today_key();
         drop(guard);
         self.usage_dirty
@@ -758,6 +835,7 @@ mod inflight_tests {
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
             total_requests: AtomicU64::new(0),
@@ -770,6 +848,8 @@ mod inflight_tests {
             usage_dirty: Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
             trae_jwt_refresh: None,
             trae_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -780,6 +860,12 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
+            buddy_ai_sticky: wb_sticky::StickyStore::default(),
+            buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            buddy_ai_pool: pool::ApiPool::new(),
+            buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         };
         {

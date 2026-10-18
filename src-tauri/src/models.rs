@@ -217,6 +217,48 @@ pub struct Settings {
     /// WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改）
     #[serde(default = "default_wb_checkin_hhmm")]
     pub wb_checkin_hhmm: String,
+    // ── Buddy 国际版（buddy-ai）每日活跃打卡（§4.5 补篇，阶段 3b） ──
+    /// buddy-ai 打卡调度开关（默认关——国际档显式开启制，与 buddy_ai_enabled 独立；
+    /// BuddyAI 页打卡卡可开）
+    #[serde(default)]
+    pub buddy_ai_checkin_enabled: bool,
+    /// buddy-ai 打卡调度触发时刻 HH:MM（默认 09:20，对齐外部项目口径）
+    #[serde(default = "default_buddy_ai_checkin_hhmm")]
+    pub buddy_ai_checkin_hhmm: String,
+    /// buddy-ai 打卡多账号间隔秒（默认 3s，0 = 关闭；复用 effective_checkin_gap）
+    #[serde(default)]
+    pub buddy_ai_checkin_gap_secs: Option<u64>,
+    // ── Buddy 国际版定时同步/续期（2026-10-16 六页对齐批 3，对齐国内任务配置口径） ──
+    /// buddy-ai 积分数据每日定时同步开关（默认开——对齐国内看板同步口径；
+    /// 仅同步 buddy-ai 池内账号，空池静默跳过）
+    #[serde(default = "default_true")]
+    pub buddy_ai_credits_sync_enabled: bool,
+    /// buddy-ai 积分同步触发时刻 HH:MM（默认 23:45，错峰 wb 23:30 / trae 23:40）
+    #[serde(default = "default_buddy_ai_credits_sync_hhmm")]
+    pub buddy_ai_credits_sync_hhmm: String,
+    /// buddy-ai 积分同步模式：off | hourly（每小时）| every_hours（每N小时）|
+    /// every_days（每N天）| daily（每日 HH:MM）。空 = 旧数据（只有 enabled 布尔），
+    /// state 归一化按旧开关派生 daily/off
+    #[serde(default)]
+    pub buddy_ai_credits_sync_mode: String,
+    /// buddy-ai 积分同步间隔小时数（every_hours 模式生效，默认 2，1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub buddy_ai_credits_sync_hours: String,
+    /// buddy-ai 积分同步间隔天数（every_days 模式生效，默认 1，1..=30）
+    #[serde(default = "default_credits_sync_days")]
+    pub buddy_ai_credits_sync_days: String,
+    /// buddy-ai 凭证兜底续期开关（默认开；lazy 48h——AT 到期前 48h 内才真正刷新）
+    #[serde(default = "default_true")]
+    pub buddy_ai_renew_enabled: bool,
+    /// buddy-ai 模型目录每日同步开关（默认开；/v3/config 直连拉取，无账号静默跳过）
+    #[serde(default = "default_true")]
+    pub buddy_ai_catalog_sync_enabled: bool,
+    /// buddy-ai 凭证兜底续期触发时刻 HH:MM（默认 10:35，错峰打卡 09:20；环境配置页可改）
+    #[serde(default = "default_buddy_ai_renew_hhmm")]
+    pub buddy_ai_renew_hhmm: String,
+    /// buddy-ai 模型目录同步触发时刻 HH:MM（默认 05:55；资源调度页可改）
+    #[serde(default = "default_buddy_ai_catalog_sync_hhmm")]
+    pub buddy_ai_catalog_sync_hhmm: String,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
     /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认）
     #[serde(default = "default_credits_sync_mode")]
@@ -282,6 +324,12 @@ pub struct Settings {
     /// CodeBuddy 桌面版 exe 手动路径（app_locate codebuddy 档案 settings_key）
     #[serde(default)]
     pub codebuddy_path: Option<String>,
+    /// WorkBuddy AI 国际版 exe 手动路径（app_locate workbuddy_ai 档案 settings_key；BuddyAI 环境配置页）
+    #[serde(default)]
+    pub workbuddy_ai_path: Option<String>,
+    /// CodeBuddy AI 国际客户端 exe 手动路径（app_locate codebuddy_ai 档案 settings_key）
+    #[serde(default)]
+    pub codebuddy_ai_path: Option<String>,
     /// WorkBuddy auth 文件人工路径（默认 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info；
     /// 非默认安装布局时在环境配置页指定）
     #[serde(default)]
@@ -355,6 +403,12 @@ pub struct Settings {
     /// 缺失/非法回退 APP_TABS 内置默认图标）
     #[serde(default)]
     pub app_icons: HashMap<String, String>,
+    /// BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）：
+    /// 独立于 hidden_apps——存量用户 hidden_apps 已持久化为 []，若借道隐藏列表
+    /// 无法区分「默认隐藏」与「用户显式取消隐藏」，故用独立 opt-in 字段；
+    /// 系统设置-应用显示面板勾选后置 true
+    #[serde(default)]
+    pub buddy_ai_visible: bool,
 }
 
 fn default_api_port() -> u16 {
@@ -404,6 +458,26 @@ fn default_wb_growth_hhmm() -> String {
 }
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
+}
+/// buddy-ai 打卡调度默认 09:20（§4.5 补篇：对齐外部项目 scheduler 口径）
+fn default_buddy_ai_checkin_hhmm() -> String {
+    "09:20".into()
+}
+/// buddy-ai 积分同步默认 23:45（错峰 wb 23:30 / trae 23:40 / qoder 23:40）
+fn default_buddy_ai_credits_sync_hhmm() -> String {
+    "23:45".into()
+}
+/// buddy-ai 积分同步 every_days 模式默认间隔天数
+fn default_credits_sync_days() -> String {
+    "1".into()
+}
+/// buddy-ai 凭证兜底续期默认 10:35（错峰打卡 09:20 / wb-renew）
+fn default_buddy_ai_renew_hhmm() -> String {
+    "10:35".into()
+}
+/// buddy-ai 模型目录同步默认 05:55（错峰 wb-catalog 05:50 / 打卡 09:20）
+fn default_buddy_ai_catalog_sync_hhmm() -> String {
+    "05:55".into()
 }
 /// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
 fn default_qoder_checkin_hhmm() -> String {
@@ -774,6 +848,41 @@ pub struct ApiPoolFile {
     /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
     #[serde(default = "default_sticky_ttl_secs")]
     pub qoder_sticky_ttl_secs: u64,
+    /// Buddy 国际版（buddy-ai）池上游开关：开启后 buddy-ai 目录模型路由到国际池。
+    /// 默认 false——dispatch「buddy-ai」档显式开启制（§4.2：避免模型路由歧义，
+    /// 用户在 API 服务页显式开启国际档），未部署国际账号时不产生空池噪音
+    #[serde(default)]
+    pub buddy_ai_enabled: bool,
+    /// buddy-ai 显式会话粘性开关（§4.2 同 qoder_sticky_enabled 口径，默认关）
+    #[serde(default)]
+    pub buddy_ai_sticky_enabled: bool,
+    /// buddy-ai 池粘性 TTL 秒（per-pool 参数，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub buddy_ai_pool_sticky_ttl_secs: u64,
+    /// buddy-ai 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限，
+    /// 对齐 Qoder 池 qoder_account_concurrency_limit 口径）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub buddy_ai_account_concurrency_limit: u32,
+    /// buddy-ai 显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800）：
+    /// 覆盖 buddy_ai_sticky store 的 EXPLICIT_TTL_SECS 常量（set_explicit_ttl 热应用）
+    #[serde(default = "default_wb_sticky_ttl_secs")]
+    pub buddy_ai_sticky_ttl_secs: u64,
+    /// buddy-ai 竞速对冲阈值毫秒（per-pool 三参数之一，0 = 关闭；默认 8000，
+    /// 运行时 clamp 1s–8s 同 WB/Qoder）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub buddy_ai_hedge_threshold_ms: u64,
+    /// buddy-ai 池分组筛选（buddy_ai_group_ids）：非空时仅纳入所选分组的国际账号
+    ///（未分组账号不参与，对齐 WB/Qoder 池 T10 语义）；空 = 不限分组
+    #[serde(default)]
+    pub buddy_ai_group_ids: Vec<String>,
+    /// buddy-ai 池标签筛选（tag_ 前缀 id）：与分组筛选取交集（D5 池语义）；空 = 不限
+    #[serde(default)]
+    pub buddy_ai_tag_ids: Vec<String>,
+    /// buddy-ai 池内调度策略（取值同 strategy；空串 = 跟随 Trae 池，与
+    /// wb_strategy / qoder_strategy 同语义）。启动（do_start）与热应用（pool_set）
+    /// 共用 PoolStrategy::resolve_buddy_ai 解析，保证两处行为一致
+    #[serde(default)]
+    pub buddy_ai_strategy: String,
     /// Qwen3.8-Flash 免费活动倍率覆盖（资源调度页模型目录开关，默认开）：
     /// 开启时该模型目录/兜底倍率按 0 处理——/v1/models 展示 0× + 取号豁免
     /// 零积分过滤（issue #111：上游免费活动期 billable=false 不扣分，但
@@ -846,6 +955,15 @@ impl Default for ApiPoolFile {
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
+            buddy_ai_enabled: false,
+            buddy_ai_sticky_enabled: false,
+            buddy_ai_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            buddy_ai_account_concurrency_limit: default_account_concurrency_limit(),
+            buddy_ai_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+            buddy_ai_hedge_threshold_ms: default_hedge_threshold_ms(),
+            buddy_ai_group_ids: Vec::new(),
+            buddy_ai_tag_ids: Vec::new(),
+            buddy_ai_strategy: String::new(),
         }
     }
 }

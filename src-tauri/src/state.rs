@@ -141,6 +141,9 @@ pub struct AppState {
     /// （命令线程/后台刷新线程/调度器三方并发）持锁执行，防旧副本整文档覆盖
     /// 丢账号（lost-update）；长窗口网络调用（回填/续期）在锁外完成后短临界区写回
     pub wb_pool_lock: Arc<Mutex<()>>,
+    /// Buddy 国际版（buddy-ai）账号池读-改-写互斥：与 wb_pool_lock 同语义、
+    /// 独立实例（§3.4 隔离清单——失败域与锁域均不与国内池交织）
+    pub buddy_ai_pool_lock: Arc<Mutex<()>>,
     /// Doubao 账号池读-改-写互斥：同 wb_pool_lock，罩住命令/巡检任务/保活线程
     /// 与 vault 启动迁移的全部写点
     pub doubao_pool_lock: Arc<Mutex<()>>,
@@ -184,6 +187,7 @@ impl AppState {
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
+            buddy_ai_pool_lock: Arc::new(Mutex::new(())),
             doubao_pool_lock: Arc::new(Mutex::new(())),
             group_defs_lock: Arc::new(Mutex::new(())),
         })
@@ -280,6 +284,10 @@ impl AppState {
         if s.wb_checkin_hhmm.trim().is_empty() {
             s.wb_checkin_hhmm = "09:10".into();
         }
+        // buddy-ai 打卡时刻零值回填（Settings::default 路径 String=""）
+        if s.buddy_ai_checkin_hhmm.trim().is_empty() {
+            s.buddy_ai_checkin_hhmm = "09:20".into();
+        }
         // Trae 每日签到时刻零值回填（默认 09:00；签到恒开无独立开关）
         if s.trae_checkin_hhmm.trim().is_empty() {
             s.trae_checkin_hhmm = "09:00".into();
@@ -305,6 +313,12 @@ impl AppState {
             s.qoder_credits_sync_mode =
                 if s.qoder_credits_sync_enabled { "every_hours" } else { "off" }.into();
         }
+        // buddy-ai 积分同步模式零值归一：空视为旧数据（只有 enabled 布尔），
+        // 按旧开关派生保持语义：true→daily（原每日定时口径）、false→off
+        if s.buddy_ai_credits_sync_mode.trim().is_empty() {
+            s.buddy_ai_credits_sync_mode =
+                if s.buddy_ai_credits_sync_enabled { "daily" } else { "off" }.into();
+        }
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
         if s.wb_catalog_sync_hhmm.trim().is_empty() {
@@ -329,12 +343,25 @@ impl AppState {
             &mut s.wb_credits_sync_hours,
             &mut s.trae_credits_sync_hours,
             &mut s.qoder_credits_sync_hours,
+            &mut s.buddy_ai_credits_sync_hours,
         ] {
             let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
             *field = v.to_string();
         }
+        // buddy-ai 积分同步 every_days 间隔天数：非法回退 1，越界 clamp 到 1..=30
+        {
+            let v = s
+                .buddy_ai_credits_sync_days
+                .trim()
+                .parse::<i64>()
+                .map(|d| d.clamp(1, 30))
+                .unwrap_or(1);
+            s.buddy_ai_credits_sync_days = v.to_string();
+        }
         // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
-        if s.pinned_app.trim().is_empty() {
+        if s.pinned_app.trim().is_empty() || s.pinned_app == "buddy-ai" {
+            // buddy-ai（国际版）默认隐藏、不参与固定应用（GeneralSettingsPanel 同口径）；
+            // 脏值防御性回落 trae
             s.pinned_app = "trae".into();
         }
         // 隐藏列表归一：丢弃非法 key、去重排序；固定应用强制可见（双保险，前端同样约束）
@@ -348,8 +375,10 @@ impl AppState {
         }
         // 自定义图标归一：丢弃非法 key 与空图标名（等于未配置）；非法图标名不在此校验，
         // 前端 resolveAppIcon 未命中即回退默认图标（候选表只有前端持有，避免后端重复维护）
+        // buddy-ai（BuddyAI 国际版）：图标自定义放行（应用显示面板行首入口），hidden_apps 不放行——
+        // 其可见性走独立 opt-in 开关 buddy_ai_visible，不进隐藏列表
         s.app_icons
-            .retain(|k, v| matches!(k.as_str(), "trae" | "buddy" | "qoder" | "doubao") && !v.trim().is_empty());
+            .retain(|k, v| matches!(k.as_str(), "trae" | "buddy" | "qoder" | "doubao" | "buddy-ai") && !v.trim().is_empty());
         // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让
@@ -404,6 +433,7 @@ mod tests {
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
+            buddy_ai_pool_lock: Arc::new(Mutex::new(())),
             doubao_pool_lock: Arc::new(Mutex::new(())),
             group_defs_lock: Arc::new(Mutex::new(())),
         }

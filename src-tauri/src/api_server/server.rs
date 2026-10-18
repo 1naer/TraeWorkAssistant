@@ -263,6 +263,9 @@ mod tests {
 /// WB 上游健康检测线程（F-34 ④/§2.2 频控维度）：每 5min + 0-60s 抖动对 CN 主域名
 /// 发一次轻量 GET（模型目录路径）。无凭证探测——任何 HTTP 响应（含 401）都证明
 /// 服务在线，仅连接失败/超时判不可达；结果写 state.wb_probe_* 供 /status 透出。
+/// G8 审查修复：同循环对 buddy-ai 国际上游（BILLING_BASE_GLOBAL，workbuddy.ai）
+/// 同口径再探一次，结果写 state.buddy_ai_probe_* 供 /status buddy_ai 块透出——
+/// 国际档开关独立于 CN，CN 可达 ≠ Intl 可达，双上游各自画像。
 /// 频控红线：单次单请求、不重试、不批量，探活流量可忽略。
 fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
@@ -308,10 +311,37 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                     }
                 }
             }
+            // buddy-ai（国际版）目录动态抓取（2026-10-15）：GET /v3/config（R-5 锚点，
+            // UA 自带 CLI 段下发全量），取 buddy-ai 池任一账号 Bearer 直连——不依赖
+            // 客户端/抓包代理。同款 best effort：失败保持内置静态表；池未启用跳过
+            if state.buddy_ai_enabled.load(Ordering::Relaxed) {
+                if let Some(p) = state.buddy_ai_pool.pick_excluding_constrained(
+                    &std::collections::HashSet::new(),
+                    None,
+                    None,
+                ) {
+                    match wb_catalog::buddy_ai_fetch_and_replace(&state.data_dir, &p.uid, &p.jwt) {
+                        Ok(n) => {
+                            crate::fs_utils::app_log(
+                                &state.data_dir,
+                                &format!("BuddyAI Intl 模型目录动态替换成功: {} 个模型", n),
+                            );
+                        }
+                        Err(e) => {
+                            crate::fs_utils::app_log(
+                                &state.data_dir,
+                                &format!("BuddyAI Intl 模型目录动态替换失败（保持静态兜底）: {}", e),
+                            );
+                        }
+                    }
+                }
+            }
         }
-        // 探测目标：WB 上游对话主域名（CN）的轻量 GET 路径
         const PROBE_URL: &str =
             concat!("https://copilot.tencent.com", "/console/enterprises/personal/models");
+        // G8 审查修复：buddy-ai 国际上游探针目标（无凭证根路径 GET，同款「有
+        // HTTP 响应 = 在线」口径；引用 wb_common 常量避免双写漂移）
+        const BUDDY_AI_PROBE_URL: &str = crate::tasks::wb_common::BILLING_BASE_GLOBAL;
         loop {
             // 5min 基础间隔 + 0-60s 抖动（多实例同时启动时错峰；零新增依赖，纳秒派生）
             let jitter = std::time::SystemTime::now()
@@ -326,24 +356,46 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
                 .build();
-            let ok = match agent
-                .get(PROBE_URL)
-                .set("User-Agent", super::wb_upstream::WB_UA)
-                .call()
-            {
-                Ok(_) => true,
-                Err(ureq::Error::Status(_, _)) => true, // 有 HTTP 响应 = 服务在线
-                Err(_) => false,                        // 网络/超时 = 不可达
+            // 无凭证探活判定（CN/Intl 共用）：任何 HTTP 响应（含 401）= 服务在线。
+            // UA 沿用原 CN 探针口径——部分 WAF 对缺 UA 连接直接重置（Err）会被
+            // 误判不可达，保留 WB_UA 与既有判定行为零差异
+            let probe_ok = |url: &str| {
+                match agent
+                    .get(url)
+                    .set("User-Agent", super::wb_upstream::WB_UA)
+                    .call()
+                {
+                    Ok(_) => true,
+                    Err(ureq::Error::Status(_, _)) => true,
+                    Err(_) => false,
+                }
             };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let ok = probe_ok(PROBE_URL);
             state.wb_probe_ts_ms.store(now, Ordering::Relaxed);
             state.wb_probe_ok.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
             if !ok {
                 // 失败明示（§2.2 接口稳定性）：记日志不静默
                 eprintln!("[wb-probe] 上游健康检测失败: {PROBE_URL}");
+            }
+            // G8：Intl 上游独立探测（同频控节奏串行第二请求，探活流量仍可忽略）；
+            // 未启用 buddy-ai 池也照探——开关随时可热开，探针只描述上游可达性。
+            // 审查复审修复：探测前重采样时间戳——CN 探针 HTTP 超时（10s）会让
+            // 沿用的 now 最多回溯 10s，/status 时间戳展示失真
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let intl_ok = probe_ok(BUDDY_AI_PROBE_URL);
+            state.buddy_ai_probe_ts_ms.store(now, Ordering::Relaxed);
+            state
+                .buddy_ai_probe_ok
+                .store(if intl_ok { 1 } else { 0 }, Ordering::Relaxed);
+            if !intl_ok {
+                eprintln!("[buddy-ai-probe] 国际上游健康检测失败: {BUDDY_AI_PROBE_URL}");
             }
         }
     });
