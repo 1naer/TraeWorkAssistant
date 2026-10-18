@@ -267,7 +267,10 @@ fn packages_from(body: &Value) -> Vec<Value> {
 
 /// summary 响应 → 余额。旧结构：顶层 RemainingCapacity/Balance 等字段；
 /// 新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。
-fn balance_from_summary(body: &Value) -> Option<f64> {
+/// 聚合父字段（如 data.CycleRemainCapacity）与 Packages[] 明细并存时，父/子
+/// 不可重复计数（issue #120 余额翻倍根因）：存在带 PackageCode 的明细 dict 时
+/// 仅对其求和，全部无 code 的旧形态回退全量和。
+pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     if let Some(t) = num_of(fs_utils::dig(
         body,
         &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
@@ -276,18 +279,34 @@ fn balance_from_summary(body: &Value) -> Option<f64> {
     }
     let mut found = vec![];
     walk_capable_dicts(body, 0, &mut found);
-    let mut s = 0.0;
-    let mut has = false;
-    for item in found {
-        if let Some(v) = num_of(fs_utils::dig(item, &["CycleRemainCapacity", "RemainingCapacity", "remaining"])) {
-            s += v;
-            has = true;
+    let sum_of = |items: &[&Value]| -> Option<f64> {
+        let mut s = 0.0;
+        let mut has = false;
+        for item in items {
+            if let Some(v) = num_of(fs_utils::dig(item, &["CycleRemainCapacity", "RemainingCapacity", "remaining"])) {
+                s += v;
+                has = true;
+            }
+        }
+        has.then_some(s)
+    };
+    let coded: Vec<&Value> = found
+        .iter()
+        .copied()
+        .filter(|d| {
+            fs_utils::dig(d, &["PackageCode", "packageCode"])
+                .and_then(Value::as_str)
+                .map_or(false, |c| !c.is_empty())
+        })
+        .collect();
+    if !coded.is_empty() {
+        if let Some(s) = sum_of(&coded) {
+            return Some(s);
         }
     }
-    if has {
-        return Some(s);
-    }
-    num_of(fs_utils::dig(body, &["CycleCapacitySizePrecise", "CycleTotalCapacity", "CapacitySize"]))
+    sum_of(&found).or_else(|| {
+        num_of(fs_utils::dig(body, &["CycleCapacitySizePrecise", "CycleTotalCapacity", "CapacitySize"]))
+    })
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -785,6 +804,26 @@ mod wb_credits_tests {
             {"CycleRemainCapacity": 10.0}, {"CycleRemainCapacity": 32.0}
         ]}});
         assert_eq!(balance_from_summary(&body), Some(42.0));
+    }
+
+    #[test]
+    fn balance_from_summary_no_double_count_with_packages() {
+        // issue #120 翻倍形态：聚合父字段与 Packages[] 明细并存 → 仅按明细求和
+        //（修复前：父 800 + 包 500+300 = 1600 = 2× 真实余额，签到差值兜底随之翻倍）
+        let body = json!({"data": {
+            "CycleRemainCapacity": 800.0,
+            "Packages": [
+                {"PackageCode": "p_a", "CycleRemainCapacity": 500.0},
+                {"PackageCode": "p_b", "CycleRemainCapacity": 300.0}
+            ]
+        }});
+        assert_eq!(balance_from_summary(&body), Some(800.0));
+        // 全部无 PackageCode 的旧形态：回退全量和（原行为不变）
+        let legacy = json!({"data": {
+            "CycleRemainCapacity": 30.0,
+            "Accounts": [{"RemainingCapacity": 10.0}]
+        }});
+        assert_eq!(balance_from_summary(&legacy), Some(40.0));
     }
 
     #[test]

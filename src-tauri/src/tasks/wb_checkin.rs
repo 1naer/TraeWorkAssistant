@@ -387,11 +387,10 @@ fn fetch_balance(agent: &ureq::Agent, headers: &[(String, String)], base: &str) 
         return None;
     }
     let b = body?;
-    num_or_none(fs_utils::dig(
-        &b,
-        &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
-    ))
-    .or_else(|| deep_balance_dig(&b, 0))
+    // 与积分页统一解析器（wb_credits::balance_from_summary）：聚合父字段 +
+    // Packages[] 明细并存时不翻倍（issue #120），pre/post 与积分页口径一致；
+    // deep_balance_dig 保留为最后回退。
+    crate::tasks::wb_credits::balance_from_summary(&b).or_else(|| deep_balance_dig(&b, 0))
 }
 
 /// WB credits 域余额（WorkBuddy 积分账本）：billing meter 是通用积分账本，
