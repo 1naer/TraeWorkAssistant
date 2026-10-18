@@ -390,15 +390,38 @@ pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     out
 }
 
-/// IDE 数据目录（M0 实测修正：`%APPDATA%\QoderCN`，与 switcher Qoder 档案 data_dir 同源）
-/// macOS 适配预留：Qoder IDE（VS Code fork）预期数据目录为
-/// `~/Library/Application Support/QoderCN`（Electron app.getPath('userData') 惯例），
-/// 需真机实测确认；实现层建议改用 `dirs::home_dir()` + 固定拼接替代 APPDATA 环境变量，
-/// 返回值语义（Option<PathBuf>）与调用方均不变
-pub(crate) fn ide_data_dir() -> Option<PathBuf> {
+/// IDE 数据目录候选（issue #119：部分用户机器无 QoderCN 目录，os error 3）：
+/// ① `%APPDATA%\QoderCN` —— CN IDE（0.4.3 拆分后的 IDE 本体，M0 实测）；
+/// ② `%APPDATA%\Qoder` —— 国际版 IDE（Electron userData 同名惯例）。
+/// 与 switcher Qoder 档案 data_dir（profile.rs 恒 QoderCN）独立：档案快照布局
+/// 绑 icube 白名单，暂不随候选扩展。
+/// macOS 适配预留：`~/Library/Application Support/<候选名>`（Electron
+/// app.getPath('userData') 惯例），实现层建议改用 `dirs::home_dir()` + 固定拼接
+/// 替代 APPDATA 环境变量，返回值语义与调用方均不变
+pub(crate) fn ide_data_dir_candidates() -> Vec<PathBuf> {
     std::env::var("APPDATA")
         .ok()
-        .map(|d| PathBuf::from(d).join("QoderCN"))
+        .map(|d| {
+            ["QoderCN", "Qoder"]
+                .iter()
+                .map(|n| PathBuf::from(&d).join(n))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// IDE 数据目录：首个存在的候选；均不存在时回退首个候选（QoderCN），维持既有
+/// 调用方（状态看板路径展示、环境重置清理目标、fail-open 守卫）默认语义不变。
+/// 注意：回退值可能并不存在——需要区分「目录不存在」的调用方（qoder_ide_scan）
+/// 应对返回值 `filter(|d| d.is_dir())` 后以 ok_or_else 报错，并用
+/// [`ide_data_dir_candidates`] 在报错中列出全部已探测路径
+pub(crate) fn ide_data_dir() -> Option<PathBuf> {
+    let cands = ide_data_dir_candidates();
+    cands
+        .iter()
+        .find(|d| d.is_dir())
+        .or_else(|| cands.first())
+        .cloned()
 }
 
 /// QoderWork exe 候选：settings.qoderwork_path 人工指定优先，否则默认安装布局。

@@ -30,7 +30,7 @@ use std::path::Path;
 use serde::Serialize;
 use tauri::State;
 
-use super::common::{account_id_of, ide_data_dir, with_pool_mut, QoderAccount};
+use super::common::{account_id_of, ide_data_dir, ide_data_dir_candidates, with_pool_mut, QoderAccount};
 use crate::state::AppState;
 use crate::tasks::qoder_common::{self, QoderCreds};
 use crate::tasks::qoder_device::QoderDeviceProfile;
@@ -210,6 +210,30 @@ pub fn scan_ide_login(data_dir: &Path) -> Result<IdeLogin, String> {
 
 // ── 扫描/导入命令 ──────────────────────────────────────────────────────────
 
+/// 捕获本机 Qoder 真实设备指纹（issue #119 C 项，真实捕获优先通道）：
+/// machineid 文件（数据目录根级）为唯一真源——客户端首启自行生成；§5.10.2
+/// 切换覆写后该值即当前登录会话实际呈现给服务端的指纹（客户端会话在它之下
+/// 建立信任）。校验：trim 后 32/64 位 hex（QoderPatcher 32-hex / VS Code fork
+/// sha256 64-hex 两形态兼容；真实值优先，仅统一小写——hex 大小写不敏感且与
+/// 写入侧 random_hex32 的小写惯例一致，不改写内容）；缺失或形态不符 → None
+/// （调用方回退随机生成，行为不变）
+fn capture_local_machine_id(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join("machineid")).ok()?;
+    let s = raw.trim();
+    let hex_ok = (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit());
+    hex_ok.then(|| s.to_ascii_lowercase())
+}
+
+/// 入池指纹：真实捕获优先，缺失回退随机生成（issue #119：生成指纹无服务端
+/// 信任会被 claim 端点 BLOCKED——本机扫描的账号绑定其真实指纹）
+fn real_or_generate_profile(data_dir: &Path) -> QoderDeviceProfile {
+    let mut p = QoderDeviceProfile::generate();
+    if let Some(mid) = capture_local_machine_id(data_dir) {
+        p.machine_id = mid;
+    }
+    p
+}
+
 /// 扫描结果摘要（脱敏：不含 token 本体）
 #[derive(Serialize, Clone, Default)]
 pub struct QoderIdeScanResult {
@@ -223,8 +247,9 @@ pub struct QoderIdeScanResult {
 }
 
 /// 扫描 IDE 存储当前登录账号并导入账号池（幂等：同 token 稳定同 id，重复=更新）。
-/// 凭证入 token store（kind=client，dt-/drt- 原样入 store；effective_creds 请求侧
-/// 仍按 §5.10 注入每账号绑定指纹——IDE 本机指纹不入 store，避免多账号共享单指纹）。
+/// 凭证入 token store（kind=client，dt-/drt- 原样入 store）；设备指纹按 issue #119
+/// C 项取本机真实捕获（machineid 文件，真实捕获优先）绑定到扫描账号——本机扫描
+/// 的账号在客户端会话下已用该指纹建立服务端信任，绑假指纹反被 claim BLOCKED。
 /// async：命令含 DPAPI 解密 + SQLite 读取等阻塞 IO，移出主线程避免卡 UI。
 #[tauri::command(async)]
 pub fn qoder_ide_scan(
@@ -233,7 +258,17 @@ pub fn qoder_ide_scan(
 ) -> Result<QoderIdeScanResult, String> {
     #[cfg(windows)]
     {
-        let data_dir = ide_data_dir().ok_or("无法定位 QoderCN 数据目录（APPDATA 缺失）")?;
+        let data_dir = ide_data_dir().filter(|d| d.is_dir()).ok_or_else(|| {
+            let cands = ide_data_dir_candidates();
+            if cands.is_empty() {
+                "无法定位 Qoder IDE 数据目录（APPDATA 环境变量缺失）".to_string()
+            } else {
+                format!(
+                    "未找到 Qoder IDE 数据目录（已探测: {}）——请确认已安装 Qoder IDE 并启动登录过（issue #119：仅装 Qoder Work 应用时无本地存储扫描通道）",
+                    cands.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("、")
+                )
+            }
+        })?;
         let login = match scan_ide_login(&data_dir) {
             Ok(l) => l,
             Err(e) => {
@@ -252,6 +287,8 @@ pub fn qoder_ide_scan(
             });
         }
         let id = account_id_of(&login.token);
+        // 审查修复：指纹对齐留痕标志——app_log 文件 IO 移出持池锁闭包，锁内仅置位
+        let mut fingerprint_aligned: Option<String> = None;
         // I09：持锁读-改-写，防并发整池覆盖丢更新。
         // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth/data_io/PAT 导入的同款语义）——
         // 同账号先经其他通道入池（token 派生 id 不同）后再扫描 IDE 时，uid 命中保留
@@ -287,7 +324,32 @@ pub fn qoder_ide_scan(
                 }
                 a.needs_relogin = false;
                 a.relogin_reason = String::new();
-                if a.device_profile.is_none() {
+                // issue #119 C 项：本机真实指纹优先——本机扫描命中的账号，其客户端会话
+                // 正以 machineid 文件的真实指纹与服务端建立信任分桶，工具侧必须绑定同一
+                // 指纹才能过 claim 风控。此处对既有账号覆盖 machine_id 属 data_io「指纹
+                // 入池永不轮换」红线的有意例外（真实捕获优先），变更置位后在锁外
+                // app_log 留痕可审计。
+                if let Some(mid) = capture_local_machine_id(&data_dir) {
+                    let changed = match &mut a.device_profile {
+                        Some(p) => {
+                            if p.machine_id != mid {
+                                p.machine_id = mid;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => {
+                            let mut p = QoderDeviceProfile::generate();
+                            p.machine_id = mid;
+                            a.device_profile = Some(p);
+                            true
+                        }
+                    };
+                    if changed {
+                        fingerprint_aligned = Some(a.id.clone());
+                    }
+                } else if a.device_profile.is_none() {
                     a.device_profile = Some(QoderDeviceProfile::generate());
                 }
                 Ok((true, a.nickname.clone(), a.id.clone()))
@@ -306,13 +368,21 @@ pub fn qoder_ide_scan(
                         .expires_at_ms
                         .and_then(qoder_common::clamp_expires_at)
                         .map(|ms| ms / 1000),
-                    // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
-                    device_profile: Some(QoderDeviceProfile::generate()),
+                    // 入池即绑定稳定指纹（§5.10：一次生成永不轮换）；issue #119 C 项：
+                    // 本机 machineid 真实指纹可捕获时优先采用（真实捕获优先）
+                    device_profile: Some(real_or_generate_profile(&data_dir)),
                     ..Default::default()
                 });
                 Ok((false, nickname, id.clone()))
             }
         })?;
+        // 指纹对齐留痕（审查修复：app_log 文件 IO 在锁外执行，不在持池锁闭包内）
+        if let Some(acc) = fingerprint_aligned {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("Qoder IDE 扫描：账号 {acc} 设备指纹已对齐本机真实指纹（issue #119 C 项）"),
+            );
+        }
         // 凭证入 token store（save_token_store 非空字段 merge，不抹掉存量字段）
         let creds = QoderCreds {
             access_token: login.token,
@@ -529,6 +599,94 @@ mod tests {
         };
         std::fs::write(data_dir.join("auth.v1.dat"), &enc_broken).unwrap();
         assert_eq!(scan_work_login_uid(&data_dir), None, "无 user.id 应返回 None");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── issue #119 C 项：真实指纹捕获 ─────────────────────────────────────
+
+    /// 独立临时目录（pid + 纳秒唯一，沿用本模块既有测试模式）
+    fn temp_base(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "f80-mid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ))
+    }
+
+    #[test]
+    fn capture_machine_id_hex形态校验() {
+        let base = temp_base("hex");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // 文件缺失 → None（调用方回退随机生成，行为不变）
+        assert_eq!(capture_local_machine_id(&base), None);
+
+        // 32-hex 小写 → 原样
+        let mid32 = "0123456789abcdef0123456789abcdef";
+        std::fs::write(base.join("machineid"), mid32).unwrap();
+        assert_eq!(capture_local_machine_id(&base).as_deref(), Some(mid32));
+
+        // 32-hex 大写 → 统一小写（hex 大小写不敏感，与写入侧 random_hex32 惯例一致）
+        std::fs::write(base.join("machineid"), mid32.to_ascii_uppercase()).unwrap();
+        assert_eq!(
+            capture_local_machine_id(&base).as_deref(),
+            Some(mid32),
+            "大写 hex 应统一为小写"
+        );
+
+        // 64-hex（VS Code fork sha256 形态）→ 接受
+        let mid64 = "f".repeat(64);
+        std::fs::write(base.join("machineid"), &mid64).unwrap();
+        assert_eq!(capture_local_machine_id(&base).as_deref(), Some(mid64.as_str()));
+
+        // trim 容忍首尾空白
+        std::fs::write(base.join("machineid"), format!("  {mid32}\n")).unwrap();
+        assert_eq!(capture_local_machine_id(&base).as_deref(), Some(mid32));
+
+        // 31 位（长度不符）→ None
+        std::fs::write(base.join("machineid"), &mid32[..31]).unwrap();
+        assert_eq!(capture_local_machine_id(&base), None);
+
+        // 33 位 → None
+        std::fs::write(base.join("machineid"), format!("{mid32}0")).unwrap();
+        assert_eq!(capture_local_machine_id(&base), None);
+
+        // 32 位但含非 hex 字符 → None
+        std::fs::write(base.join("machineid"), "g".repeat(32)).unwrap();
+        assert_eq!(capture_local_machine_id(&base), None);
+
+        // 空文件 → None
+        std::fs::write(base.join("machineid"), "").unwrap();
+        assert_eq!(capture_local_machine_id(&base), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn real_or_generate_真实优先与随机回退() {
+        let base = temp_base("rog");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // 无 machineid 文件 → 随机生成小写 32-hex 形态
+        let p = real_or_generate_profile(&base);
+        assert_eq!(p.machine_id.len(), 32);
+        assert!(
+            p.machine_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "随机回退应为小写 32-hex，实际: {}",
+            p.machine_id
+        );
+
+        // 有 machineid 文件 → 精确等于文件值（大写文件也统一小写化）
+        let mid = "abcdef0123456789abcdef0123456789";
+        std::fs::write(base.join("machineid"), mid.to_ascii_uppercase()).unwrap();
+        let p = real_or_generate_profile(&base);
+        assert_eq!(p.machine_id, mid, "应采用本机真实指纹而非随机生成");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

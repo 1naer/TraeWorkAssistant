@@ -20,7 +20,8 @@ import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { nextTheme } from '../lib/themes';
 import { resolveAppIcon } from '../lib/appIcons';
-import type { ViewKey, AppKey } from '../types';
+import { getPinnedApp, isAppVisible } from '../lib/appVisibility';
+import type { AppKey, ViewKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
 
@@ -104,28 +105,20 @@ export default function Sidebar({
   const [showSystem, setShowSystem] = useState(false);
 
   // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤。
-  // pinned 非法/缺失回退 trae（后端 state.rs 已归一，此处对前端旧缓存双保险）；
-  // buddy-ai（国际版）不参与固定应用、默认隐藏，仅 settings.buddy_ai_visible = true 时显示
-  const pinnedApp = (
-    APP_KEYS.includes(settings?.pinned_app as AppKey) && settings?.pinned_app !== 'buddy-ai'
-      ? settings?.pinned_app
-      : 'trae'
-  ) as AppKey;
-  const hiddenApps = settings?.hidden_apps ?? [];
-  const visibleTabs = APP_TABS.filter(
-    (t) =>
-      t.key === pinnedApp ||
-      (t.key === 'buddy-ai' && settings?.buddy_ai_visible === true) ||
-      (t.key !== 'buddy-ai' && !hiddenApps.includes(t.key)),
-  );
+  // 口径统一由 lib/appVisibility 提供（pinned 非法/缺失回退 trae；buddy-ai 不参与固定、
+  // 默认隐藏，仅 settings.buddy_ai_visible = true 时显示）
+  const pinnedApp = getPinnedApp(settings);
+  const visibleTabs = APP_TABS.filter((t) => isAppVisible(settings, t.key));
 
   // 当前激活应用被隐藏（或固定项变更）时自动回落固定应用主页，避免停留在无 Tab 的应用
   useEffect(() => {
     if (!visibleTabs.some((t) => t.key === activeApp)) {
       setActiveApp(pinnedApp);
     }
+    // 审查修复：补 buddy_ai_visible 依赖——停留在 BuddyAI 应用时关闭其可见性，
+    // 回落固定应用须即时触发（否则停留在无 Tab 的应用）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeApp, pinnedApp, settings?.hidden_apps]);
+  }, [activeApp, pinnedApp, settings?.hidden_apps, settings?.buddy_ai_visible]);
 
   // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）；BuddyAI → 6 页（国际版对齐 Buddy 产品形态）
   const nav =

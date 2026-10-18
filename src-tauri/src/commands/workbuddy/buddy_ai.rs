@@ -579,13 +579,18 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     let body: Value = match resp {
         Ok(r) => r.into_json().unwrap_or_default(),
         Err(ureq::Error::Status(code, r)) => {
-            let _ = r;
             // §4.1：Intl 刷新失败按暂态处理，不标记 needs_relogin，仅落日志留痕
+            // issue #118：读错误响应体透传上游 error/error_description（如 invalid_grant 细节）
+            let msg = crate::tasks::wb_common::refresh_fail_msg(
+                code,
+                r,
+                &format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录或重新导入"),
+            );
             fs_utils::app_log(
                 &state.data_dir,
-                &format!("buddy-ai: 凭证续期失败（HTTP {code}）id={user_id}，按暂态处理不标记重登录"),
+                &format!("buddy-ai: 凭证续期失败 id={user_id}，{msg}，按暂态处理不标记重登录"),
             );
-            return Err(format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录或重新导入"));
+            return Err(msg);
         }
         Err(e) => {
             fs_utils::app_log(

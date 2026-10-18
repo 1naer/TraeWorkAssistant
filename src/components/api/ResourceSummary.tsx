@@ -21,6 +21,7 @@ import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { fmtCredits } from '../../lib/format';
+import { isPoolVisible } from '../../lib/appVisibility';
 import { DISPATCH_PRESETS, matchPreset } from './dispatchPresets';
 import { computePoolMetrics } from './poolMetrics';
 import type {
@@ -68,18 +69,16 @@ const selectCls =
 const inputCls =
   'h-7 w-44 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none placeholder:text-slate-300 focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
 
-/** 池间候选序全集（优先级编辑补尾展示 + per_model 排列生成用） */
+/** 池间候选序全集（优先级编辑补尾与沉尾写回用全量；可见池排列的候选序在组件内按可见性动态派生） */
 const POOL_KEYS = ['buddy', 'trae', 'qoder', 'buddy-ai'];
 
-/** 全排列（per_model 候选序选项：四池 24 种，覆盖全部合法顺序） */
+/** 全排列（per_model 候选序选项：n 池 n! 种，覆盖全部合法顺序） */
 function permutations(arr: string[]): string[][] {
   if (arr.length <= 1) return [arr];
   return arr.flatMap((item, i) =>
     permutations([...arr.slice(0, i), ...arr.slice(i + 1)]).map((rest) => [item, ...rest]),
   );
 }
-
-const POOL_ORDERS = permutations(POOL_KEYS).map((arr) => arr.join('>'));
 
 const orderKey = (arr: string[]) => arr.join('>');
 
@@ -101,11 +100,12 @@ function DispatchCenterCard({
   onPoolChanged: (p: ApiPoolFile) => void;
 }) {
   const toast = useAppStore((s) => s.pushToast);
+  const settings = useAppStore((s) => s.settings);
   const [policy, setPolicy] = useState<DispatchPolicy | null>(null);
   const [saving, setSaving] = useState(false);
-  // per_model 新增绑定行（本地输入态，添加时才落 policy）
+  // per_model 新增绑定行（本地输入态，添加时才落 policy；实际生效值见 newOrderEff 派生）
   const [newPerModelName, setNewPerModelName] = useState('');
-  const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
+  const [newPerModelOrder, setNewPerModelOrder] = useState('');
   // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），
   // onBlur 才落盘。审查 F14 修复：改存原始字符串——旧实现 Number('')=0 使「清空
   // 重输」直接跳 0，误失焦即静默保存 0（=关闭调度保护）；现空串/非法输入失焦时
@@ -125,6 +125,15 @@ function DispatchCenterCard({
 
   /** 当前组合命中的预设（匹配规则见 dispatchPresets.matchPreset） */
   const activePreset = useMemo(() => matchPreset(pool, policy), [pool, policy]);
+
+  /** 可见资源池（系统设置「应用显示」联动；custom 池恒可见但不参与池间候选序）。
+   *  复审修复：按组件既有 POOL_KEYS 顺序派生（而非 lib 的 POOL_APPS 顺序）——
+   *  全池可见时保持原 POOL_ORDERS[0] 默认预选序 buddy>trae>qoder>buddy-ai 不变 */
+  const visiblePools = useMemo(() => POOL_KEYS.filter((p) => isPoolVisible(settings, p)), [settings]);
+  /** 可见池全排列（per_model 候选序基座；四池全隐藏时为空 → 新增绑定禁用，存量绑定保留原文展示） */
+  const poolOrders = useMemo(() => permutations(visiblePools).map((a) => a.join('>')), [visiblePools]);
+  // 可见性变化后旧默认序不再在候选内时回落首个可见序（四池全隐藏时为空串 = 禁用新增绑定）
+  const newOrderEff = poolOrders.includes(newPerModelOrder) ? newPerModelOrder : (poolOrders[0] ?? '');
 
   /** 统一保存入口：inter 走 dispatch_policy_set；trae/buddy/qoder/buddyAi 走 pool_set（未传维度保留原值） */
   const save = async (patch: {
@@ -182,14 +191,21 @@ function DispatchCenterCard({
     return [...policy.priority, ...POOL_KEYS.filter((p) => !policy.priority.includes(p))];
   }, [policy]);
 
-  /** 优先级数组内移动（priority 模式编辑；作用于补齐后的全集） */
+  /** 优先级可见子序列（隐藏池不参与编辑展示；仅用于 chips 渲染与 move 计算） */
+  const visiblePriority = useMemo(
+    () => priorityFull.filter((p) => isPoolVisible(settings, p)),
+    [priorityFull, settings],
+  );
+
+  /** 优先级数组内移动（priority 模式编辑；在可见子序列上交换，隐藏池按原相对序沉尾写回全集） */
   const move = (i: number, dir: -1 | 1) => {
     if (!policy) return;
-    const next = priorityFull.slice();
     const j = i + dir;
-    if (j < 0 || j >= next.length) return;
-    [next[i], next[j]] = [next[j], next[i]];
-    void savePolicy({ priority: next });
+    if (j < 0 || j >= visiblePriority.length) return;
+    const nextVisible = visiblePriority.slice();
+    [nextVisible[i], nextVisible[j]] = [nextVisible[j], nextVisible[i]];
+    const hidden = priorityFull.filter((p) => !nextVisible.includes(p));
+    void savePolicy({ priority: [...nextVisible, ...hidden] });
   };
 
   const savePolicy = async (patch: Partial<DispatchPolicy>) => {
@@ -287,30 +303,36 @@ function DispatchCenterCard({
           {policy.strategy === 'priority' && (
             <div className="flex items-center gap-1.5">
               <span className="text-slate-400 dark:text-zinc-500">优先级</span>
-              {priorityFull.map((p, i) => (
-                <span
-                  key={p}
-                  className="flex items-center gap-0.5 rounded-full border border-slate-200 py-0.5 pl-2 pr-0.5 dark:border-zinc-700"
-                >
-                  {POOL_LABELS[p] ?? p}
-                  <button
-                    className="rounded p-0.5 text-slate-400 hover:text-brand-500 disabled:opacity-30"
-                    disabled={i === 0}
-                    onClick={() => move(i, -1)}
-                    title="上移"
-                  >
-                    <ArrowUp size={11} />
-                  </button>
-                  <button
-                    className="rounded p-0.5 text-slate-400 hover:text-brand-500 disabled:opacity-30"
-                    disabled={i === priorityFull.length - 1}
-                    onClick={() => move(i, 1)}
-                    title="下移"
-                  >
-                    <ArrowDown size={11} />
-                  </button>
+              {visiblePriority.length === 0 ? (
+                <span className="text-[11px] text-amber-600 dark:text-amber-400">
+                  当前无可见资源池，优先级编辑不可用（存量配置保留生效）
                 </span>
-              ))}
+              ) : (
+                visiblePriority.map((p, i) => (
+                  <span
+                    key={p}
+                    className="flex items-center gap-0.5 rounded-full border border-slate-200 py-0.5 pl-2 pr-0.5 dark:border-zinc-700"
+                  >
+                    {POOL_LABELS[p] ?? p}
+                    <button
+                      className="rounded p-0.5 text-slate-400 hover:text-brand-500 disabled:opacity-30"
+                      disabled={i === 0}
+                      onClick={() => move(i, -1)}
+                      title="上移"
+                    >
+                      <ArrowUp size={11} />
+                    </button>
+                    <button
+                      className="rounded p-0.5 text-slate-400 hover:text-brand-500 disabled:opacity-30"
+                      disabled={i === visiblePriority.length - 1}
+                      onClick={() => move(i, 1)}
+                      title="下移"
+                    >
+                      <ArrowDown size={11} />
+                    </button>
+                  </span>
+                ))
+              )}
             </div>
           )}
           <label className="flex items-center gap-1.5 text-slate-500 dark:text-zinc-400">
@@ -378,6 +400,11 @@ function DispatchCenterCard({
           <div className="mb-1.5 text-[11px] font-medium text-slate-500 dark:text-zinc-400">
             模型绑定池（可选：为单个模型固定池候选序，优先于上方全局策略）
           </div>
+          {poolOrders.length === 0 && (
+            <p className="mb-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+              当前无可见资源池：新增绑定不可用，存量绑定按原候选序保留展示。
+            </p>
+          )}
           {Object.keys(policy.per_model).length === 0 ? (
             <p className="text-[11px] text-slate-400 dark:text-zinc-500">
               暂无绑定，全部模型按上方全局策略调度。
@@ -400,12 +427,12 @@ function DispatchCenterCard({
                       void savePolicy({ per_model: next });
                     }}
                   >
-                    {POOL_ORDERS.map((k) => (
+                    {poolOrders.map((k) => (
                       <option key={k} value={k}>
                         {orderLabel(k)}
                       </option>
                     ))}
-                    {!POOL_ORDERS.includes(orderKey(order)) && (
+                    {!poolOrders.includes(orderKey(order)) && (
                       <option value={orderKey(order)}>{orderKey(order)}（自定义）</option>
                     )}
                   </select>
@@ -434,10 +461,11 @@ function DispatchCenterCard({
             />
             <select
               className={selectCls}
-              value={newPerModelOrder}
+              value={newOrderEff}
+              disabled={poolOrders.length === 0}
               onChange={(e) => setNewPerModelOrder(e.target.value)}
             >
-              {POOL_ORDERS.map((k) => (
+              {poolOrders.map((k) => (
                 <option key={k} value={k}>
                   {orderLabel(k)}
                 </option>
@@ -445,12 +473,12 @@ function DispatchCenterCard({
             </select>
             <button
               className="h-7 rounded-md border border-slate-200 px-2.5 text-xs text-slate-600 transition-colors hover:border-brand-300 hover:text-brand-600 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
-              disabled={!newPerModelName.trim() || saving || Boolean(policy.per_model[newPerModelName.trim()])}
-              title={policy.per_model[newPerModelName.trim()] ? '该模型已绑定' : '添加绑定'}
+              disabled={!newPerModelName.trim() || !newOrderEff || saving || Boolean(policy.per_model[newPerModelName.trim()])}
+              title={!newOrderEff ? '当前无可见资源池，无法新增绑定' : policy.per_model[newPerModelName.trim()] ? '该模型已绑定' : '添加绑定'}
               onClick={() => {
                 const model = newPerModelName.trim();
-                if (!model || policy.per_model[model]) return;
-                const next = { ...policy.per_model, [model]: newPerModelOrder.split('>') };
+                if (!model || !newOrderEff || policy.per_model[model]) return;
+                const next = { ...policy.per_model, [model]: newOrderEff.split('>') };
                 void savePolicy({ per_model: next });
                 setNewPerModelName('');
               }}
@@ -467,70 +495,78 @@ function DispatchCenterCard({
           各资源池池内调度（账号取号顺序；成员与分组在各应用「资源调度」页维护）
         </div>
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
-          <label className="flex items-center gap-2">
-            <span className="text-slate-400 dark:text-zinc-500">Trae 池</span>
-            <select
-              className={selectCls}
-              value={pool?.strategy || 'expire_first'}
-              disabled={!pool || saving}
-              onChange={(e) => void save({ trae: e.target.value })}
-            >
-              {STRATEGIES.map((s) => (
-                <option key={s} value={s}>
-                  {STRATEGY_LABELS[s]}
-                  {s === 'expire_first' ? '（默认）' : ''}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="text-slate-400 dark:text-zinc-500">Buddy 池</span>
-            <select
-              className={selectCls}
-              value={pool?.wb_strategy ?? ''}
-              disabled={!pool || saving}
-              onChange={(e) => void save({ buddy: e.target.value })}
-            >
-              <option value="">跟随 Trae 池</option>
-              {STRATEGIES.map((s) => (
-                <option key={s} value={s}>
-                  {STRATEGY_LABELS[s]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="text-slate-400 dark:text-zinc-500">Qoder 池</span>
-            <select
-              className={selectCls}
-              value={pool?.qoder_strategy ?? ''}
-              disabled={!pool || saving}
-              onChange={(e) => void save({ qoder: e.target.value })}
-            >
-              <option value="">跟随 Trae 池</option>
-              {STRATEGIES.map((s) => (
-                <option key={s} value={s}>
-                  {STRATEGY_LABELS[s]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="text-slate-400 dark:text-zinc-500">BuddyAI 国际池</span>
-            <select
-              className={selectCls}
-              value={pool?.buddy_ai_strategy ?? ''}
-              disabled={!pool || saving}
-              onChange={(e) => void save({ buddyAi: e.target.value })}
-            >
-              <option value="">跟随 Trae 池</option>
-              {STRATEGIES.map((s) => (
-                <option key={s} value={s}>
-                  {STRATEGY_LABELS[s]}
-                </option>
-              ))}
-            </select>
-          </label>
+          {isPoolVisible(settings, 'trae') && (
+            <label className="flex items-center gap-2">
+              <span className="text-slate-400 dark:text-zinc-500">Trae 池</span>
+              <select
+                className={selectCls}
+                value={pool?.strategy || 'expire_first'}
+                disabled={!pool || saving}
+                onChange={(e) => void save({ trae: e.target.value })}
+              >
+                {STRATEGIES.map((s) => (
+                  <option key={s} value={s}>
+                    {STRATEGY_LABELS[s]}
+                    {s === 'expire_first' ? '（默认）' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {isPoolVisible(settings, 'buddy') && (
+            <label className="flex items-center gap-2">
+              <span className="text-slate-400 dark:text-zinc-500">Buddy 池</span>
+              <select
+                className={selectCls}
+                value={pool?.wb_strategy ?? ''}
+                disabled={!pool || saving}
+                onChange={(e) => void save({ buddy: e.target.value })}
+              >
+                <option value="">跟随 Trae 池</option>
+                {STRATEGIES.map((s) => (
+                  <option key={s} value={s}>
+                    {STRATEGY_LABELS[s]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {isPoolVisible(settings, 'qoder') && (
+            <label className="flex items-center gap-2">
+              <span className="text-slate-400 dark:text-zinc-500">Qoder 池</span>
+              <select
+                className={selectCls}
+                value={pool?.qoder_strategy ?? ''}
+                disabled={!pool || saving}
+                onChange={(e) => void save({ qoder: e.target.value })}
+              >
+                <option value="">跟随 Trae 池</option>
+                {STRATEGIES.map((s) => (
+                  <option key={s} value={s}>
+                    {STRATEGY_LABELS[s]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {isPoolVisible(settings, 'buddy-ai') && (
+            <label className="flex items-center gap-2">
+              <span className="text-slate-400 dark:text-zinc-500">BuddyAI 国际池</span>
+              <select
+                className={selectCls}
+                value={pool?.buddy_ai_strategy ?? ''}
+                disabled={!pool || saving}
+                onChange={(e) => void save({ buddyAi: e.target.value })}
+              >
+                <option value="">跟随 Trae 池</option>
+                {STRATEGIES.map((s) => (
+                  <option key={s} value={s}>
+                    {STRATEGY_LABELS[s]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <span className="text-slate-400 dark:text-zinc-500">
             自定义模型：<span className="text-slate-700 dark:text-zinc-200">命中即直达</span>（上游自有计费，无池内调度）
           </span>
@@ -544,6 +580,7 @@ function DispatchCenterCard({
 }
 
 export default function ResourceSummary() {
+  const settings = useAppStore((s) => s.settings);
   const [pool, setPool] = useState<ApiPoolFile | null>(null);
   const [accounts, setAccounts] = useState<AccountView[]>([]);
   const [wbAccounts, setWbAccounts] = useState<WorkBuddyAccountView[]>([]);
@@ -637,7 +674,8 @@ export default function ResourceSummary() {
 
       {/* 五池摘要卡（Trae / Buddy / Qoder / BuddyAI 国际 / 自定义）：两行一行三个，自适应宽度 */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-      {/* Trae 资源池摘要 */}
+      {/* Trae 资源池摘要（应用隐藏时不渲染，数据照常统计） */}
+      {isPoolVisible(settings, 'trae') && (
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Server size={16} className="text-brand-500" />
@@ -676,8 +714,10 @@ export default function ResourceSummary() {
           详情（账号池选择 / 分组筛选 / 模型目录）见 Trae「资源调度」页
         </p>
       </div>
+      )}
 
-      {/* Buddy 资源池摘要 */}
+      {/* Buddy 资源池摘要（应用隐藏时不渲染，数据照常统计） */}
+      {isPoolVisible(settings, 'buddy') && (
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Bot size={16} className="text-violet-500" />
@@ -713,8 +753,10 @@ export default function ResourceSummary() {
           详情（上游开关 / 模型目录 / 账号池）见 Buddy「资源调度」页
         </p>
       </div>
+      )}
 
-      {/* Qoder 资源池摘要 */}
+      {/* Qoder 资源池摘要（应用隐藏时不渲染，数据照常统计） */}
+      {isPoolVisible(settings, 'qoder') && (
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Boxes size={16} className="text-emerald-500" />
@@ -750,8 +792,10 @@ export default function ResourceSummary() {
           详情（上游开关 / 模型目录 / 账号清单）见 Qoder「资源调度」页
         </p>
       </div>
+      )}
 
-      {/* BuddyAI 国际资源池摘要 */}
+      {/* BuddyAI 国际资源池摘要（应用隐藏时不渲染，数据照常统计） */}
+      {isPoolVisible(settings, 'buddy-ai') && (
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Globe size={16} className="text-cyan-500" />
@@ -787,8 +831,9 @@ export default function ResourceSummary() {
           详情（上游开关 / 模型目录 / 账号池）见 BuddyAI 国际「资源调度」页
         </p>
       </div>
+      )}
 
-      {/* 自定义模型池摘要 */}
+      {/* 自定义模型池摘要（恒可见） */}
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Blocks size={16} className="text-sky-500" />

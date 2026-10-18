@@ -258,18 +258,20 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             user_data_dir: format!("{home}\\.workbuddy"),
             settings_key: Some("workbuddy_path"),
         },
-        // WorkBuddy AI 国际版客户端（buddy-ai 独立应用顶栏/环境配置专用档案，P1 审查修复）：
-        // 与国内 WorkBuddy 是不同安装目录（用户实测 2026-10-15：
-        // %LOCALAPPDATA%\Programs\WorkBuddyAI），exe 名未知官方定式，候选覆盖三种形态；
-        // 注册表模式串收窄为 "WorkBuddyAI"/"WorkBuddy AI"，避免误匹配国内 "WorkBuddy" 卸载项
+        // WorkBuddy AI 国际版客户端（buddy-ai 独立应用顶栏/环境配置专用档案，P1 审查修复）。
+        // 2026-10-17 并存实测：国际版安装器与国内共用 %LOCALAPPDATA%\Programs\WorkBuddy\，
+        // 以独立 exe 名 WorkBuddyAI.exe 区分（未落 WorkBuddyAI\ 独立目录）——候选表
+        // 独立目录形态在前（标准布局优先），共享目录并存路径兜底；reg_exe_names 剔除
+        // 国内 "WorkBuddy.exe" 防注册表/回查串台；注册表模式串收窄为 "WorkBuddyAI"/
+        // "WorkBuddy AI"，避免误匹配国内 "WorkBuddy" 卸载项
         "workbuddy_ai" => AppProfile {
             display: "WorkBuddy AI",
             reg_patterns: &["WorkBuddyAI", "WorkBuddy AI"],
-            reg_exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe", "WorkBuddy.exe"],
+            reg_exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe"],
             exe_candidates: &[
                 "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe",
                 "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddy AI.exe",
-                "%LOCALAPPDATA%\\Programs\\WorkBuddyAI\\WorkBuddy.exe",
+                "%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddyAI.exe",
             ],
             proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
             user_data_dir: format!("{home}\\.workbuddy-ai"),
@@ -628,6 +630,7 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
             let mut icon: Option<String> = None;
             let mut loc: Option<String> = None;
             let mut name_ok = false;
+            let mut cur_key: Option<String> = None;
             for line in s.lines() {
                 let line = line.trim();
                 if line.starts_with("HKEY_") {
@@ -635,10 +638,20 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
                         if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
                             return Some(hit);
                         }
+                        // reg query /f 输出只含匹配值行（2026-10-17 实测：DisplayName
+                        // 命中时同键的 DisplayIcon/InstallLocation 往往不在 /f 输出），
+                        // 按键路径回查该键全部值再解析一次
+                        if let Some(k) = cur_key.as_deref() {
+                            let (i2, l2) = reg_query_key_values(k);
+                            if let Some(hit) = resolve_reg_profile_candidate(&i2, &l2, profile) {
+                                return Some(hit);
+                            }
+                        }
                     }
                     icon = None;
                     loc = None;
                     name_ok = false;
+                    cur_key = Some(line.to_string());
                     continue;
                 }
                 if let Some(v) = line.strip_prefix("DisplayName") {
@@ -661,6 +674,12 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
                 if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
                     return Some(hit);
                 }
+                if let Some(k) = cur_key.as_deref() {
+                    let (i2, l2) = reg_query_key_values(k);
+                    if let Some(hit) = resolve_reg_profile_candidate(&i2, &l2, profile) {
+                        return Some(hit);
+                    }
+                }
             }
         }
     }
@@ -676,7 +695,21 @@ fn resolve_reg_profile_candidate(
     if let Some(icon) = icon {
         // DisplayIcon 可能带 ",0" 图标索引后缀
         let clean = icon.split(',').next().unwrap_or(icon).trim().to_string();
-        if clean.to_lowercase().ends_with(".exe") && std::path::Path::new(&clean).is_file() {
+        // icon 文件名须精确命中档案白名单：国内档案 reg_patterns 含 "WorkBuddy"
+        // 会 contains 匹配国际键 "WorkBuddyAI (User)"，无白名单则其 DisplayIcon
+        // （WorkBuddyAI.exe）被国内档案误收，注册表级串台
+        let fname_ok = std::path::Path::new(&clean)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|f| {
+                let f = f.to_lowercase();
+                profile.reg_exe_names.iter().any(|n| n.to_lowercase() == f)
+            })
+            .unwrap_or(false);
+        if fname_ok
+            && clean.to_lowercase().ends_with(".exe")
+            && std::path::Path::new(&clean).is_file()
+        {
             return Some(clean);
         }
     }
@@ -689,6 +722,33 @@ fn resolve_reg_profile_candidate(
         }
     }
     None
+}
+
+/// 按键路径回查单个卸载键的全部值（DisplayIcon / InstallLocation）。
+/// `reg query <key>`（无 /f）输出该键所有值行；失败静默返回空。
+fn reg_query_key_values(key: &str) -> (Option<String>, Option<String>) {
+    let Ok(out) = Command::new("reg")
+        .args(["query", key])
+        .creation_flags(0x08000000)
+        .output()
+    else {
+        return (None, None);
+    };
+    let mut icon = None;
+    let mut loc = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("DisplayIcon") {
+            if let Some(val) = v.split("REG_SZ").nth(1) {
+                icon = Some(val.trim().to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("InstallLocation") {
+            if let Some(val) = v.split("REG_SZ").nth(1) {
+                loc = Some(val.trim().to_string());
+            }
+        }
+    }
+    (icon, loc)
 }
 
 /// 运行进程反查 exe 路径（应用运行中时最准）：精确映像名匹配，取首个带路径的进程。

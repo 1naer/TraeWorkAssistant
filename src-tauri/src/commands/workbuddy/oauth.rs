@@ -1,11 +1,14 @@
 //! WorkBuddy M7 生态接入 · OAuth 扫码登录（F-50，§3.10）（原 workbuddy.rs 机械拆分）。
 //!
 //! 流程（无 PKCE，state 服务端签发；对齐已验证的 workbuddy2api/官方插件实现）：
-//!   ① POST https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI → state + authUrl
-//!      （API 上游在 copilot.tencent.com，不在 www.codebuddy.cn；UA 模拟官方 CLI
-//!       `CLI/2.x CodeBuddy/2.x`，Origin/Referer 指向 www.codebuddy.cn）
+//!   ① POST https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy → state + authUrl
+//!      （API 上游在 copilot.tencent.com，不在 www.codebuddy.cn；UA 三段式
+//!       `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`，Origin/Referer 指向 www.codebuddy.cn。
+//!       2026-10-18 实测：platform=workbuddy + WorkBuddy 桌面 UA 两者同时满足，服务端才返回
+//!       www.workbuddy.cn/login 新登录页）
 //!   ② 系统浏览器打开 authUrl（服务端 URL 原样优先；缺失或缺 state 凭证参数时按
-//!      已验证形态 `copilot.tencent.com/login?platform=CLI&state=<state>` 构造，绝不打开裸链接）
+//!      REGION_CN 当前形态 `www.workbuddy.cn/login?platform=workbuddy&state=<state>&version=5.8.3`
+//!      构造，绝不打开裸链接）
 //!   ③ GET /v2/plugin/auth/token?state= 轮询（≤300s，间隔 3s）
 //!   ④ GET /v2/plugin/login/account?state= 带 Bearer 取 uid/nickname → 自动入池 + 凭证回写 token store
 //! 每流程独立 cookie jar（手工捕获 Set-Cookie 回传，不引新依赖）；凭证零明文输出（不进日志/事件/UI）。
@@ -100,8 +103,9 @@ fn find_state_credential(body: &serde_json::Value) -> Option<(&'static str, Stri
 /// ① 候选字段链取第一个 http(s):// 开头且 query 已含 `state` 凭证参数的 authUrl **原样打开**
 ///    （参考实现 `fmt.Println(st.AuthURL)` 同款：服务端 URL 从不追加参数）；
 /// ② URL 缺失 / 非 http(s) / query 缺 state（上一轮故障形态：错误上游只回裸登录页链接）
-///    → 按已验证形态构造 `copilot.tencent.com/login?platform=CLI&state=<state>`
-///    （antigravity-tools 卡密登录链接同款拼法；workbuddy-switch 缺 authUrl 时亦按此回退），
+///    → 按区域配置构造 `{login_base}/login?platform={platform}&state=<state>[&version=]`
+///    （CN 当前为 `www.workbuddy.cn/login?platform=workbuddy&state=<state>&version=5.8.3`；
+///    antigravity-tools 卡密登录链接同款拼法），
 ///    绝不原样打开缺 state 的登录页链接，也绝不回退裸基础域 URL。
 fn resolve_auth_url(
     body: &serde_json::Value,
@@ -122,8 +126,8 @@ fn resolve_auth_url(
                 .filter(|v| auth_url_query_has_key(v, "state"))
         })
         .unwrap_or_else(|| {
-            // 回退构造（CN：`copilot.tencent.com/login?platform=CLI&state=<state>` 原形态；
-            // Intl：R-1 实测官方带 version 参数，对齐带上）
+            // 回退构造（CN：`www.workbuddy.cn/login?platform=workbuddy&state=<state>&version=5.8.3`，
+            // 与官方桌面端 5.8.3 打开形态一致；Intl：R-1 实测官方带 version 参数，对齐带上）
             let mut link = format!("{}/login?platform={}&state={}", ep.login_base, ep.platform, state_id);
             if !ep.client_version.is_empty() {
                 link.push_str(&format!("&version={}", ep.client_version));
@@ -227,7 +231,8 @@ pub(super) fn oauth_flow(
     // www.codebuddy.cn 会拿到与 CLI 登录流程不匹配的裸登录链接）；Intl = www.workbuddy.ai（R-1）
     let base = ep.auth_base;
     let web_origin = ep.web_origin;
-    // UA/头模拟官方客户端（CN = CLI 2.63.2 / Intl = WorkBuddy 桌面端身份，R-3 附录 A）；
+    // UA/头模拟官方客户端（CN/Intl 均为 WorkBuddy 桌面端身份——CN 5.8.3 / Intl 5.7.6，
+    // 2026-10-18 实测 CN 需 platform=workbuddy + 桌面 UA 双满足才返回新登录页）；
     // 自造 UA 可能被服务端降级处理
     let client_ua = ep.ua;
     let intl = ep.platform == "workbuddy-ai";
@@ -553,36 +558,36 @@ mod oauth_tests {
         );
     }
 
-    /// ② 故障现场形态（参考得出的关键形态）：服务端只回裸登录页链接（query 缺 state）
-    ///    → 不原样打开、也不给裸链接补参，按已验证卡密形态构造
-    ///    `copilot/login?platform=CLI&state=<state>`（antigravity-tools 卡密同款拼法）
+    /// ② 故障现场形态：服务端只回裸登录页链接（query 缺 state）
+    ///    → 不原样打开、也不给裸链接补参，按 REGION_CN 当前配置构造
+    ///    `www.workbuddy.cn/login?platform=workbuddy&state=<state>&version=5.8.3`
     #[test]
     fn resolve_auth_url_bare_url_replaced_by_canonical_login_link() {
         let body = oauth_body(r#"{"state":"st-123","url":"https://www.codebuddy.cn/login?platform=CLI"}"#);
         assert_eq!(
             resolve_cn(&body, "st-123").unwrap(),
-            "https://copilot.tencent.com/login?platform=CLI&state=st-123"
+            "https://www.workbuddy.cn/login?platform=workbuddy&state=st-123&version=5.8.3"
         );
         let wrapped = oauth_body(r#"{"data":{"authState":"AB-9","authUrl":"https://cb.cn/login"}}"#);
         assert_eq!(
             resolve_cn(&wrapped, "AB-9").unwrap(),
-            "https://copilot.tencent.com/login?platform=CLI&state=AB-9"
+            "https://www.workbuddy.cn/login?platform=workbuddy&state=AB-9&version=5.8.3"
         );
         assert_eq!(find_state_credential(&wrapped).map(|(_, v)| v), Some("AB-9".to_string()));
     }
 
-    /// ③ URL 字段缺失 / 非 http(s) → 用 state 构造同款链接（workbuddy-switch 回退同款）；
+    /// ③ URL 字段缺失 / 非 http(s) → 用 state 构造 REGION_CN 回退链接；
     ///    state 缺失/为空 → 明确报错，绝不打开无 state 的链接
     #[test]
     fn resolve_auth_url_missing_or_invalid_errors() {
         assert_eq!(
             resolve_cn(&oauth_body(r#"{"state":"s1"}"#), "s1").unwrap(),
-            "https://copilot.tencent.com/login?platform=CLI&state=s1"
+            "https://www.workbuddy.cn/login?platform=workbuddy&state=s1&version=5.8.3"
         );
         // 非法 authUrl（javascript:）视同缺失 → 构造，绝不打开
         assert_eq!(
             resolve_cn(&oauth_body(r#"{"authUrl":"javascript:alert(1)","state":"s1"}"#), "s1").unwrap(),
-            "https://copilot.tencent.com/login?platform=CLI&state=s1"
+            "https://www.workbuddy.cn/login?platform=workbuddy&state=s1&version=5.8.3"
         );
         // 入参 state 为空（响应亦无 state 字段可兜底）→ 报错
         assert!(resolve_cn(&oauth_body(r#"{"authUrl":"https://cb.cn/login?state=x"}"#), "").is_err());

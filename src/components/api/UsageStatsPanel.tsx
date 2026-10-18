@@ -24,6 +24,8 @@ import { StatCard } from '../ui';
 import { api } from '../../lib/tauri';
 import { fmtTokens } from '../../lib/format';
 import { cn } from '../../lib/cn';
+import { useAppStore } from '../../store';
+import { isPoolVisible } from '../../lib/appVisibility';
 import type { UsageCounterView, UsageDayView, UsageKeyTokenView, UsageModelLatencyView } from '../../types';
 
 /** 资源池筛选（§5.2：全部/Trae/Buddy/BuddyAI 国际/Qoder/自定义模型） */
@@ -192,15 +194,20 @@ export default function UsageStatsPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [days]);
 
-  // 按筛选聚合多桶（"全部"时相加，§8.2）
+  // 按筛选聚合多桶（"全部"时相加，§8.2）。
+  // 应用显隐联动：当前筛选对应的应用被隐藏时回落"全部"（派生值，无额外 effect）；
+  // 落盘用量照常统计，隐藏池数据仍计入"全部"聚合（账务数据不因 UI 隐藏消失）
+  const settings = useAppStore((s) => s.settings);
+  const effFilter: PoolFilter =
+    filter !== 'all' && filter !== 'custom' && !isPoolVisible(settings, filter) ? 'all' : filter;
   const usage = useMemo(() => {
-    if (filter === 'trae') return traeUsage;
-    if (filter === 'buddy') return buddyUsage;
-    if (filter === 'buddy-ai') return buddyAiUsage;
-    if (filter === 'qoder') return qoderUsage;
-    if (filter === 'custom') return customUsage;
+    if (effFilter === 'trae') return traeUsage;
+    if (effFilter === 'buddy') return buddyUsage;
+    if (effFilter === 'buddy-ai') return buddyAiUsage;
+    if (effFilter === 'qoder') return qoderUsage;
+    if (effFilter === 'custom') return customUsage;
     return mergeBuckets(traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage);
-  }, [filter, traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage]);
+  }, [effFilter, traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage]);
 
   // 汇总（跨天聚合）+ 图表数据（与原页面统计逻辑一致，纯搬移）
   const summary = useMemo(() => {
@@ -272,12 +279,19 @@ export default function UsageStatsPanel() {
     [usage],
   );
 
+  // 可见池筛选按钮（custom 恒可见；隐藏应用的池筛选项隐藏）与聚合提示文案
+  const visibleFilters = (Object.keys(FILTER_LABELS) as PoolFilter[]).filter(
+    (f) => f === 'all' || f === 'custom' || isPoolVisible(settings, f),
+  );
+  const poolHintLabels = (['trae', 'buddy', 'buddy-ai', 'qoder'] as const)
+    .filter((f) => isPoolVisible(settings, f))
+    .map((f) => FILTER_LABELS[f]);
   const filterHint =
-    filter === 'all'
-      ? 'Trae + Buddy + BuddyAI + Qoder + 自定义 五桶聚合'
-      : filter === 'custom'
+    effFilter === 'all'
+      ? `${[...poolHintLabels, '自定义'].join(' + ')} 聚合`
+      : effFilter === 'custom'
         ? '仅自定义模型桶'
-        : `仅 ${FILTER_LABELS[filter]} 桶`;
+        : `仅 ${FILTER_LABELS[effFilter]} 桶`;
 
   return (
     <div className="card p-4">
@@ -303,12 +317,12 @@ export default function UsageStatsPanel() {
             </button>
           ))}
           <span className="mx-1 text-slate-300 dark:text-zinc-700">|</span>
-          {(Object.keys(FILTER_LABELS) as PoolFilter[]).map((f) => (
+          {visibleFilters.map((f) => (
             <button
               key={f}
               className={
                 'rounded-md px-2 py-1 text-xs transition ' +
-                (filter === f
+                (effFilter === f
                   ? 'bg-brand-500/10 font-medium text-brand-600 dark:text-brand-400'
                   : 'text-slate-500 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800')
               }
@@ -395,7 +409,7 @@ export default function UsageStatsPanel() {
       {summary.topModels.length > 0 && (
         <div className="mt-4">
           <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
-            模型分布（近 {days} 天 Top 5 · {FILTER_LABELS[filter]}）
+            模型分布（近 {days} 天 Top 5 · {FILTER_LABELS[effFilter]}）
           </p>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">

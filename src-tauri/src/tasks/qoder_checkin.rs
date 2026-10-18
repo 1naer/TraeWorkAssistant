@@ -805,14 +805,18 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind:
 /// 盲发失败的人类可读原因（known_daily_fallback Failed 分支消息构造）。
 /// 已探针锁定的形态给可操作提示，其余保留 HTTP 码 + 原始响应前缀（截 120
 /// 字符，与旧格式一致）供排障：
-/// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误），
-///   提示到真实客户端建立设备信任
+/// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误）。
+///   归因是工具盲发携带的每账号指纹未获服务端信任分桶——旧文案「在客户端
+///   登录一次」无效：客户端登录建立的是客户端原生指纹的信任，与工具盲发
+///   指纹不一致（issue #119）。有效路径：先在工具内切换到该账号（切换器会把
+///   该账号指纹同步为本机 machineid/storage.json/state.vscdb），再开客户端
+///   正常使用一次，使服务端为该指纹建立信任，然后回工具重试
 /// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
 /// - 409/CAMPAIGN_NOT_ACTIVE：候选 campaignId 过期（活动批次轮换，issue #66），
 ///   重学习机制（主列表 + 最小头补学）将自动补正
 fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
     if claimed == Some("BLOCKED") {
-        return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——请在 Qoder 客户端正常登录/使用一次建立设备信任后重试".into();
+        return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——该账号设备指纹未建立服务端信任：请在工具内切换到该账号（切换会把该账号指纹同步到本机），再打开 Qoder 客户端正常使用一次建立信任，然后重试".into();
     }
     if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
         return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试".into();

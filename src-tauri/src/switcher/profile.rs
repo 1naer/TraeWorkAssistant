@@ -172,7 +172,10 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // CodeBuddy 从不回写共享 auth 文件（登录真源在自身 vscdb）——
             // 切/存 WorkBuddy 不关停 CodeBuddy，两端完全独立（ProcNames 仅本端）
             proc_names: &["WorkBuddy"],
-            proc_patterns: &["WorkBuddy*"],
+            // 审查修复（2026-10-17 双客户端并存实测）："WorkBuddy*" 通配会命中国际版
+            // WorkBuddyAI.exe——第 5 级 exe 发现/进程列表会把国际进程误认作国内在跑；
+            // 收窄为本名精确 glob（与 proc_names 精确组语义对齐）
+            proc_patterns: &["WorkBuddy.exe"],
             exe_names: &["WorkBuddy.exe"],
             lnk_patterns: &["*WorkBuddy*"],
             reg_patterns: &["*WorkBuddy*"],
@@ -320,13 +323,20 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             graceful_wait_secs: 5,
             proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
             proc_patterns: &["WorkBuddyAI*", "WorkBuddy AI*"],
-            exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe", "WorkBuddy.exe"],
+            // 审查修复（2026-10-17 并存实测）：白名单剔除国内专属 "WorkBuddy.exe"——
+            // 留着会让 lnk/注册表级把国内 exe 误认成国际客户端（串台）
+            exe_names: &["WorkBuddyAI.exe", "WorkBuddy AI.exe"],
             lnk_patterns: &["*WorkBuddyAI*", "*WorkBuddy AI*"],
             reg_patterns: &["WorkBuddyAI", "WorkBuddy AI"],
+            // 2026-10-17 并存实测：国际版安装器未落 WorkBuddyAI\ 独立目录，而是与国内
+            // 共用 Programs\WorkBuddy\（以独立 exe 名 WorkBuddyAI.exe 区分；原第三项
+            // "独立目录下 WorkBuddy.exe" 形态无实据且与国内 exe 撞名，删除）。
+            // 独立目录候选在前（标准布局优先），共享目录并存路径兜底（参照 CodeBuddy
+            // 档案双路径先例）——BuddyAI 环境配置「未检测到」即共享路径缺失所致
             exe_candidates: vec![
                 PathBuf::from(format!("{local}\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe")),
                 PathBuf::from(format!("{local}\\Programs\\WorkBuddyAI\\WorkBuddy AI.exe")),
-                PathBuf::from(format!("{local}\\Programs\\WorkBuddyAI\\WorkBuddy.exe")),
+                PathBuf::from(format!("{local}\\Programs\\WorkBuddy\\WorkBuddyAI.exe")),
             ],
             cb_global_storage_dir: None,
             icube_items: &[],
@@ -392,6 +402,21 @@ mod tests {
         assert_eq!(wb.layout, Layout::Authfile);
         assert_eq!(wb.graceful_wait_secs, 5);
         assert_eq!(wb.proc_names, &["WorkBuddy"]);
+        // 2026-10-17 双客户端并存实测：国内通配 "WorkBuddy*" 会误杀国际
+        // WorkBuddyAI.exe，proc_patterns 收窄为精确映像名
+        assert_eq!(wb.proc_patterns, &["WorkBuddy.exe"]);
+
+        // 2026-10-17 并存实测：国际 exe 与国内同装于 Programs\WorkBuddy\
+        // （独立 exe 名区分，未落 WorkBuddyAI\ 独立目录），候选表以独立
+        // 目录为标准布局、共享目录路径兜底
+        let wbai = profile_for(TargetApp::WorkBuddyAI, &data);
+        assert_eq!(wbai.proc_names, &["WorkBuddyAI", "WorkBuddy AI"]);
+        assert_eq!(wbai.exe_names, &["WorkBuddyAI.exe", "WorkBuddy AI.exe"]);
+        assert_eq!(wbai.exe_candidates.len(), 3);
+        assert!(wbai.exe_candidates.contains(&PathBuf::from(format!(
+            "{}\\Programs\\WorkBuddy\\WorkBuddyAI.exe",
+            std::env::var("LOCALAPPDATA").unwrap_or_default()
+        ))));
 
         let cb = profile_for(TargetApp::CodeBuddy, &data);
         assert_eq!(cb.proc_names, &["CodeBuddy", "CodeBuddy CN"]);

@@ -12,6 +12,7 @@ import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
+import { isPoolVisible } from '../../lib/appVisibility';
 import type { ApiKeyEntry, GroupView, PoolStatus, TagView, UsageDayView } from '../../types';
 
 /** issue #30 混合白名单：候选账号平台标记 */
@@ -47,6 +48,8 @@ export default function ApiKeysManager({
   onSubModalChange?: (open: boolean) => void;
 }) {
   const toast = useAppStore((s) => s.pushToast);
+  // 系统设置「应用显示」联动（隐藏不停功能：存量 Key 的隐藏池绑定/白名单仍可管理）
+  const settings = useAppStore((s) => s.settings);
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([]);
   const [authDisabled, setAuthDisabled] = useState(false);
   const [keysSaving, setKeysSaving] = useState(false);
@@ -162,6 +165,9 @@ export default function ApiKeysManager({
       toast('error', 'Key 值与现有条目重复');
       return;
     }
+    // 新增 Key 的资源池选择：选中池所属应用被隐藏时回落全局（新增不选隐藏池）
+    const effNewBindPool =
+      newBindPool === '' || isPoolVisible(settings, newBindPool) ? newBindPool : '';
     const entry: ApiKeyEntry = {
       id: crypto.randomUUID(),
       name,
@@ -174,7 +180,7 @@ export default function ApiKeysManager({
       allowed_accounts: [],
       schedule_mode: 'expire_first',
       dedicated_account: '',
-      bind_pool: newBindPool,
+      bind_pool: effNewBindPool,
       allowed_groups: [],
       allowed_tags: [],
       daily_stats: [],
@@ -473,6 +479,13 @@ export default function ApiKeysManager({
     [editBindPool],
   );
 
+  // 可见池名串（限定上游提示文案用；全部隐藏时兜底占位）
+  const visiblePoolsText =
+    (['trae', 'buddy', 'qoder', 'buddy-ai'] as CandidatePool[])
+      .filter((p) => isPoolVisible(settings, p))
+      .map((p) => POOL_TAG[p].label)
+      .join(' + ') || '无可见池';
+
   const switchBindPool = (p: string) => {
     if (p === editBindPool) return;
     setEditBindPool(p);
@@ -546,7 +559,8 @@ export default function ApiKeysManager({
               { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
               { key: 'buddy-ai', label: 'BuddyAI', title: '优先走 BuddyAI 国际池，异常可回退' },
               { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
-            ].map((p) => (
+              // 应用显隐联动：新增 Key 不提供隐藏应用的池选项
+            ].filter((p) => p.key === '' || isPoolVisible(settings, p.key)).map((p) => (
               <button
                 key={p.key}
                 className={`shrink-0 whitespace-nowrap rounded-lg border px-2 py-1.5 text-xs font-medium transition-colors ${
@@ -797,13 +811,20 @@ export default function ApiKeysManager({
                 { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
                 { key: 'buddy-ai', label: 'BuddyAI 池', desc: '优先走 BuddyAI，异常可回退' },
                 { key: 'qoder', label: 'Qoder 池', desc: '优先走 Qoder，异常可回退' },
+                // 应用显隐联动：保留全量按钮（存量 bind_pool 指向隐藏池时需有选中态），
+                // 隐藏池加「已隐藏」徽标——隐藏不停功能、不删数据
               ].map((p) => (
                 <button
                   key={p.key}
                   className={`flex-1 rounded-lg border p-2.5 text-left text-xs ${editBindPool === p.key ? 'border-indigo-400 bg-indigo-50 dark:bg-indigo-500/10' : 'border-slate-200 dark:border-zinc-700'}`}
                   onClick={() => switchBindPool(p.key)}
                 >
-                  <div className="font-medium">{p.label}</div>
+                  <div className="font-medium">
+                    {p.label}
+                    {p.key !== '' && !isPoolVisible(settings, p.key) && (
+                      <Badge tone="slate" className="ml-1 !px-1.5 !text-[10px]">已隐藏</Badge>
+                    )}
+                  </div>
                   <div className="mt-0.5 text-slate-400">{p.desc}</div>
                 </button>
               ))}
@@ -846,7 +867,7 @@ export default function ApiKeysManager({
               <span className="mb-1 block text-xs font-medium text-slate-500">
                 专一账号
                 <span className="ml-1 font-normal text-slate-400">
-                  （{editBindPool ? bindPoolLabel(editBindPool) : 'Trae/Buddy/Qoder/BuddyAI 国际池'}账号）
+                  （{editBindPool ? bindPoolLabel(editBindPool) : visiblePoolsText.replace(/ \+ /g, '/')}账号）
                 </span>
               </span>
               <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
@@ -854,6 +875,7 @@ export default function ApiKeysManager({
                 {editCandidates.map((c) => (
                   <option key={encodeUid(c.pool, c.uid)} value={encodeUid(c.pool, c.uid)}>
                     [{POOL_TAG[c.pool].label}] {c.name || c.uid}
+                    {!isPoolVisible(settings, c.pool) ? '（已隐藏池）' : ''}
                     {c.credits != null ? `（${c.credits.toFixed(1)} 积分）` : ''}
                   </option>
                 ))}
@@ -867,7 +889,7 @@ export default function ApiKeysManager({
             <div className="mb-1.5 text-xs font-medium text-slate-500">
               限定上游
               <span className="ml-1 font-normal text-slate-400">
-                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : 'Trae + Buddy + Qoder + BuddyAI 国际池账号'}
+                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : `${visiblePoolsText}账号`}
                 ；不勾选 = 使用全部上游账号）
               </span>
             </div>
@@ -892,6 +914,9 @@ export default function ApiKeysManager({
                       <Badge tone={POOL_TAG[c.pool].tone} className="!px-1.5 !text-[10px]">
                         {POOL_TAG[c.pool].label}
                       </Badge>
+                      {!isPoolVisible(settings, c.pool) && (
+                        <Badge tone="slate" className="!px-1.5 !text-[10px]">已隐藏</Badge>
+                      )}
                       <span className="truncate">{c.name || c.uid}</span>
                       {c.credits != null && <span className="ml-auto tabular-nums text-slate-400">{c.credits.toFixed(1)}</span>}
                     </label>

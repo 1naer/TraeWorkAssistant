@@ -12,8 +12,9 @@ import { CircleHelp, Copy, Search } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
+import { isPoolVisible } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
-import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
+import type { GatewaySettings, LanIfaceIp, Settings, UnifiedModel } from '../../types';
 
 const POOL_LABELS: Record<string, string> = {
   trae: 'Trae',
@@ -23,13 +24,13 @@ const POOL_LABELS: Record<string, string> = {
   custom: '自定义',
 };
 
-/** 倍率取当前可用来源池最小值（同一模型多池服务时按最低消耗展示）。
- * 仅统计 enabled 来源：不可用池不承接请求，其倍率不应参与展示，
- * 否则用户会看到实际路由不到的低价（与「实际生效倍率」口径背离）；
+/** 倍率取当前可用且可见来源池最小值（同一模型多池服务时按最低消耗展示）。
+ * 仅统计 enabled 且可见来源：不可用池不承接请求、隐藏池不面向当前用户展示，
+ * 其倍率不应参与展示，否则用户会看到实际路由不到的低价（与「实际生效倍率」口径背离）；
  * 全部不可用或未声明 → null（显示 —） */
-function minRateOf(m: UnifiedModel): number | null {
+function minRateOf(m: UnifiedModel, settings: Settings | null): number | null {
   const rates = m.sources
-    .filter((s) => s.enabled)
+    .filter((s) => s.enabled && isPoolVisible(settings, s.pool))
     .map((s) => s.rate)
     .filter((r): r is number => r != null && Number.isFinite(r));
   return rates.length ? Math.min(...rates) : null;
@@ -47,6 +48,7 @@ function Endpoint({ method, path, note }: { method: string; path: string; note: 
 
 export default function GatewayHelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useAppStore((s) => s.pushToast);
+  const settings = useAppStore((s) => s.settings);
   const [gw, setGw] = useState<GatewaySettings | null>(null);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [query, setQuery] = useState('');
@@ -73,19 +75,30 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
       });
   }, [open]);
 
+  /** 可见模型基座（系统设置「应用显示」联动）：仅保留至少有一个可见来源池的模型 */
+  const visibleModels = useMemo(
+    () => models.filter((m) => m.sources.some((s) => isPoolVisible(settings, s.pool))),
+    [models, settings],
+  );
+  // cURL 示例模型：默认模型属已隐藏池时回落首个可见模型（示例须实际可请求）
+  const exampleModel =
+    gw?.default_model && visibleModels.some((m) => m.id === gw.default_model)
+      ? gw.default_model
+      : (visibleModels[0]?.id ?? '');
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return models;
-    return models.filter(
+    if (!q) return visibleModels;
+    return visibleModels.filter(
       (m) =>
         m.id.toLowerCase().includes(q) ||
         m.display.toLowerCase().includes(q) ||
         m.vendor.toLowerCase().includes(q),
     );
-  }, [models, query]);
+  }, [visibleModels, query]);
 
   const copyCurl = async () => {
-    const m = gw?.default_model || models[0]?.id || 'glm-5.3';
+    const m = exampleModel || 'glm-5.3';
     const example = `curl -X POST ${base}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer your-api-key" \\
@@ -148,7 +161,17 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               <div>
                 <span className="text-slate-400 dark:text-zinc-500">模型：</span>
                 <span className="text-[11px]">
-                  请求按模型 ID 匹配资源池；未指定时用默认模型 <code>{gw?.default_model || '—'}</code>
+                  请求按模型 ID 匹配资源池；未指定时用默认模型{' '}
+                  <code>
+                    {gw?.default_model || '—'}
+                    {gw?.default_model &&
+                    // 复审修复：仅「目录中存在但仅由隐藏池服务」才标注；目录中不存在
+                    // 的存量默认模型不加误导性标注（placeholder 场景另行兜底展示）
+                    models.some((m) => m.id === gw.default_model) &&
+                    !visibleModels.some((m) => m.id === gw.default_model)
+                      ? '（属已隐藏池）'
+                      : ''}
+                  </code>
                 </span>
               </div>
             </div>
@@ -178,7 +201,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             <code className="block break-all text-[11px] leading-relaxed text-slate-500 dark:text-zinc-400">
               curl -X POST {base}/v1/chat/completions \<br />
               &nbsp;&nbsp;-H &quot;Authorization: Bearer your-api-key&quot; \<br />
-              &nbsp;&nbsp;-d &apos;&#123;&quot;model&quot;: &quot;{gw?.default_model || '模型 ID'}&quot;, &quot;messages&quot;:
+              &nbsp;&nbsp;-d &apos;&#123;&quot;model&quot;: &quot;{exampleModel || '模型 ID'}&quot;, &quot;messages&quot;:
               [...&#125;&apos;
             </code>
           </div>
@@ -241,7 +264,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
         <div className="lg:col-span-3">
           <div className="mb-2 flex items-center gap-2">
             <p className="text-xs font-medium text-slate-700 dark:text-zinc-200">
-              支持模型<span className="ml-1 text-slate-400">（{filtered.length}/{models.length}）</span>
+              支持模型<span className="ml-1 text-slate-400">（{filtered.length}/{visibleModels.length}）</span>
             </p>
             <div className="relative ml-auto">
               <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -268,8 +291,10 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               </thead>
               <tbody>
                 {filtered.map((m) => {
-                  const enabled = m.sources.some((s) => s.enabled);
-                  const rate = minRateOf(m);
+                  // 行内来源按可见性过滤（隐藏池徽章不展示，避免泄露；enabled 口径同步取可见来源）
+                  const visibleSources = m.sources.filter((s) => isPoolVisible(settings, s.pool));
+                  const enabled = visibleSources.some((s) => s.enabled);
+                  const rate = minRateOf(m, settings);
                   return (
                     <tr
                       key={m.id}
@@ -315,7 +340,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                       </td>
                       <td className="px-2 py-2">
                         <div className="flex flex-wrap gap-1">
-                          {m.sources.map((s) => (
+                          {visibleSources.map((s) => (
                             <Badge key={s.pool} tone={s.enabled ? 'slate' : 'amber'}>
                               {POOL_LABELS[s.pool] ?? s.pool}
                             </Badge>
@@ -329,7 +354,11 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 {filtered.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-2 py-6 text-center text-slate-400 dark:text-zinc-500">
-                      {models.length === 0 ? '模型目录加载中或为空' : '无匹配模型'}
+                      {models.length === 0
+                        ? '模型目录加载中或为空'
+                        : visibleModels.length === 0
+                          ? '当前可见应用下无支持模型'
+                          : '无匹配模型'}
                     </td>
                   </tr>
                 )}

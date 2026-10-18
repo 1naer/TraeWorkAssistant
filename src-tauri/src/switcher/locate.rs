@@ -141,9 +141,13 @@ fn registry_locate(sess: &Session) -> Option<PathBuf> {
             if !sess.prof.reg_patterns.iter().any(|p| glob_match_ci(p, &display)) {
                 continue;
             }
-            // DisplayIcon：剥 ",0" 图标索引后缀（等价 PS -replace ',',''）
+            // DisplayIcon：剥 ",N" 图标索引后缀（2026-10-17 修复：原 replace(',', "")
+            // 仿 PS -replace 仅删逗号本身，会把 "…\WorkBuddyAI.exe,0" 变
+            // "…\WorkBuddyAI.exe0" 恒 is_file 失败，注册表级形同虚设；改为取首个
+            // 逗号段，与 env.rs resolve_reg_profile_candidate 同构）
             if let Ok(icon) = item.get_string("DisplayIcon") {
-                let p = PathBuf::from(icon.replace(',', "").trim().to_string());
+                let clean = icon.split(',').next().unwrap_or(&icon).trim().to_string();
+                let p = PathBuf::from(clean);
                 if p.is_file() && profile::exe_matches(&p, &sess.prof) {
                     return Some(p);
                 }
@@ -167,14 +171,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn displayicon_索引后缀剥离_对齐ps_replace语义() {
-        // PS -replace ',','' 仅删逗号本身：",0" 剥后留下尾缀 "0"（"Doubao.exe0"），
-        // Test-Path 随之失败回退 InstallLocation——Rust 逐字对齐该行为，
-        // 不"修正"为剥索引（否则与 PS 实机结果不可对拍）
+    fn displayicon_索引后缀剥离_取首个逗号段() {
+        // 2026-10-17 修复：原 replace(',', "") 仿 PS -replace 仅删逗号本身，
+        // 会把 "…\WorkBuddyAI.exe,0" 变 "…\WorkBuddyAI.exe0" 恒 is_file 失败，
+        // 注册表级形同虚设；改为取首个逗号段（剥图标索引语义，与 env.rs 同构）
+        let icon = "C:\\x\\WorkBuddyAI.exe,0";
         assert_eq!(
-            "C:\\x\\Doubao.exe,0".replace(',', "").trim(),
-            "C:\\x\\Doubao.exe0"
+            icon.split(',').next().unwrap_or(icon).trim(),
+            "C:\\x\\WorkBuddyAI.exe"
         );
+        // 无索引后缀原样保留
+        let bare = "C:\\x\\Doubao.exe";
+        assert_eq!(bare.split(',').next().unwrap_or(bare).trim(), bare);
     }
 
     #[test]

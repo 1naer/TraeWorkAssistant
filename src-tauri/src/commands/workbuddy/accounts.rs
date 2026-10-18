@@ -641,8 +641,12 @@ pub fn workbuddy_refresh_token(
     let body: serde_json::Value = match resp {
         Ok(r) => r.into_json().unwrap_or_default(),
         Err(ureq::Error::Status(code, r)) => {
-            let _ = r;
-            return Err(format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"));
+            // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
+            return Err(crate::tasks::wb_common::refresh_fail_msg(
+                code,
+                r,
+                &format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"),
+            ));
         }
         Err(e) => return Err(format!("刷新请求失败: {e}")),
     };

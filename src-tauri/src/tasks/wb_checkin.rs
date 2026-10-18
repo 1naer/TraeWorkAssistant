@@ -509,7 +509,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）。
         // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
-        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, &aid, &creds);
+        let (new, fail_reason, fail_detail) = wb_common::refresh_token_once_locked(state, agent, &aid, &creds);
         match new {
             Some(new) => {
                 sync_pool_expiry(state, &aid, &new);
@@ -530,10 +530,21 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
             None => {
                 // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）
                 if fail_reason == Some(wb_common::RefreshFail::Auth) {
-                    wb_common::mark_needs_relogin(state, &aid, &format!("签到 refresh 失败: {message}"));
+                    // issue #118：透传上游 error/error_description，便于区分会话失效与账号封禁
+                    let mut reason = format!("签到 refresh 失败: {message}");
+                    if let Some(d) = fail_detail.as_deref() {
+                        reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
+                    }
+                    wb_common::mark_needs_relogin(state, &aid, &reason);
                 }
                 kind = "fail".into();
-                message = "登录态失效且刷新失败，需重新登录".into();
+                message = match fail_detail.as_deref() {
+                    Some(d) => format!(
+                        "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
+                        wb_common::refresh_fail_hint(d)
+                    ),
+                    None => "登录态失效且刷新失败，需重新登录".into(),
+                };
                 reward = None;
             }
         }
@@ -665,7 +676,7 @@ where
     let (kind, msg) = f(&headers);
     if kind == "auth" {
         // H-1：加锁刷新 + 二次检查 + 内部落库（原 refresh_token_once_ex + 手工 save）
-        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, acct_id, creds);
+        let (new, fail_reason, fail_detail) = wb_common::refresh_token_once_locked(state, agent, acct_id, creds);
         if let Some(new) = new {
             sync_pool_expiry(state, acct_id, &new);
             let h2 = wb_common::build_auth_headers(&new, false);
@@ -680,9 +691,21 @@ where
         }
         // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（下次调度自然重试）
         if fail_reason == Some(wb_common::RefreshFail::Auth) {
-            wb_common::mark_needs_relogin(state, acct_id, &format!("refresh 失败: {msg}"));
+            // issue #118：透传上游错误细节，便于区分会话失效与账号封禁
+            let mut reason = format!("refresh 失败: {msg}");
+            if let Some(d) = fail_detail.as_deref() {
+                reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
+            }
+            wb_common::mark_needs_relogin(state, acct_id, &reason);
         }
-        return ("fail".into(), "登录态失效且刷新失败".into());
+        let msg_fail = match fail_detail.as_deref() {
+            Some(d) => format!(
+                "登录态失效且刷新失败；上游: {d}（{}）",
+                wb_common::refresh_fail_hint(d)
+            ),
+            None => "登录态失效且刷新失败".into(),
+        };
+        return ("fail".into(), msg_fail);
     }
     (kind, msg)
 }
