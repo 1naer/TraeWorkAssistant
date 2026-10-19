@@ -259,6 +259,7 @@ fn process_account(
     token: &str,
     uid: &str,
     base: &str,
+    shared: Option<&std::sync::Arc<crate::api_server::ApiSharedState>>,
     emit: &mut dyn FnMut(&Value),
 ) -> Value {
     // T7 审查修复：fail 文案统一改写「HTTP 401/403」→「凭证401/403」。调度器
@@ -312,7 +313,10 @@ fn process_account(
         "conversationOrigin": "workbuddy-app",
         "plugins": [{ "name": "weixinpay", "marketplace": "codebuddy-builtin" }],
     });
-    let conv_id = with_backoff(|| {
+    // ① 建会话（审查 #17：POST 非幂等，不走 with_backoff——请求已达但响应解析
+    // 失败（Msg 类：into_json 失败/data.id 缺失）时重发会在服务端再建一个会话 →
+    // 孤儿会话累积；失败直接 fail 交整轮冷却由下一轮重打。对齐 session/prompt 不重试口径）
+    let conv_id = (|| {
         let resp = web_headers(agent.post(&format!("{base}/console/as/conversations/")), token, uid)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())?;
@@ -332,6 +336,10 @@ fn process_account(
                 )))
             }
         })
+    })()
+    .map_err(|e| match e {
+        BackoffErr::Status(c) => format!("HTTP {c}"),
+        BackoffErr::Msg(m) => m,
     });
     let conv_id = match conv_id {
         Ok(v) => v,
@@ -550,7 +558,23 @@ fn process_account(
                     let head = match resp.into_string() {
                         Ok(body) => match serde_json::from_str::<Value>(&body) {
                             Ok(v) => trim_json(&v),
-                            Err(_) => body.chars().take(600).collect(),
+                            // 审查 #18：非 JSON 文本（HTML 错误页/网关诊断）无法
+                            // 结构化脱敏——含敏感键名即整段隐去（保留字节数供诊断），
+                            // 凭证值不落 app.log；无敏感键仍原文截断保留诊断价值
+                            Err(_) => {
+                                let lower = body.to_lowercase();
+                                if SENSITIVE_KEYS
+                                    .iter()
+                                    .any(|k| lower.contains(&k.to_lowercase()))
+                                {
+                                    format!(
+                                        "[非 JSON 响应体 {} 字节，含敏感字段已整段隐去]",
+                                        body.len()
+                                    )
+                                } else {
+                                    body.chars().take(600).collect()
+                                }
+                            }
                         },
                         Err(_) => String::new(),
                     };
@@ -746,6 +770,26 @@ fn process_account(
             crate::fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 打卡积分回写失败 {acct_id}: {err}"));
         }
     }
+    // 审查 #4：打卡到账同步拨进运行期网关 buddy_ai_pool（qoder/wb 先例）——
+    // 此前只写持久池，网关运行池钉死在装配时刻快照，零积分过滤窗口内到账的
+    // 新余额进不了运行池，账号被持续排除到下次积分同步（默认 every_hours 2h）。
+    // 键位口径：buddy-ai 网关装配以账号 id 充当条目 uid（审查 H2 复核），按
+    // acct_id 拨新即命中；expire None 不抹池内旧值（对齐 buddy_pool_write_credits
+    // 的「仅 Some 才覆盖」口径，防 expire_first「先到期优先」误压）
+    if let (Some(shared), Some(info)) = (shared, &after) {
+        let expire = match info.expire_secs {
+            Some(e) => Some(e),
+            None => shared
+                .buddy_ai_pool
+                .status_list()
+                .into_iter()
+                .find(|s| s.uid == acct_id)
+                .and_then(|s| s.credits_expire_at),
+        };
+        let m: std::collections::HashMap<String, (f64, Option<i64>)> =
+            std::collections::HashMap::from([(acct_id.to_string(), (info.total, expire))]);
+        shared.buddy_ai_pool.update_credits_snapshot(&m);
+    }
     let msg = match gain {
         Some(g) => format!("活跃打卡完成，积分 +{g:.0}（{:.0} → {:.0}）",
             before.as_ref().map(|b| b.total).unwrap_or(0.0),
@@ -822,21 +866,27 @@ fn acp_answer_request(
     format!("{method} ← 已代答（HTTP {status}）")
 }
 
+/// 诊断摘要敏感键（审查 #18：补 sessionId/session_id——ACP ② 步 sessionId 与
+/// 沙箱 token/link 同属会话凭证，广播/app_log 落盘前一并打码；模块级供
+/// trim_json 与非 JSON 文本整段隐去判定共用）
+const SENSITIVE_KEYS: [&str; 9] = [
+    "token",
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "refreshToken",
+    "authorization",
+    "link",
+    "sessionId",
+    "session_id",
+];
+
 /// 失败诊断用的响应摘要（审查 H5/H6 修复）：
 /// ① 先脱敏——响应可能携带沙箱凭证（② 步的 token/link 等），原样序列化会经
 ///    NDJSON 进度事件广播 + app_log 明文落盘（长期存储泄漏面）；
 /// ② 再截断——serde_json 输出 UTF-8 原文，按字节切片遇非 ASCII（中文错误文案）
 ///    不是字符边界会 panic 且 panic 沿 process_account 展开杀掉整轮打卡线程
 fn trim_json(v: &Value) -> String {
-    const SENSITIVE_KEYS: [&str; 7] = [
-        "token",
-        "access_token",
-        "accessToken",
-        "refresh_token",
-        "refreshToken",
-        "authorization",
-        "link",
-    ];
     let mut redacted = v.clone();
     redact_sensitive(redacted.as_object_mut(), &SENSITIVE_KEYS);
     let s = redacted.to_string();
@@ -872,7 +922,14 @@ fn redact_sensitive(obj: Option<&mut serde_json::Map<String, Value>>, keys: &[&s
 
 /// 打卡整轮：buddy-ai 池全账号串行（NDJSON 管线复用 wb-checkin 契约）。
 /// 返回 done 事件（ok/already/failed 计数），供调度器/启动钩子直接消费。
-pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Value {
+/// `runtime`：GUI 进程内网关运行态句柄（调度器/启动补跑/UI 手动打卡传入，对齐
+/// qoder_checkin::run_checkin_round 提取模式）——打卡到账运行期拨进 buddy_ai_pool
+///（审查 #4）；CLI 独立进程传 None 跳过
+pub fn run_checkin_round(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    emit: &mut dyn FnMut(&Value),
+) -> Value {
     let agent = crate::tasks::http_agent(30);
     // 花名册经 buddy_ai.rs 公开 helper（WbPool 字段不对 tasks 暴露）；
     // 仅含凭证账号参与（无凭证跳过——手工导入无 rt 也打不了卡）
@@ -890,9 +947,28 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
                 .unwrap_or(false)
         })
         .collect();
+    // 审查 #15：空池空轮打 skipped_empty_pool 标记——调度器 tick 据此不 mark_run
+    //（mark_run 固化「当日已跑」，当日新增账号会失去调度补打）；事件流契约不变
+    //（start/done 齐备，UI/CLI 零改动），结果落库亦跳过（无事件可记）
+    if accounts.is_empty() {
+        emit(&json!({ "type": "start", "total": 0 }));
+        let done = json!({
+            "type": "done", "ok": 0, "already": 0, "failed": 0,
+            "skipped": "buddy-ai 池无可用账号，本轮空跑跳过（不固化当日已跑）",
+            "skipped_empty_pool": true,
+        });
+        emit(&done);
+        return done;
+    }
     emit(&json!({ "type": "start", "total": accounts.len() }));
 
     let gap_secs = crate::models::effective_checkin_gap(state.settings().buddy_ai_checkin_gap_secs);
+    // 网关运行态共享句柄（审查 #4 运行期回写；对齐 qoder_checkin::run_checkin_round
+    // 与 buddy_ai_credits_sync_impl 提取模式）：网关未启动时为 None
+    let shared = runtime.and_then(|r| {
+        let g = r.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|rt| rt.shared.clone())
+    });
     let mut events: Vec<Value> = Vec::new();
     for (i, (id, name, pool_uid)) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
@@ -921,7 +997,7 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
             "name": name,
             "message": format!("开始处理（{}/{}），六步链预计 1-3 分钟…", i + 1, accounts.len()),
         }));
-        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, &mut *emit);
+        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, shared.as_ref(), &mut *emit);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);

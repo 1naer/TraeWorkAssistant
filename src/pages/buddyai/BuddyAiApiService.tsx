@@ -72,6 +72,9 @@ export default function BuddyAiApiService() {
   // 调度参数最近一次落库值（审查修复 P3 同源：onBlur 未改动不重复保存——原实现每次
   // 失焦都触发 poolSet + 「已保存」toast，用户仅点击路过输入框也会弹保存噪音）
   const savedParamsRef = useRef<Record<string, number>>({});
+  // 保存请求序号守卫（审查 #6，与 ResourceSummary F2 同类竞态）：连续保存时旧请求
+  // 慢败返回，陈旧快照回滚会覆盖其后已成功保存的字段并可能经下次 onBlur 写回后端
+  const saveSeqRef = useRef(0);
 
   const refreshCatalog = useCallback(async () => {
     const [cat, unified] = await Promise.all([
@@ -161,6 +164,9 @@ export default function BuddyAiApiService() {
       pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
       return false;
     }
+    // 序号守卫（F2 同范式）：仅最新一次请求允许回滚/saving 复位，乱序旧失败不得
+    // 用陈旧快照覆盖其后已成功保存的字段
+    const seq = ++saveSeqRef.current;
     setSaving(true);
     // 乐观更新（审查 P2：原在 await 之后 setFlags，保存进行中（≥400ms）再点
     // 另一个开关会基于旧 flags 快照提交，把第一次改动静默回退）
@@ -177,17 +183,21 @@ export default function BuddyAiApiService() {
       );
       return true;
     } catch (err) {
-      // 按本次 patch 字段回滚（审查修复）：整份回滚到调用时快照会连带抹掉
-      // 并发已成功落库的其他字段（连续保存时第二次失败回滚覆盖第一次成功值）
-      const revert = { ...flags };
-      for (const k of Object.keys(next) as Array<keyof typeof next>) {
-        (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
+      if (seq === saveSeqRef.current) {
+        // 按本次 patch 字段函数式回滚（审查修复）：不用陈旧快照整份覆盖，基于最新
+        // state 仅回滚本次 patch 键，避免连带抹掉并发已成功落库的其他字段
+        setFlags((cur) => {
+          const revert = { ...cur };
+          for (const k of Object.keys(next) as Array<keyof typeof next>) {
+            (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
+          }
+          return revert;
+        });
+        pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
       }
-      setFlags(revert);
-      pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
       return false;
     } finally {
-      setSaving(false);
+      if (seq === saveSeqRef.current) setSaving(false);
     }
   };
 

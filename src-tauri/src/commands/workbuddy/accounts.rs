@@ -435,7 +435,8 @@ fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
 /// 真源 = token rec 的 domain 字段（is_global_region）；auth 文件无 domain 时以
 /// JWT iss 含 workbuddy.ai 兜底（国际 OAuth 为 Keycloak 风格，iss 指向国际域）。
 /// 二者皆缺 → 放行（fail-open，不误伤国内凭证导入）。
-fn is_intl_credential(domain: Option<&str>, access_token: Option<&str>) -> bool {
+/// pub(crate)：buddy-ai 导入入口反向门控（审查 #13）复用同一判据镜像隔离
+pub(crate) fn is_intl_credential(domain: Option<&str>, access_token: Option<&str>) -> bool {
     if let Some(d) = domain {
         if crate::tasks::wb_common::is_global_region(d) {
             return true;

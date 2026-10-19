@@ -191,8 +191,12 @@ export default function BuddyAiCredits() {
   // 本地 Token 统计（~/.workbuddy-ai/projects 会话扫描；懒加载：Token Tab 首次激活才拉取）
   const [tokenStats, setTokenStats] = useState<BuddyAiTokenStats | null>(null);
   const tokensLoadedRef = useRef(false);
+  // 载入/同步序号守卫（审查 #22）：积分同步与列表加载交叉时后到的旧快照不得覆盖
+  // 新余额——共享序号，仅最新一次请求允许写数据/状态
+  const loadSeqRef = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     try {
       // 主数据 accountsList 失败仅局部报错，不丢弃其余四路已成功的数据（对齐各路独立容错）
@@ -206,13 +210,14 @@ export default function BuddyAiCredits() {
         api.buddyai.creditsHistory(90).catch(() => [] as CreditSnap[]),
         api.groups.sharedList().catch(() => [] as GroupView[]),
       ]);
+      if (seq !== loadSeqRef.current) return;
       if (accs) setAccounts(accs);
       setRecords(recs);
       setGroups(gs);
       setUsage(usg);
       setHistory(hist);
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -253,21 +258,30 @@ export default function BuddyAiCredits() {
   }, [tab, creditsSource, tokensSource, loadOfficial, loadTokenStats]);
 
   const syncCredits = async () => {
+    // 与 load 共享序号（审查 #22）：慢败/慢成的积分同步不得覆盖其后已完成的加载，
+    // 反向同理——仅最新一次请求写 accounts/toast/syncing
+    const seq = ++loadSeqRef.current;
     setSyncing(true);
     try {
       const n = await withMinDelay(api.buddyai.creditsFetch(), 800);
-      setAccounts(n);
-      const ok = n.filter((a) => a.credits_balance != null).length;
-      pushToast('success', `积分已同步（${ok}/${n.length} 个账号取数成功）`);
-      // 已加载过的源随全局刷新联动（官网聚合 10min 缓存过期后此路强制重拉窗口内数据）
-      if (officialLoadedRef.current) void loadOfficial();
-      if (tokensLoadedRef.current) void loadTokenStats(true);
-      // 会话明细落地缓存重查（积分同步顺带官网聚合 → 行级明细随路落盘）
-      setSessReload((k) => k + 1);
+      if (seq === loadSeqRef.current) {
+        setAccounts(n);
+        const ok = n.filter((a) => a.credits_balance != null).length;
+        pushToast('success', `积分已同步（${ok}/${n.length} 个账号取数成功）`);
+        // 已加载过的源随全局刷新联动（官网聚合 10min 缓存过期后此路强制重拉窗口内数据）
+        if (officialLoadedRef.current) void loadOfficial();
+        if (tokensLoadedRef.current) void loadTokenStats(true);
+        // 会话明细落地缓存重查（积分同步顺带官网聚合 → 行级明细随路落盘）
+        setSessReload((k) => k + 1);
+      }
     } catch (err) {
-      pushToast('error', `积分同步失败：${String(err).slice(0, 160)}`);
+      if (seq === loadSeqRef.current) pushToast('error', `积分同步失败：${String(err).slice(0, 160)}`);
     } finally {
-      setSyncing(false);
+      if (seq === loadSeqRef.current) {
+        setSyncing(false);
+        // 同步补位清 loading：交叉的旧 load 被本请求取代后不再负责复位加载态
+        setLoading(false);
+      }
     }
   };
 

@@ -803,9 +803,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       settings.buddy_ai_catalog_sync_enabled = settings.buddy_ai_catalog_sync_enabled !== false;
       if (!settings.buddy_ai_catalog_sync_hhmm?.trim()) settings.buddy_ai_catalog_sync_hhmm = '05:55';
       // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
+      // 审查 #7 修复：图标白名单对齐后端 state.rs 口径含 buddy-ai（应用显示面板行首
+      // 入口放行自定义图标；原沿用 hidden_apps 的 validApps 缺 buddy-ai，每次刷新
+      // 都把 buddy-ai 自定义图标清除并随 saveSettings 写回丢失）
+      const iconApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
-        if (validApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
+        if (iconApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
           cleanIcons[k as AppKey] = v.trim();
         }
       }

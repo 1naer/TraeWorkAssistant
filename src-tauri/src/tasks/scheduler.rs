@@ -312,15 +312,17 @@ fn tick(app: &AppHandle, st: &AppState) {
             Ok(v) => {
                 let summary = summarize(&v, t.key);
                 // skipped_busy（审查修复：qoder-checkin 轮次锁被 UI 路径持有的幂等跳过）
-                // 不 mark_run——跳过≠完成，mark_run 会固化「当日已跑」关闭当日重试链，
-                // UI 轮次的失败账号将失去当日调度兜底。其余 skipped（空池静默空转）
-                // 仍照常记账，防 EveryHours/Hourly 任务每 tick 空转刷日志
+                // 与 skipped_empty_pool（审查 #15：buddy-ai 空池空轮）不 mark_run——
+                // 跳过≠完成，mark_run 会固化「当日已跑」关闭当日重试链，UI 轮次的
+                // 失败账号将失去当日调度兜底；空池空轮记账则会让当日新增账号失去
+                // 调度补打。skipped_busy 落日志（低频、值得留痕）；空轮纯静默
+                //（池空期间每 tick 触发，落日志会刷屏，对齐「空池静默空转」定调）
                 if v.get("skipped_busy").is_some() {
                     fs_utils::app_log(
                         &st.data_dir,
                         &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
                     );
-                } else {
+                } else if v.get("skipped_empty_pool").is_none() {
                     mark_run(st, t.key, &today, &summary);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
                     // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
@@ -580,7 +582,13 @@ fn run_task(
                 }));
             }
             let mut events: Vec<Value> = Vec::new();
-            let done = super::buddy_ai_checkin::run_checkin_round(st, &mut |ev| events.push(ev.clone()));
+            let done = super::buddy_ai_checkin::run_checkin_round(st, runtime, &mut |ev| events.push(ev.clone()));
+            // 审查 #15：空池空轮透传 skipped_empty_pool——tick 据此不 mark_run 且
+            // 静默（当日新增账号保留调度补打机会）；连击统计无需更新（ok/already/
+            // failed 全 0，buddy_ai_streak_next 原值返回），提前返回省一次判定
+            if done.get("skipped_empty_pool").is_some() {
+                return Ok(done);
+            }
             let ok_count = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
             let already_count = done.get("already").and_then(Value::as_i64).unwrap_or(0);
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);

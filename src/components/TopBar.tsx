@@ -452,16 +452,26 @@ function BuddyAiTopBar() {
 
   useEffect(() => {
     let alive = true;
-    api.env
-      .locate('workbuddy_ai')
-      .then((r) => alive && setWbLocate(r))
-      .catch(() => {});
-    api.env
-      .locate('codebuddy_ai')
-      .then((r) => alive && setCbLocate(r))
-      .catch(() => {});
+    // 审查 #23：客户端检测原为挂载时一次性快照，窗口存活期间装/卸客户端后徽标
+    // stale——补窗口聚焦重探测 + 30s 低频轮询（locate 为本地文件探测，开销可忽略）
+    const probe = () => {
+      api.env
+        .locate('workbuddy_ai')
+        .then((r) => alive && setWbLocate(r))
+        .catch(() => {});
+      api.env
+        .locate('codebuddy_ai')
+        .then((r) => alive && setCbLocate(r))
+        .catch(() => {});
+    };
+    probe();
+    const onFocus = () => probe();
+    window.addEventListener('focus', onFocus);
+    const timer = window.setInterval(probe, 30_000);
     return () => {
       alive = false;
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(timer);
     };
   }, []);
 

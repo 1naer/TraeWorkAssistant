@@ -158,7 +158,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "buddy-ai-checkin" => {
             match crate::commands::workbuddy::try_acquire_buddy_ai_round() {
                 Ok(_round) => {
-                    let done = buddy_ai_checkin::run_checkin_round(state, &mut print_progress);
+                    // runtime=None：CLI 独立进程无网关运行态，打卡到账仅落持久池
+                    let done = buddy_ai_checkin::run_checkin_round(state, None, &mut print_progress);
                     let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let already = done
                         .get("already")
