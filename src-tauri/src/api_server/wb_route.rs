@@ -206,15 +206,6 @@ pub(crate) fn gen_conv_id() -> String {
 
 // ==================== 模型级冷却（T2.7/F-34） ====================
 
-/// 模型是否处于冷却中；返回剩余秒数（CN wb 档便捷包装：&ApiSharedState 只读路径用，
-/// 如错误响应构造；执行链一律走视图版 [`model_cooling_remaining`]）
-pub fn model_cooling_remaining_wb(state: &ApiSharedState, model: &str) -> Option<i64> {
-    let map = safe_lock(&state.model_cooldowns);
-    let (until, _) = map.get(model)?;
-    let now = now_ts();
-    (*until > now).then_some(*until - now)
-}
-
 /// 模型是否处于冷却中；返回剩余秒数（视图感知：buddy-ai 档读独立冷却表）
 pub fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
     let map = safe_lock(&state.route_model_cooldowns());
