@@ -48,6 +48,7 @@ import {
   Square,
   Triangle,
   Diamond,
+  Globe,
   type LucideIcon,
 } from 'lucide-react';
 import type { AppKey } from '../types';
@@ -107,6 +108,9 @@ export const ICON_CHOICES: { name: string; icon: LucideIcon }[] = [
   { name: 'Square', icon: Square },
   { name: 'Triangle', icon: Triangle },
   { name: 'Diamond', icon: Diamond },
+  // 审查修复（L32）：Globe 是 buddy-ai 的内置默认图标名，缺失会使 resolveAppIcon
+  // 解析为 null（侧边栏回退空白/占位），补入候选表
+  { name: 'Globe', icon: Globe },
 ];
 
 /** 图标名 → 组件映射（O(1) 解析；未知名返回 undefined 由调用方回退默认） */

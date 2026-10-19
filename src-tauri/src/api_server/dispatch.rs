@@ -212,8 +212,12 @@ pub enum DispatchError {
     /// 仅 Trae 源模型且 trae_enabled=false（同族镜像；Trae 开关默认开，
     /// 关闭属用户显式动作，与"池耗尽 503"区分开）
     TraeDisabled,
-    /// Buddy 模型级冷却中（单源显式 429；双源已在选池时回退）
-    ModelCooling(i64),
+    /// 模型级冷却中（单源显式 429；双源已在选池时回退）。
+    /// 审查修复（模型冷却归因）：附带发起请求的目标池（buddy/buddy-ai/qoder
+    /// 各持独立冷却表），供 routes 层请求日志按真实池归因——此前类型不带池、
+    /// 响应层硬编码 "buddy"，buddy-ai/qoder 的模型级 429 在用量看板与
+    /// app_log 中归因失真
+    ModelCooling(i64, TargetPool),
     /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
     NoHealthy(TargetPool),
 }
@@ -263,6 +267,10 @@ struct ModelSources {
     /// Intl 专属标记（审查修复）：buddy 源来自 Intl 静态目录而非 CN 目录——
     /// Buddy(CN) 池不服务该模型（available 门控），仅 buddy-ai 池可取号
     buddy_intl_only: bool,
+    /// CN+Intl 双收录标记（审查修复 第2项）：模型同时被 CN 目录与 Intl 目录
+    /// 收录——国际档开启时 buddy-ai 池可服务；CN 专属模型（false）不得静默
+    /// 路由国际池（跨区计费/合规歧义，available 门控）
+    buddy_in_both: bool,
     /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
     trae: bool,
     /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
@@ -293,9 +301,13 @@ impl ModelSources {
         if self.buddy.is_some() && wb_enabled && !self.buddy_intl_only {
             n += 1;
         }
-        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）；Intl 专属
-        // 模型源同样计入（CN 目录未命中但 Intl 目录命中时 buddy 源存在）
-        if self.buddy.is_some() && buddy_ai_enabled {
+        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）；仅 Intl
+        // 专属或 CN+Intl 双收录模型计入（审查修复 第2项：CN 专属模型不得静默
+        // 路由国际池，智能调度/换号回退闸门与 available 同口径）
+        if self.buddy.is_some()
+            && buddy_ai_enabled
+            && (self.buddy_intl_only || self.buddy_in_both)
+        {
             n += 1;
         }
         if self.qoder.is_some() && qoder_enabled {
@@ -318,7 +330,13 @@ impl ModelSources {
             TargetPool::Trae => self.trae && trae_enabled,
             // Intl 专属模型源不得路由 Buddy(CN) 池（审查修复：CN 上游无该模型 id）
             TargetPool::Buddy => self.buddy.is_some() && wb_enabled && !self.buddy_intl_only,
-            TargetPool::BuddyAi => self.buddy.is_some() && buddy_ai_enabled,
+            // 审查修复（第2项）：仅 Intl 专属或 CN+Intl 双收录模型可走国际池——
+            // CN 专属模型即使国际档开启也不被智能调度/换号回退静默切国际上游
+            TargetPool::BuddyAi => {
+                self.buddy.is_some()
+                    && buddy_ai_enabled
+                    && (self.buddy_intl_only || self.buddy_in_both)
+            }
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
             TargetPool::Custom => false,
         }
@@ -416,12 +434,27 @@ pub fn resolve_target(
     // Intl 目录动态化（2026-10-15）：动态抓取结果优先（kv buddy_ai_model_catalog），
     // 缺失回落内置静态表——/v3/config 实抓成功后倍率/上下文即随动态目录生效
     let intl_catalog = super::wb_catalog::buddy_ai_load(&state.data_dir);
+    // buddy-ai 国际档开关（阶段 2）：显式开启制，默认关（前移读取：Intl 专属
+    // id 折入与双收录判定均以本开关为前提）
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
     // 审查修复（buddy-ai Intl 专属模型误路由）：CN 目录未命中时并查 Intl 目录
     //（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等 Intl 专属 id
     // 不在 CN 目录，原实现 buddy_hit=None → 落 Trae 透传语义被误路由 Trae 上游。
     // 命中折入 buddy 源（final_model/effort/冷却链路复用），buddy_intl_only 标记
     // 随源携带：Buddy(CN) 池不得服务 Intl 专属模型（available 门控），buddy-ai 池正常取号
-    let intl_hit = if super::wb_catalog::find(&catalog, &r.model).is_none() {
+    // 审查修复（第1项）：折入以国际档开启为前提——关闭态 Intl 专属 id 不折入，
+    // 恢复 Trae 透传既有语义（无条件折入会使国际档关闭时四源全不可用 →
+    // 503 NoHealthy(Trae)，被误判为「Trae 池耗尽」）
+    let cn_hit = super::wb_catalog::find(&catalog, &r.model).is_some();
+    // 审查修复（第2项）：CN+Intl 双收录判定——CN 目录命中且 Intl 目录同收录，
+    // 国际档开启时 buddy-ai 池可服务（available 门控放行依据）
+    let buddy_in_both = cn_hit
+        && super::wb_catalog::find(&intl_catalog, &r.model)
+            .or_else(|| super::wb_catalog::find(&intl_catalog, model))
+            .is_some();
+    let intl_hit = if !cn_hit && buddy_ai_enabled {
         super::wb_catalog::find(&intl_catalog, &r.model)
             .or_else(|| super::wb_catalog::find(&intl_catalog, model))
             .map(|m| (m.id.clone(), None))
@@ -528,6 +561,8 @@ pub fn resolve_target(
         buddy: buddy_hit,
         // 审查修复：Intl 专属模型源（CN 目录未命中、Intl 目录命中）
         buddy_intl_only,
+        // 审查修复（第2项）：CN+Intl 双收录判定随源携带
+        buddy_in_both,
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
@@ -540,20 +575,23 @@ pub fn resolve_target(
     let trae_enabled = state
         .trae_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
-    // buddy-ai 国际档开关（阶段 2）：显式开启制，默认关
-    let buddy_ai_enabled = state
-        .buddy_ai_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
-
     // 仅 Buddy 源模型 + wb_enabled=false → 显式报错（§4.3：保持现有
     // wb_upstream_disabled 语义；"关闭"与"不可用"是两个概念）。
     // 三源扩展（p3-3 审查修复）：Qoder 源可用时 Buddy 关闭不构成"无源可用"，
-    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）；
-    // 阶段 2：buddy-ai 国际档开启时同源可服务，同样不早退
+    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）
+    // 审查修复（第3项）：早退门控与 available(BuddyAi) 同口径——仅 Intl 专属/
+    // 双收录模型在国际档开启时跳过早退走国际池；CN 专属模型即使国际档开启
+    // 仍报 WbDisabled（用户显式关闭 WB 上游的语义不被静默绕过）
     if sources.buddy.is_some()
         && !sources.trae
         && !wb_enabled
-        && !buddy_ai_enabled
+        && !sources.available(
+            TargetPool::BuddyAi,
+            trae_enabled,
+            wb_enabled,
+            qoder_enabled,
+            buddy_ai_enabled,
+        )
         && !(sources.qoder.is_some() && qoder_enabled)
     {
         return Err(DispatchError::WbDisabled);
@@ -718,18 +756,20 @@ pub fn resolve_target(
                     && has_next;
                 if !can_fallback {
                     return Err(match (pool, reason) {
+                        // 审查修复（模型冷却归因）：错误携带真实目标池，冷却表
+                        // 本就按池独立（CN=wb 视图 / Intl=intl 视图 / qoder 独立表）
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::wb(state.clone());
                             let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
                                 .unwrap_or(0);
-                            DispatchError::ModelCooling(secs)
+                            DispatchError::ModelCooling(secs, TargetPool::Buddy)
                         }
                         // buddy-ai 模型级冷却同构映射（独立冷却表：同名模型跨区不混轮）
                         (TargetPool::BuddyAi, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::intl(state.clone());
                             let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
                                 .unwrap_or(0);
-                            DispatchError::ModelCooling(secs)
+                            DispatchError::ModelCooling(secs, TargetPool::BuddyAi)
                         }
                         // Qoder 模型级冷却同构映射（审查修复）：单源排队冷却显式 429
                         (TargetPool::Qoder, FallbackReason::ModelCooldown) => {
@@ -737,7 +777,7 @@ pub fn resolve_target(
                                 &sources.qoder.clone().unwrap_or_default(),
                             )
                             .unwrap_or(0) as i64;
-                            DispatchError::ModelCooling(secs)
+                            DispatchError::ModelCooling(secs, TargetPool::Qoder)
                         }
                         (p, _) => DispatchError::NoHealthy(p),
                     });
@@ -1489,9 +1529,10 @@ mod tests {
             &super::super::wb_route::WbView::wb(f.state.clone()),
             "hy4",
         );
+        // 审查修复（模型冷却归因）：错误现携带目标池，顺带断言归因池为 Buddy
         assert!(matches!(
             f.resolve("hy4").unwrap_err(),
-            DispatchError::ModelCooling(_)
+            DispatchError::ModelCooling(_, TargetPool::Buddy)
         ));
     }
 
@@ -1625,10 +1666,12 @@ mod tests {
 
     // ---------- 阶段 2 审查修复：Intl 专属模型源判定 ----------
 
-    /// Intl 专属 id（仅 builtin_buddy_ai 目录，CN 目录无）：折入 buddy 源后路由
-    /// buddy-ai 池；原实现 buddy_hit=None 落 Trae 透传语义被误路由 Trae 上游。
+    /// Intl 专属 id（仅 builtin_buddy_ai 目录，CN 目录无）：国际档开启时折入
+    /// buddy 源后路由 buddy-ai 池；原实现 buddy_hit=None 落 Trae 透传语义被误
+    /// 路由 Trae 上游。
     /// 同时固化：Buddy(CN) 池不得服务 Intl 专属模型（available 门控）；
-    /// buddy-ai 关闭时显式报错而非静默投 Trae；CN 目录模型 WbDisabled 语义不变
+    /// 国际档关闭时不折入、恢复 Trae 透传既有语义（审查修复 第1项）；
+    /// CN 目录模型 WbDisabled 语义不变
     #[test]
     fn t_intl_only_model_routes_buddy_ai_pool() {
         use std::sync::atomic::Ordering;
@@ -1657,11 +1700,17 @@ mod tests {
         assert_eq!(r.pool, TargetPool::BuddyAi);
         assert_eq!(r.model, "deepseek-v4.1-flash");
 
-        // buddy-ai 关闭 → 无可服务池，显式报错（不误投 Trae）
+        // 审查修复（第1项）：国际档关闭时 Intl 专属 id 不折入 buddy 源 → 恢复
+        // Trae 透传既有语义（原实现无条件折入 → 四源全不可用 503 NoHealthy(Trae)，
+        // 被误判为「Trae 池耗尽」）
         let f2 = fixture(&["unrelated-trae"], Some(&["hy4"]), Some(&policy_default()));
         f2.state.wb_enabled.store(false, Ordering::Relaxed);
-        f2.state.trae_enabled.store(false, Ordering::Relaxed);
-        assert!(f2.resolve("deepseek-v4.1-flash").is_err());
+        f2.seed_healthy(true);
+        let r2 = f2
+            .resolve("deepseek-v4.1-flash")
+            .expect("国际档关闭时 Intl 专属 id 应恢复 Trae 透传");
+        assert_eq!(r2.pool, TargetPool::Trae);
+        assert_eq!(r2.model, "deepseek-v4.1-flash");
 
         // CN 目录模型不受 Intl 折入影响：wb 关闭 → WbDisabled 语义保持
         //（hy4 仅 CN 目录，不在 Intl 17 表/Qoder 目录）
@@ -1673,6 +1722,74 @@ mod tests {
             Err(DispatchError::WbDisabled) => {}
             other => panic!("CN 模型 wb 关闭应报 WbDisabled，实际 {other:?}"),
         }
+    }
+
+    /// 审查修复（第2项）：国际档开启时 CN 专属模型不静默路由国际池——
+    /// available/available_count 门控（intl_only ‖ in_both）：国际池积分远高于
+    /// CN 池，修复前 Smart 重排会把 hy4 切到 BuddyAi；修复后 BuddyAi 不计入
+    /// 可用源（count=1 不触发重排）→ Buddy 胜出。
+    /// wb 关闭时 CN 专属模型仍报 WbDisabled（第3项：不因国际档开启被静默绕过）
+    #[test]
+    fn t_intl_on_cn_only_model_not_routed_buddy_ai() {
+        use std::sync::atomic::Ordering;
+        let f = fixture(&["unrelated-trae"], Some(&["hy4"]), Some(&policy_default()));
+        f.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.state.buddy_ai_pool.sync_from_wb(
+            &[super::super::pool::WbSyncAccount {
+                uid: "g1".into(),
+                name: "intl".into(),
+                token: "tk".into(),
+                domain: "www.workbuddy.ai".into(),
+                enterprise_id: String::new(),
+                global_region: true,
+                credits: Some(100.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["g1".to_string()],
+        );
+        let r = f.resolve_no_session("hy4").expect("CN 专属模型应可调度");
+        assert_eq!(r.pool, TargetPool::Buddy);
+        // wb 关闭 + 国际档开启：CN 专属模型仍显式报 WbDisabled（不静默走国际池）
+        f.state.wb_enabled.store(false, Ordering::Relaxed);
+        assert_eq!(
+            f.resolve_no_session("hy4").unwrap_err(),
+            DispatchError::WbDisabled
+        );
+    }
+
+    /// 审查修复（第2项）：双收录模型（CN+Intl 同收录）国际档开启时可走国际池
+    #[test]
+    fn t_in_both_model_routes_buddy_ai_when_intl_on() {
+        use std::sync::atomic::Ordering;
+        // glm-5.3 同时收录于 CN 与 Intl 目录；wb 关 + trae 关 + 国际档开
+        let f = fixture(&["unrelated-trae"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.state.wb_enabled.store(false, Ordering::Relaxed);
+        f.state.trae_enabled.store(false, Ordering::Relaxed);
+        f.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f.state.buddy_ai_pool.sync_from_wb(
+            &[super::super::pool::WbSyncAccount {
+                uid: "g1".into(),
+                name: "intl".into(),
+                token: "tk".into(),
+                domain: "www.workbuddy.ai".into(),
+                enterprise_id: String::new(),
+                global_region: true,
+                credits: Some(10.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["g1".to_string()],
+        );
+        let r = f.resolve("glm-5.3").expect("双收录模型国际档开启应可走国际池");
+        assert_eq!(r.pool, TargetPool::BuddyAi);
+        assert_eq!(r.model, "glm-5.3");
     }
 
     // ---------- 策略加载与合法性 ----------

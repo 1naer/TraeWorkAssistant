@@ -488,13 +488,74 @@ fn stream_convert_text_src(
     (error_info, sent_any, pending_usage)
 }
 
-/// 纯文本收集器：output/thought 文本 + usage + error（无 tool_calls 场景）
+/// 纯文本收集器：output/thought 文本 + tool_calls 跨事件合并 + usage + error
 struct PlainCollect {
     content: String,
     reasoning: String,
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    /// 审查修复（M6）：按 index 分段合并后的 tool_calls（与流式侧对称）
+    tools: Vec<Value>,
+}
+
+/// 审查修复（M6）：SOLO tool_call 分片规范化——function_call 旧形态转
+/// function、剔除 namespace/partial_arguments（与流式侧转换同口径）
+fn normalize_tool_delta(mut c: Value) -> Value {
+    if let Some(fc) = c.get("function_call").cloned() {
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("function".into(), fc);
+            obj.remove("function_call");
+        }
+    }
+    if let Some(fn_obj) = c.get("function").and_then(Value::as_object).cloned() {
+        let mut clean = fn_obj;
+        clean.remove("namespace");
+        clean.remove("partial_arguments");
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("function".into(), Value::Object(clean));
+        }
+    }
+    c
+}
+
+/// 审查修复（M6）：向既有 tool 槽位合并后续分片——id/type 非空覆盖（首片带全），
+/// function.name 非空覆盖，function.arguments 字符串追加
+fn merge_tool_slot(t: &mut Value, call: &Value) {
+    let Some(obj) = t.as_object_mut() else { return };
+    for k in ["id", "type"] {
+        if let Some(v) = call.get(k).and_then(Value::as_str) {
+            if !v.is_empty() {
+                obj.insert(k.to_string(), json!(v));
+            }
+        }
+    }
+    let name = call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let args = call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if name.is_empty() && args.is_empty() {
+        return;
+    }
+    if let Some(fo) = obj.get_mut("function").and_then(Value::as_object_mut) {
+        if !name.is_empty() {
+            fo.insert("name".into(), json!(name));
+        }
+        if !args.is_empty() {
+            let cur = fo
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            fo.insert("arguments".into(), json!(format!("{cur}{args}")));
+        }
+    }
 }
 
 /// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
@@ -507,6 +568,7 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         finish_reason: "stop".to_string(),
         usage: None,
         error_info: None,
+        tools: Vec::new(),
     };
     for line in br.lines() {
         let line = match line {
@@ -518,6 +580,30 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                 "output" | "thought" => {
                     out.content.push_str(&ev.response);
                     out.reasoning.push_str(&ev.reasoning);
+                    // 审查修复（M6）：非流式聚合补 tool_calls 跨事件合并——此前
+                    // 仅收集文本，stream=false 客户端拿到空 content 丢工具调用
+                    //（与流式 ToolBuf 不对称）；按 index 分段：首见创建条目、
+                    // arguments 字符串追加
+                    if let Some(arr) = ev.tool_calls.and_then(|tc| tc.as_array().cloned()) {
+                        for call in arr {
+                            let call = normalize_tool_delta(call);
+                            match call.get("index").and_then(Value::as_u64) {
+                                Some(i) => {
+                                    if let Some(t) = out
+                                        .tools
+                                        .iter_mut()
+                                        .find(|t| t.get("index").and_then(Value::as_u64) == Some(i))
+                                    {
+                                        merge_tool_slot(t, &call);
+                                    } else {
+                                        out.tools.push(call);
+                                    }
+                                }
+                                // 无 index 的分片无法跨事件关联，按独立条目保留（与流式透传对称）
+                                None => out.tools.push(call),
+                            }
+                        }
+                    }
                 }
                 "token_usage" => {
                     out.usage = Some(normalize_openai_usage(&ev.usage.unwrap_or(json!({}))));
@@ -553,6 +639,10 @@ pub fn aggregate<R: Read + Send>(
     });
     if !c.reasoning.is_empty() {
         message["reasoning_content"] = json!(c.reasoning);
+    }
+    // 审查修复（M6）：非流式聚合补发合并后的 tool_calls（与流式侧对称）
+    if !c.tools.is_empty() {
+        message["tool_calls"] = json!(c.tools);
     }
 
     let mut resp = json!({
@@ -1332,6 +1422,34 @@ mod tests {
         let joined = collect_events(rx).join("\n");
         assert!(joined.contains("hi"), "output 文本应已转发");
         assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    // ==================== 非流式聚合 tool_calls 合并（审查修复 M6）====================
+
+    #[test]
+    fn aggregate_merges_tool_call_fragments_across_events() {
+        // 上游 tool_calls 分片下发（首片 id+name+半截 arguments，次片补余下）：
+        // 非流式聚合必须按 index 合并为单条目，否则 stream=false 客户端丢工具调用
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]}\n\n",
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"北京\\\"}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n",
+        );
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        assert!(err.is_none());
+        let resp = resp.expect("tool_calls 流必须产出聚合结果");
+        let msg = &resp["choices"][0]["message"];
+        let tools = msg["tool_calls"].as_array().expect("tool_calls 必须下发");
+        assert_eq!(tools.len(), 1, "同 index 分片合并为单条目");
+        assert_eq!(tools[0]["id"], "call_1");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            tools[0]["function"]["arguments"].as_str().unwrap(),
+            "{\"city\":\"北京\"}",
+            "arguments 跨事件字符串追加"
+        );
+        assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]

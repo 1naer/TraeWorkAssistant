@@ -773,7 +773,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见；
       // buddy-ai（国际版）不参与固定应用（脏值回退 trae，与后端 state.rs 归一口径一致）
-      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
+      // 审查修复（L33）：hidden_apps 白名单对齐后端 state.rs 口径——仅 4 键且不含
+      // buddy-ai（其可见性走独立 opt-in buddy_ai_visible，不进隐藏列表）
+      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
       const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
       if (!pinnableApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
       settings.hidden_apps = (settings.hidden_apps ?? []).filter(

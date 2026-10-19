@@ -32,6 +32,13 @@ const WB_AUTH_FILE_NAME: &str = "workbuddy-desktop.info";
 pub(crate) fn wb_auth_dir() -> PathBuf {
     std::env::var("LOCALAPPDATA")
         .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
+        // 审查修复（L14）：LOCALAPPDATA 缺失（如计划任务上下文）时原实现退化为
+        // 随进程 CWD 漂移的相对路径——改从 USERPROFILE 推导绝对路径兜底，
+        // 两者皆缺失才保留相对路径作最后回退
+        .or_else(|_| {
+            std::env::var("USERPROFILE")
+                .map(|u| PathBuf::from(u).join("AppData").join("Local").join(WB_AUTH_DIR_REL))
+        })
         .unwrap_or_else(|_| PathBuf::from(WB_AUTH_DIR_REL))
 }
 

@@ -688,21 +688,36 @@ where
             }
             return (kind2, msg2);
         }
-        // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（下次调度自然重试）
-        if fail_reason == Some(wb_common::RefreshFail::Auth) {
+        // 审查修复（M16）：按 RefreshFail 枚举区分文案——仅 Auth/NoRefreshToken 归为
+        // 登录态问题（前者标 needs_relogin，后者无 rt 永不自愈同样标）；Network/
+        // BadResponse/Busy 属瞬时失败（下次调度自然重试），如实报瞬时失败，
+        // 不再渲染成「登录态失效」误导用户去重登
+        let auth_dead = matches!(
+            fail_reason,
+            Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
+        );
+        if auth_dead {
             // issue #118：透传上游错误细节，便于区分会话失效与账号封禁
             let mut reason = format!("refresh 失败: {msg}");
             if let Some(d) = fail_detail.as_deref() {
                 reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
             }
             wb_common::mark_needs_relogin(state, acct_id, &reason);
+            let msg_fail = match fail_detail.as_deref() {
+                Some(d) => format!(
+                    "登录态失效且刷新失败；上游: {d}（{}）",
+                    wb_common::refresh_fail_hint(d)
+                ),
+                None => "登录态失效且刷新失败".into(),
+            };
+            return ("fail".into(), msg_fail);
         }
         let msg_fail = match fail_detail.as_deref() {
             Some(d) => format!(
-                "登录态失效且刷新失败；上游: {d}（{}）",
+                "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试；上游: {d}（{}）",
                 wb_common::refresh_fail_hint(d)
             ),
-            None => "登录态失效且刷新失败".into(),
+            None => "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试".into(),
         };
         return ("fail".into(), msg_fail);
     }

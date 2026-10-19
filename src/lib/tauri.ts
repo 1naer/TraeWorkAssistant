@@ -491,16 +491,17 @@ export const api = {
         'buddy_ai_credits_history',
         { days: days ?? null },
       ),
-    /** 账号池导出（includeCredentials=true 附带凭证明文副本，前端强确认） */
-    accountsExport: (includeCredentials?: boolean) =>
+    /** 账号池导出（includeCredentials=true 时须提供 password：凭证以 AIWQENC1 信封加密写入导出文件，不回传明文） */
+    accountsExport: (includeCredentials?: boolean, password?: string) =>
       invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
         includeCredentials: includeCredentials ?? null,
+        password: password ?? null,
       }),
-    /** 账号池导入（accounts_export 回导；合并语义：同 id 跳过，凭证副本仅回灌缺失账号） */
-    accountsImport: (poolJson: Record<string, unknown>) =>
+    /** 账号池导入（accounts_export 回导；加密信封文件须传 password 解密，明文旧文件 password 传 null 兼容） */
+    accountsImport: (poolJson: Record<string, unknown>, password?: string | null) =>
       invoke<{ added: number; skipped: number; invalid: number; tokens_added: number }>(
         'buddy_ai_accounts_import',
-        { poolJson },
+        { poolJson, password: password ?? null },
       ),
     /** 扫描本机 WorkBuddy AI 客户端登录账号（account-snapshot.json；识别+池内匹配） */
     localScan: () =>
@@ -1166,87 +1167,100 @@ export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
   const unsubs: UnlistenFn[] = [];
-  if (handlers.onProxyLog) {
-    unsubs.push(
-      await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
-    );
-  }
-  if (handlers.onAccountCaptured) {
-    unsubs.push(
-      await listen<string>('account-captured', (e) =>
-        handlers.onAccountCaptured!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onCheckinProgress) {
-    unsubs.push(
-      await listen<CheckinProgressEvent>('checkin-progress', (e) =>
-        handlers.onCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchProgress) {
-    unsubs.push(
-      await listen<string>('switch-progress', (e) =>
-        handlers.onSwitchProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchDone) {
-    unsubs.push(
-      await listen<SwitchDoneEvent>('switch-done', (e) =>
-        handlers.onSwitchDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginProgress) {
-    unsubs.push(
-      await listen<string>('save-login-progress', (e) =>
-        handlers.onSaveLoginProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginDone) {
-    unsubs.push(
-      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
-        handlers.onSaveLoginDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetProgress) {
-    unsubs.push(
-      await listen<string>('device-reset-progress', (e) =>
-        handlers.onDeviceResetProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetDone) {
-    unsubs.push(
-      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
-        handlers.onDeviceResetDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileProgress) {
-    unsubs.push(
-      await listen<string>('profile-progress', (e) =>
-        handlers.onProfileProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileDone) {
-    unsubs.push(
-      await listen<ProfileDoneEvent>('profile-done', (e) =>
-        handlers.onProfileDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onQoderCheckinProgress) {
-    unsubs.push(
-      await listen<string>('qoder-checkin-progress', (e) =>
-        handlers.onQoderCheckinProgress!(e.payload),
-      ),
-    );
+  // 审查修复（L31）：注册中途失败（某事件 listen 抛错）时，先注销已注册的
+  // 前 N-1 个监听再重抛，避免泄漏；调用方（store）拿到异常时也不会有残留监听
+  try {
+    if (handlers.onProxyLog) {
+      unsubs.push(
+        await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
+      );
+    }
+    if (handlers.onAccountCaptured) {
+      unsubs.push(
+        await listen<string>('account-captured', (e) =>
+          handlers.onAccountCaptured!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCheckinProgress) {
+      unsubs.push(
+        await listen<CheckinProgressEvent>('checkin-progress', (e) =>
+          handlers.onCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchProgress) {
+      unsubs.push(
+        await listen<string>('switch-progress', (e) =>
+          handlers.onSwitchProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchDone) {
+      unsubs.push(
+        await listen<SwitchDoneEvent>('switch-done', (e) =>
+          handlers.onSwitchDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginProgress) {
+      unsubs.push(
+        await listen<string>('save-login-progress', (e) =>
+          handlers.onSaveLoginProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginDone) {
+      unsubs.push(
+        await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
+          handlers.onSaveLoginDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetProgress) {
+      unsubs.push(
+        await listen<string>('device-reset-progress', (e) =>
+          handlers.onDeviceResetProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetDone) {
+      unsubs.push(
+        await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
+          handlers.onDeviceResetDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileProgress) {
+      unsubs.push(
+        await listen<string>('profile-progress', (e) =>
+          handlers.onProfileProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileDone) {
+      unsubs.push(
+        await listen<ProfileDoneEvent>('profile-done', (e) =>
+          handlers.onProfileDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onQoderCheckinProgress) {
+      unsubs.push(
+        await listen<string>('qoder-checkin-progress', (e) =>
+          handlers.onQoderCheckinProgress!(e.payload),
+        ),
+      );
+    }
+  } catch (err) {
+    for (const u of unsubs) {
+      try {
+        u();
+      } catch {
+        /* 单个注销失败不阻断清理，继续注销其余监听 */
+      }
+    }
+    throw err;
   }
   return unsubs;
 }

@@ -73,6 +73,13 @@ export default function BuddyAiAccounts() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
   const [exportBusy, setExportBusy] = useState(false);
+  // 审查修复（第5项）：含凭证导出必须设密码（AIWQENC1 加密信封），双输入防手误
+  const [exportPwd, setExportPwd] = useState('');
+  const [exportPwd2, setExportPwd2] = useState('');
+  // 审查修复（第5项）：加密导出文件导入时需密码解密（AIWQENC1 信封），暂存解析后的信封载荷
+  const [importEnvelope, setImportEnvelope] = useState<Record<string, unknown> | null>(null);
+  const [importPwd, setImportPwd] = useState('');
+  const [importBusy, setImportBusy] = useState(false);
   // 帮助 / 分组管理 / 标签管理弹框（对齐国内 BuddyAccounts）
   const [helpOpen, setHelpOpen] = useState(false);
   const [groupOpen, setGroupOpen] = useState(false);
@@ -172,6 +179,10 @@ export default function BuddyAiAccounts() {
       if (e.payload.auth_url) setOauthAuthUrl(e.payload.auth_url);
     });
     const unDone = listen<WbOauthDone>('buddy-ai-oauth-done', (e) => {
+      // 审查修复（L26）：done 即定局（成功或失败均已展示），撤销看门狗，
+      // 避免 310s 后「登录超时」覆盖已展示的结果信息
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = undefined;
       setOauthBusy(false);
       if (e.payload.ok) {
         pushToast('success', e.payload.message || '国际账号已扫码登录并自动入池');
@@ -249,8 +260,8 @@ export default function BuddyAiAccounts() {
         if (!swBusyRef.current) return;
         setSwBusy(false);
         swBusyRef.current = false;
-        if (e.payload.success) pushToast('success', e.payload.raw || '切换完成');
-        else pushToast('error', e.payload.raw || '切换失败，详见进度面板');
+        // 审查修复（L25）：完成 toast 由 store 全局监听统一发（onSwitchDone），
+        // 页面级只负责解锁与刷新，避免双 toast
         void refresh();
       }),
     );
@@ -259,8 +270,8 @@ export default function BuddyAiAccounts() {
         if (!swBusyRef.current) return;
         setSwBusy(false);
         swBusyRef.current = false;
-        if (e.payload.success) pushToast('success', e.payload.raw || '当前登录态已保存');
-        else pushToast('error', e.payload.raw || '保存失败，详见进度面板');
+        // 审查修复（L25）：完成 toast 由 store 全局监听统一发（onSaveLoginDone），
+        // 页面级只负责解锁与刷新，避免双 toast
         void refresh();
       }),
     );
@@ -342,13 +353,18 @@ export default function BuddyAiAccounts() {
     }
   };
 
-  // 导出账号池（P8 对齐国内 F-46：默认脱敏；凭证副本强确认——文件含明文 token 等同密码）
+  // 导出账号池（P8 对齐国内 F-46：默认脱敏；凭证副本强确认——含凭证必须设密码加密导出）
   const doExport = async () => {
+    // 审查修复（第5项）：含凭证导出必须提供非空且一致的密码，否则拒绝发起导出
+    if (exportWithCreds && (!exportPwd.trim() || exportPwd !== exportPwd2)) {
+      pushToast('error', '两次输入的导出密码为空或不一致，无法导出含凭证的文件');
+      return;
+    }
     setExportBusy(true);
     try {
-      const payload = await api.buddyai.accountsExport(exportWithCreds);
-      // FL-5：导出计数取自导出载荷（页面快照可能已过期）
-      const exportedCount = Array.isArray(payload.accounts) ? payload.accounts.length : 0;
+      const payload = await api.buddyai.accountsExport(exportWithCreds, exportWithCreds ? exportPwd : undefined);
+      // FL-5：导出计数取自导出载荷（页面快照可能已过期）；加密信封顶层无 accounts，回退页面计数
+      const exportedCount = Array.isArray(payload.accounts) ? payload.accounts.length : (accounts?.length ?? 0);
       const filePath = await save({
         defaultPath: `buddy-ai-accounts-${new Date().toISOString().slice(0, 10)}.json`,
         filters: [{ name: 'JSON', extensions: ['json'] }],
@@ -358,7 +374,7 @@ export default function BuddyAiAccounts() {
         return;
       }
       await api.misc.writeTextFile(filePath, JSON.stringify(payload, null, 2));
-      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${exportWithCreds ? '（含凭证明文，请妥善保管）' : ''}`);
+      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${exportWithCreds ? '（凭证已 AES-256-GCM 加密，请牢记导出密码）' : ''}`);
       setExportOpen(false);
     } catch (err) {
       pushToast('error', `导出失败：${String(err).slice(0, 160)}`);
@@ -381,10 +397,16 @@ export default function BuddyAiAccounts() {
     }
   };
 
-  /** 导入账号 JSON（accounts_export 回导；合并语义：同 id 跳过不覆盖） */
+  /** 导入账号 JSON（accounts_export 回导；合并语义：同 id 跳过不覆盖；加密信封文件先弹密码框） */
   const doImport = async (file: File) => {
     try {
-      const parsed = JSON.parse(await file.text());
+      const parsed = JSON.parse(await file.text()) as Record<string, unknown>;
+      // 审查修复（第5项）：AIWQENC1 加密信封（顶层 data 为 base64 字符串，与后端 envelope_data_of 判据一致）需密码解密
+      if (typeof parsed?.data === 'string' && parsed.data.length > 0) {
+        setImportPwd('');
+        setImportEnvelope(parsed);
+        return;
+      }
       const r = await api.buddyai.accountsImport(parsed);
       pushToast(
         'success',
@@ -393,6 +415,26 @@ export default function BuddyAiAccounts() {
       await refresh();
     } catch (err) {
       pushToast('error', `导入失败：${String(err).slice(0, 160)}`);
+    }
+  };
+
+  /** 审查修复（第5项）：导入加密信封文件（AIWQENC1）——带密码交后端解密后按原合并语义入池 */
+  const doImportEncrypted = async () => {
+    if (!importEnvelope || !importPwd.trim()) return;
+    setImportBusy(true);
+    try {
+      const r = await api.buddyai.accountsImport(importEnvelope, importPwd);
+      pushToast(
+        'success',
+        `导入完成：新增 ${r.added} · 跳过 ${r.skipped}（已存在）· 无效 ${r.invalid} · 凭证回灌 ${r.tokens_added}`,
+      );
+      setImportEnvelope(null);
+      setImportPwd('');
+      await refresh();
+    } catch (err) {
+      pushToast('error', `导入失败：${String(err).slice(0, 160)}`);
+    } finally {
+      setImportBusy(false);
     }
   };
 
@@ -526,7 +568,12 @@ export default function BuddyAiAccounts() {
             </button>
             <button
               className="btn-outline"
-              onClick={() => setExportOpen(true)}
+              onClick={() => {
+                // 审查修复（第5项）：每次打开导出弹框重置密码输入，避免残留上次的密码
+                setExportPwd('');
+                setExportPwd2('');
+                setExportOpen(true);
+              }}
               disabled={!accounts || accounts.length === 0}
               title="导出账号池为 JSON（可选是否附带凭证副本）"
             >
@@ -980,8 +1027,39 @@ export default function BuddyAiAccounts() {
           </label>
           {exportWithCreds ? (
             <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] leading-4 text-red-600 dark:bg-red-500/10 dark:text-red-300">
-              ⚠ 勾选后导出文件包含 access_token / refresh_token 明文，等同账号密码——请妥善保管，切勿通过不可信渠道传输。
+              ⚠ 勾选后 access_token / refresh_token 将以 AES-256-GCM 加密写入导出文件（等同账号密码）——请妥善保管文件并牢记导出密码，导入时需输入。
             </div>
+          ) : null}
+          {exportWithCreds ? (
+            <>
+              <div>
+                <label className="label">导出密码（用于加密凭证）</label>
+                <input
+                  type="password"
+                  className="input"
+                  value={exportPwd}
+                  onChange={(e) => setExportPwd(e.target.value)}
+                  placeholder="导入加密文件时需输入此密码"
+                />
+              </div>
+              <div>
+                <label className="label">确认密码</label>
+                <input
+                  type="password"
+                  className="input"
+                  value={exportPwd2}
+                  onChange={(e) => setExportPwd2(e.target.value)}
+                  onKeyDown={(e) => {
+                    // 审查修复（第5项）：回车快捷提交，仅当密码非空且两次一致时允许
+                    if (e.key === 'Enter' && !exportBusy && exportPwd.trim() && exportPwd === exportPwd2) void doExport();
+                  }}
+                  placeholder="再次输入相同密码"
+                />
+                {exportPwd2.length > 0 && exportPwd !== exportPwd2 ? (
+                  <p className="mt-1 text-[11px] text-red-500">两次输入的密码不一致</p>
+                ) : null}
+              </div>
+            </>
           ) : null}
           <div className="flex justify-end gap-2 pt-1">
             <button className="btn-secondary" disabled={exportBusy} onClick={() => setExportOpen(false)}>
@@ -989,11 +1067,45 @@ export default function BuddyAiAccounts() {
             </button>
             <button
               className={`btn-primary inline-flex items-center gap-1.5 ${exportWithCreds ? 'bg-red-600 hover:bg-red-700' : ''}`}
-              disabled={exportBusy}
+              disabled={exportBusy || (exportWithCreds && (!exportPwd.trim() || exportPwd !== exportPwd2))}
               onClick={() => void doExport()}
             >
               {exportBusy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-              {exportWithCreds ? '我已知晓风险，确认导出' : '确认导出'}
+              {exportWithCreds ? '我已知晓风险，加密导出' : '确认导出'}
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 审查修复（第5项）：AIWQENC1 加密导出文件需密码解密——导入密码弹框 */}
+      <Modal open={importEnvelope !== null} onClose={() => !importBusy && setImportEnvelope(null)} title="导入加密账号文件" widthClass="max-w-sm">
+        <div className="space-y-3 text-sm">
+          <div>该文件为加密导出（凭证已加密），请输入导出时设置的密码进行解密导入。</div>
+          <div>
+            <label className="label">导出密码</label>
+            <input
+              type="password"
+              className="input"
+              autoFocus
+              value={importPwd}
+              onChange={(e) => setImportPwd(e.target.value)}
+              onKeyDown={(e) => {
+                // 审查修复（第5项）：回车快捷提交，仅当密码非空且不处于忙态时允许
+                if (e.key === 'Enter' && !importBusy && importPwd.trim()) void doImportEncrypted();
+              }}
+              placeholder="导出时设置的密码"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-1">
+            <button className="btn-secondary" disabled={importBusy} onClick={() => setImportEnvelope(null)}>
+              取消
+            </button>
+            <button
+              className="btn-primary inline-flex items-center gap-1.5"
+              disabled={importBusy || !importPwd.trim()}
+              onClick={() => void doImportEncrypted()}
+            >
+              {importBusy ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />} 解密并导入
             </button>
           </div>
         </div>

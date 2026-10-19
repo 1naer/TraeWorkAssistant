@@ -365,6 +365,34 @@ mod tests {
         (d, s)
     }
 
+    /// 审查修复（M7）：rows_replace_with_kv 单事务原语回环——行表替换与 kv 元数据
+    /// 同事务生效（api_keys_save 最敏感：Key 行与鉴权开关不得分叉）。
+    #[test]
+    fn rows_replace_with_kv_roundtrip_via_api_keys_save() {
+        use crate::api_server::api_keys::ApiKeyEntry;
+        let (_dir, s) = tmp_store("rrkv");
+
+        // 经真实调用点 api_keys_save 写入：行表 + 鉴权开关一次落库
+        let entry: ApiKeyEntry =
+            serde_json::from_value(json!({ "id": "k1", "name": "测试Key", "key": "sk-test" })).unwrap();
+        api_keys_save(&s, &ApiKeysFile { keys: vec![entry], auth_disabled: true }).unwrap();
+        let loaded = api_keys_load(&s);
+        assert_eq!(loaded.keys.len(), 1, "Key 行随调用点写入");
+        assert_eq!(loaded.keys[0].id, "k1");
+        assert!(loaded.auth_disabled, "鉴权开关与 Key 行同事务写入，不得缺失");
+
+        // 原语直测：整表替换 + kv 键覆盖，同事务内双双生效
+        let rows = vec![("k2".to_string(), json!({ "id": "k2", "name": "n2", "key": "sk-2" }))];
+        s.rows_replace_with_kv("api_keys", &rows, "probe_key", "v1").unwrap();
+        let all = s.rows_all("api_keys").unwrap();
+        assert_eq!(all.len(), 1, "整表替换生效");
+        assert_eq!(all[0].0, "k2");
+        assert_eq!(s.kv_get_raw("probe_key").as_deref(), Some("v1"));
+
+        // 白名单守门与 rows_replace 同口径：非法表名直接拒绝
+        assert!(s.rows_replace_with_kv("not_a_table", &rows, "probe_key", "v2").is_err());
+    }
+
     /// qoder_sessions_compact 全链路（会话聚合修复后口径）：按 (date, uid, preview)
     /// 归并（随机 session_id 旧行同轮归并）、跨账号不串组、近期窗不动、
     /// 幂等（再跑 0 变更）、迟到行并入已合并组不双计、agg 前缀防御。
@@ -1230,8 +1258,9 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             (uid, Value::Object(obj))
         })
         .collect();
-    s.rows_replace("remaining_credits", &rows)?;
-    s.kv_set("remaining_credits_updated_at", &f.updated_at)
+    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("remaining_credits", &rows, "remaining_credits_updated_at", &kv)
 }
 
 // ── 冷却状态（account_cooldowns.json → account_cooldowns 表）─────────────────
@@ -1260,8 +1289,9 @@ pub fn account_cooldowns_save(s: &Store, f: &AccountCooldownsFile) -> Result<(),
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("account_cooldowns", &rows)?;
-    s.kv_set("account_cooldowns_updated_at", &f.updated_at)
+    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("account_cooldowns", &rows, "account_cooldowns_updated_at", &kv)
 }
 
 // ── 套餐身份（pay_status.json → pay_status 表）───────────────────────────────
@@ -1288,8 +1318,9 @@ pub fn pay_status_save(s: &Store, f: &crate::commands::trae_apps::PayStatusFile)
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("pay_status", &rows)?;
-    s.kv_set("pay_status_updated_at", &f.updated_at)
+    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("pay_status", &rows, "pay_status_updated_at", &kv)
 }
 
 // ── API Key（api_keys.json → api_keys 表 + kv 鉴权开关）──────────────────────
@@ -1314,8 +1345,14 @@ pub fn api_keys_save(s: &Store, f: &ApiKeysFile) -> Result<(), String> {
         .map(|k| serde_json::to_value(k).map(|v| (k.id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("api_keys", &rows)?;
-    s.kv_set_raw("api_keys_auth_disabled", if f.auth_disabled { "true" } else { "false" })
+    // 审查修复（M7）：行表与鉴权开关同事务写入（最敏感分叉点——崩溃后可能
+    // 出现「Key 已换而开关未改」的陈旧鉴权状态）
+    s.rows_replace_with_kv(
+        "api_keys",
+        &rows,
+        "api_keys_auth_disabled",
+        if f.auth_disabled { "true" } else { "false" },
+    )
 }
 
 // ── 自定义模型（custom_models.json → custom_models 表）───────────────────────
@@ -1340,8 +1377,8 @@ pub fn custom_models_save(s: &Store, f: &CustomModelsFile) -> Result<(), String>
         .map(|m| serde_json::to_value(m).map(|v| (m.id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("custom_models", &rows)?;
-    s.kv_set_raw("custom_models_updated_at", &f.updated_at.to_string())
+    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    s.rows_replace_with_kv("custom_models", &rows, "custom_models_updated_at", &f.updated_at.to_string())
 }
 
 // ── 豆包账号池（doubao_accounts.json → doubao_accounts 表）───────────────────
@@ -1367,11 +1404,10 @@ pub fn doubao_pool_save(s: &Store, pool: &crate::commands::doubao::DoubaoAccount
         .map(|a| serde_json::to_value(a).map(|v| (a.user_id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("doubao_accounts", &rows)?;
-    s.kv_set(
-        "doubao_pool_meta",
-        &json!({ "last_keepalive_at": pool.last_keepalive_at }),
-    )
+    // 审查修复（M7）：行表与 keepalive 元数据同事务写入，消除崩溃/竞争分叉窗口
+    let kv = serde_json::to_string(&json!({ "last_keepalive_at": pool.last_keepalive_at }))
+        .map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("doubao_accounts", &rows, "doubao_pool_meta", &kv)
 }
 
 // ── WorkBuddy 账号池（workbuddy_accounts.json → wb_accounts 表，Value 语义）──

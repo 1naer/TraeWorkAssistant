@@ -653,9 +653,30 @@ fn process_account(
                 // 交 30 分钟冷却重试（凭证续期/401 自愈后新值可成功）。last_status
                 // 携带的「HTTP 401」原文会经 fail 闭包改写为「凭证401」（T7），
                 // 不触发调度器 failed_permanent；原始错误已 app_log 佐证
-                if e.contains("HTTP 401") || e.contains("HTTP 403") {
-                    last_status = format!("轮询凭证失效（{e}）");
-                    break;
+                // 审查修复（确定性4xx早退）：401/403 之外的确定性 4xx 同样空转满
+                // 180s 无意义——按同款「HTTP {code}」口径提取状态码（with_backoff
+                // 的 Status 错误文案），400-499（除 408/429）确定性失败直接退出；
+                // 408/429/5xx/网络抖动保留重试。早退走普通 fail（调度器 buddy-ai
+                // 打卡分支已无 failed_permanent 判定，全部失败交冷却重试）
+                let poll_code = e
+                    .rsplit("HTTP ")
+                    .next()
+                    .and_then(|rest| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse::<u16>()
+                            .ok()
+                    });
+                if let Some(code) = poll_code {
+                    if (400..500).contains(&code) && code != 408 && code != 429 {
+                        last_status = if e.contains("HTTP 401") || e.contains("HTTP 403") {
+                            format!("轮询凭证失效（{e}）")
+                        } else {
+                            format!("轮询确定性失败（{e}）")
+                        };
+                        break;
+                    }
                 }
                 continue;
             }
@@ -688,8 +709,11 @@ fn process_account(
     let _write_guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
     // 删号竞态保护（审查修复）：六步链执行期（最长 3 分钟）账号可能已被用户移除
     //（remove 已三清 token store/vault/锁表）——upsert 语义会把幽灵凭证行复活，
-    // 先确认账号仍在池中才落戳
-    if !crate::commands::workbuddy::buddy_pool_roster(state).iter().any(|(id, _, _)| id == acct_id) {
+    // 先确认账号仍在池中才落戳。审查修复（停用误判）：删号判定不能用 roster
+    //（滤了 disabled，停用账号不在花名册但仍在池中，会被误判「已移除」致幂等
+    // 戳不落盘 + 归因失实）——改用含停用账号的池原始判定：停用（在池）放行落戳
+    // + 正常回写；真移除（池中已无此 id）才保留删号保护
+    if !crate::commands::workbuddy::buddy_ai_pool_contains(state, acct_id) {
         return fail("账号已在本轮打卡期间被移除，幂等戳不落盘".to_string());
     }
     let latest = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);

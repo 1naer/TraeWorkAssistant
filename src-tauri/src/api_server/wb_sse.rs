@@ -160,7 +160,12 @@ fn parse_data(data: &str) -> Option<WbEvent> {
             .and_then(|m| m.as_str())
             .unwrap_or("upstream error")
             .to_string();
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        // 审查修复（M1）：错误码宽口径提取——code 为字符串形态（如 "4001"）时
+        // parse 成功即取值，避免落 0 丢失 classify_wb_error 的模型级豁免判定依据
+        let code = err
+            .get("code")
+            .and_then(|c| c.as_i64().or_else(|| c.as_str().and_then(|s| s.parse::<i64>().ok())))
+            .unwrap_or(0);
         return Some(WbEvent::Error { code, msg });
     }
     let choice = v

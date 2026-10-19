@@ -367,6 +367,22 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             .cloned()
             .ok_or_else(|| "token_store 内部错误：目标行缺失".to_string())?
     };
+    // 审查修复（M22）：vault 收敛（secure_store_for_save）会把敏感字段明文写入
+    // vault——若此刻 DB 已被其他进程改成不识别的 version，vault 之后的闸门 #2
+    // 才早退会留下「vault 有凭证、DB 无行」的半迁移态孤儿记录。vault 写入前
+    // 重读 DB 复查 version，不识别直接早退（零写入）；vault 之后的 fresh 重载
+    // 与闸门 #2 保留（继续护住 H-1 行级合并的收窄窗口，判定口径与之一致）
+    {
+        let pre = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
+        if pre
+            .as_object()
+            .and_then(|o| o.get("version"))
+            .map(|v| v.as_i64() != Some(1))
+            .unwrap_or(false)
+        {
+            return Err("token_store 版本不识别，拒绝写入".to_string());
+        }
+    }
     // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；故落库不使用上面的
     // 读时快照整表替换，而是重新 load DB 最新表做「仅目标行替换」的行级合并，
     // 把进程间 last-writer-wins 的覆盖窗口从「vault 全程」收窄到「load→replace 数毫秒」

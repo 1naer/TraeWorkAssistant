@@ -338,8 +338,10 @@ impl ApiSharedState {
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_cached_in(bucket, cached);
+        // 审查修复（用量跨日归行）：day 在持锁期间取定一次，cached_tokens 写入
+        // 与标脏落盘共用同一日期键，杜绝跨零点时写入行与标脏行分裂到两日
         let day = usage::today_key();
+        guard.record_cached_in(bucket, &day, cached);
         drop(guard);
         self.usage_dirty
             .lock()

@@ -206,6 +206,11 @@ pub async fn do_start(
     let server = crate::device_proxy::ProxyServer::start(cfg, Some(app.clone()))
         .await
         .map_err(|e| {
+            // 审查修复（H2）：启动失败路径清理本轮已捕获的系统代理快照，不留脏状态——
+            // 此时尚未接管系统代理，快照残留会让下次 proxy_stop 用「别人的快照」还原
+            *PREV_SYSTEM_PROXY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             fs_utils::app_log(&state.data_dir, &format!("代理启动失败: {e}"));
             e
         })?;
@@ -301,7 +306,7 @@ pub async fn proxy_start(
 
 #[tauri::command]
 pub fn proxy_stop(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<AppState>,
     proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> Result<ProxyStatus, String> {
@@ -310,6 +315,7 @@ pub fn proxy_stop(
         Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
         None => (0, 0),
     };
+    let was_running = g.is_some();
     if let Some(h) = g.take() {
         // 标记「主动停止」，避免看门狗把正常停止误判为崩溃而重复还原代理
         PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
@@ -318,15 +324,23 @@ pub fn proxy_stop(
         h.server.stop();
         fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
     }
-    // 还原系统代理（#14 共用）：若启动前存在外部代理(VPN)，则还原之；否则清空，
-    // 避免本机全局断网（consume=true 取走快照，本轮还原一次性）
-    if let Err(e) = restore_system_proxy(true) {
-        fs_utils::app_log(
-            &state.data_dir,
-            &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
-        );
+    // 审查修复（H2）：仅「确曾接管」（本次确实停止了运行中的代理实例）才还原系统代理；
+    // 句柄为 None（代理未运行/早已停止）时跳过并提示无需还原——原实现无条件
+    // restore_system_proxy(true)，重复点「停止」会落入 clear_win_proxy()，静默清掉
+    // 用户自己设置的 VPN/系统代理
+    if was_running {
+        // 还原系统代理（#14 共用）：若启动前存在外部代理(VPN)，则还原之；否则清空，
+        // 避免本机全局断网（consume=true 取走快照，本轮还原一次性）
+        if let Err(e) = restore_system_proxy(true) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+            );
+        }
+    } else {
+        let _ = app.emit("proxy-log", "代理未在运行，系统代理无需还原");
     }
-    sync_tray_proxy_text(&_app, false);
+    sync_tray_proxy_text(&app, false);
     Ok(ProxyStatus {
         running: false,
         port,

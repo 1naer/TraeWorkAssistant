@@ -1091,6 +1091,10 @@ fn known_daily_fallback(
     // 当轮重学：重取列表（fetch_campaigns 允许空表——空表 = 学不到 = 放弃重试），
     // 宽松档学习，仅取**未试过**的 id（409 剔除只动 learned/table，tried 防重学撞旧 id）。
     // 重学 GET 用最小头（同上：视野超集，CLAIMABLE 可见，学习更稳）
+    // 审查备案（L20）：宽松档学习不校验活动时间窗，学到的 id 可能含未开放/已过期
+    // 活动，仅作第二轮盲发的候选范围提示（加速收敛）——真值以端点判定为准：
+    // already 只能来自服务端 replayed/CLAIMED 回放确认（classify_blind_step），
+    // 学习值本身不会把未领活动误归 already
     let mut retry: Vec<(String, String)> = Vec::new();
     if let Ok(campaigns) = fetch_campaigns(agent, &minimal_auth_headers(access_token), urls) {
         merge_learned(&mut retry, learn_daily_campaign_ids_lenient(&campaigns));
@@ -1480,31 +1484,36 @@ fn process_account(
     //   （1~3s）会误判未到账 → 降级 fail 触发整轮重签；改最多 3 次回读，到账
     //  （post > pre）即提前采信，3 轮成功回读均未增长才降级
     // - 回读失败（None）不判负——余额端点故障不应推翻已成功的领取
-    if kind == "success" && pre_balance.is_some() {
-        let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
-        let mut arrived = false;
-        for _attempt in 0..3 {
-            jitter_sleep();
-            let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
-                continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
-            };
-            let Some(pre) = pre_balance else { break; };
-            if reward.is_none() && post > pre {
-                reward = Some(post - pre);
+    if kind == "success" {
+        // 审查修复（L18）：原循环内 `let Some(pre) = pre_balance else { break; }` 是
+        // 不可达守卫（外层条件已保证 pre_balance 为 Some），死代码在日后重构外层
+        // 条件时会静默退化——改为安全绑定：不变量破坏时跳过整个到账校验
+        //（不判到账，维持 success），不依赖不可达分支兜底
+        if let Some(pre) = pre_balance {
+            let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
+            let mut arrived = false;
+            for _attempt in 0..3 {
+                jitter_sleep();
+                let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
+                    continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
+                };
+                if reward.is_none() && post > pre {
+                    reward = Some(post - pre);
+                }
+                if post > pre {
+                    arrived = true;
+                    break;
+                }
+                flat_reads += 1;
+                if !all_credits {
+                    break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
+                }
             }
-            if post > pre {
-                arrived = true;
-                break;
+            if all_credits && !arrived && flat_reads > 0 {
+                kind = "fail".into();
+                message = format!("{message}；但余额未增长（未到账），保留自动重试");
+                reward = None;
             }
-            flat_reads += 1;
-            if !all_credits {
-                break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
-            }
-        }
-        if all_credits && !arrived && flat_reads > 0 {
-            kind = "fail".into();
-            message = format!("{message}；但余额未增长（未到账），保留自动重试");
-            reward = None;
         }
     }
     // 签到奖励运行期回写（对齐 qoder_credits::run_snapshot_task 的 issue #102 口径）：

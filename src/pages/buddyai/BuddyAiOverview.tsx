@@ -149,8 +149,10 @@ export default function BuddyAiOverview() {
     },
     {
       key: 'account',
-      title: '扫描本机账号',
-      desc: '在客户端登录后到「账号管理」扫描本机 .workbuddy-ai 账号，或用 workbuddy.ai OAuth 登录入池。',
+      /* 审查修复（第7项残留复查）：docker 版已裁剪「扫描本机账号」入口，卡片标题与
+         引导同步改为实际可用入口（OAuth 登录 / 导入账号），与 HelpModal 口径一致 */
+      title: '添加账号',
+      desc: '到「账号管理」用 workbuddy.ai OAuth 登录授权入池，或「导入账号」导入账号池 JSON（.workbuddy.ai 域凭证）。',
       done: total > 0,
       actionLabel: '去导入',
       view: 'buddyai-accounts',
@@ -262,7 +264,8 @@ export default function BuddyAiOverview() {
               ? `本机登录：${localAcct.nickname || '—'}（account-snapshot 实抓）`
               : pkgNames.length > 1
                 ? `积分包含 ${pkgNames.join(' / ')}`
-                : '未检测到本机登录（账号管理 → 扫描本机账号）'
+                // 审查修复（第7项残留复查）：扫描入口已裁剪，指向改为实际存在的 OAuth登录 按钮
+                : '未检测到本机登录（账号管理 → OAuth登录）'
           }
           tone="violet"
         />

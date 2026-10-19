@@ -713,7 +713,14 @@ pub fn account_delete(
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
         fs_utils::ensure_uid_safe(&user_id)?;
         let p = state.path("profiles").join(&user_id);
-        let _ = std::fs::remove_dir_all(p);
+        // 审查修复（M13）：删除失败原被 `let _` 吞掉——登录态快照（含敏感凭证）
+        // 「以为删了其实还在」，落 app.log 留痕便于人工确认与清理
+        if let Err(e) = std::fs::remove_dir_all(&p) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("账号 {user_id} 登录态快照目录删除失败: {e}"),
+            );
+        }
     }
     Ok(())
 }

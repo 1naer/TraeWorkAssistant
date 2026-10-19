@@ -58,6 +58,12 @@ pub(crate) fn buddy_pool_roster(state: &AppState) -> Vec<(String, String, String
         .collect()
 }
 
+/// buddy-ai 池成员判定（含停用账号）：打卡删号保护二次判定用——roster 已滤
+/// disabled，停用账号不在花名册但仍在池中，据 roster 判「已移除」会误伤
+pub(crate) fn buddy_ai_pool_contains(state: &AppState, acct_id: &str) -> bool {
+    load_buddy_pool(state).accounts.iter().any(|a| a.id == acct_id)
+}
+
 /// buddy-ai 池单账号积分快照回写（持 buddy_ai_pool_lock 短临界区；三键口径
 /// 对齐 write_back_pool_balances：balance / fetched_at / 最早未来到期）
 pub(crate) fn buddy_pool_write_credits(
@@ -270,11 +276,15 @@ pub fn buddy_ai_account_import_creds(
     state: State<'_, AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     name: Option<String>,
-    access_token: String,
+    access_token: Option<String>,
     refresh_token: Option<String>,
     domain: Option<String>,
 ) -> Result<Value, String> {
-    let token = access_token.trim().to_string();
+    // 审查修复（导入参数容错）：前端 invoke 传 accessToken ?? null 时，String 形参在
+    // 桥接层反序列化即失败（等效 500），下方「access_token 不能为空」业务校验永远走不到，
+    // 前端拿到的是桥接错误而非业务文案；改 Option<String> 天然接受 null，
+    // None 与空串统一落既有空校验返回业务文案
+    let token = access_token.as_deref().unwrap_or("").trim().to_string();
     if token.is_empty() {
         return Err("access_token 不能为空".into());
     }
@@ -333,6 +343,17 @@ pub fn buddy_ai_account_import_creds(
     // 锁外读到的 stale rt 会整行覆盖新 rt（账号须重登）——与续期/打卡写段同锁域
     let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
     let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 审查修复（M18）：导入「先落池后落凭证」——落池到写凭证之间账号可能被并发
+    // 删除（删除路径只持池锁不持刷新锁），凭证 upsert 是整行 REPLACE，会给已不
+    // 存在的账号留下永驻 store 的幽灵凭证行。持刷新锁后复查账号仍在池中（锁序
+    // 刷新锁→池锁，与续期路径 640 行同序），不在则拒绝写凭证。
+    let still_in_pool = {
+        let _pool_guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        load_buddy_pool(&state).accounts.iter().any(|a| a.id == target_id)
+    };
+    if !still_in_pool {
+        return Err(format!("账号 {target_id} 已被移除，取消凭证写入（防幽灵凭证残留）"));
+    }
     let existing = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
         .get("tokens")
         .and_then(|t| t.get(&target_id))
@@ -547,10 +568,26 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     let _refresh_guard = refresh_lock
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Some(_cross) =
-        crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(&state.data_dir, "buddy-ai", &acct.id, 5000).0
-    else {
-        return Err("他方进程正在刷新该账号，稍后重试".into());
+    // 审查修复（锁失败归因）：解构 (acquired, fail)——原 `.0` 丢弃失败原因，
+    // CreateFailed/WaitFailed（内核错误，锁机制不可用）被误报为「他方进程正在
+    // 刷新」。Busy 保留原幂等语义与文案；非 Busy 落 app_log 如实归因
+    //（对齐 qoder_refresh 的 lock_fail 处理范式）
+    let (_cross, lock_fail) =
+        crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(&state.data_dir, "buddy-ai", &acct.id, 5000);
+    let Some(_cross) = _cross else {
+        let busy = matches!(lock_fail, Some(crate::tasks::qoder_common::CrossProcLockFail::Busy));
+        let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+        if !busy {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("buddy-ai: 账号 {user_id} 跨进程刷新锁获取失败（{reason}）"),
+            );
+        }
+        return Err(if busy {
+            "他方进程正在刷新该账号，稍后重试".into()
+        } else {
+            format!("跨进程刷新锁不可用（{reason}），稍后重试")
+        });
     };
     // 锁内读凭证（他人刚刷新落库的新值直接可见）
     let tokens = load_buddy_tokens(&state);
@@ -847,6 +884,11 @@ pub fn buddy_ai_credits_sync_impl(
         .unwrap_or_default();
     let mut out = Vec::new();
     for a in &pool.accounts {
+        // 审查修复（M17）：停用账号不参与积分/Token 同步，避免污染看板统计
+        // （对齐 buddy_ai_usage_official_all_impl 的 disabled 过滤口径）
+        if a.disabled {
+            continue;
+        }
         let rec = tokens.get(&a.id).cloned().unwrap_or_default();
         let token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default().to_string();
         if token.is_empty() {
@@ -1662,6 +1704,7 @@ fn buddy_ai_row_preview(item: &Value) -> String {
 /// 端点/回退与 buddy_ai_request_usage 同款：/v2 前缀 404 回退裸路径）。
 /// 返回 (聚合行 (date, credit, model), 请求级行)；requestId 去重，
 /// credit 缺失/负值/日期不可解析行跳过；请求级行仅含 ts 可解析的行。
+/// 审查修复（M21）：分页中途失败降级为「已取数据 + truncated」（零数据失败仍上抛）。
 fn buddy_ai_official_usage_rows(
     agent: &ureq::Agent,
     base: &str,
@@ -1710,20 +1753,41 @@ fn buddy_ai_official_usage_rows(
     let mut reported_total: i64 = 0;
     let mut page_responses: Vec<Value> = vec![first];
     let mut next_page = 2u64;
+    // 审查修复（M21）：分页中途失败降级——置 mid_fail 提前收束，返回已成功拉取的
+    // 页数据并透传 truncated（调用方/前端据此提示「数据不完整」），不再 `?`/Err
+    // 整体上抛丢弃全部已取页；首页探测失败与零数据失败仍原样上抛——调用方的
+    // stale 缓存回退依赖 Err 信号，空数据 + truncated 会被误计为成功账号跳过回退
+    let mut mid_fail = false;
     loop {
         let Some(v) = page_responses.pop() else {
             if next_page > 30 {
                 break;
             }
-            page_responses.push(call(&url, next_page)?);
-            next_page += 1;
+            match call(&url, next_page) {
+                Ok(v) => {
+                    page_responses.push(v);
+                    next_page += 1;
+                }
+                Err(e) => {
+                    if rows.is_empty() && sess_rows.is_empty() {
+                        return Err(e);
+                    }
+                    mid_fail = true;
+                    break;
+                }
+            }
             continue;
         };
         if v.get("code").and_then(Value::as_i64) != Some(0) {
-            return Err(format!(
+            let msg = format!(
                 "官网返回异常: {}",
                 v.get("msg").and_then(Value::as_str).unwrap_or("未知错误")
-            ));
+            );
+            if rows.is_empty() && sess_rows.is_empty() {
+                return Err(msg);
+            }
+            mid_fail = true;
+            break;
         }
         let data = v.get("data").cloned().unwrap_or_default();
         let items = data
@@ -1779,8 +1843,9 @@ fn buddy_ai_official_usage_rows(
             break;
         }
     }
-    // 截断标记（31 天 > 30 页 × 100 行的重度账号）：聚合可低估，调用方/前端须可感知
-    let truncated = reported_total > seen.len() as i64;
+    // 截断标记（31 天 > 30 页 × 100 行的重度账号）：聚合可低估，调用方/前端须可感知；
+    // M21 分页中途失败同样置 truncated（已取页数不足，聚合同样不完整）
+    let truncated = mid_fail || reported_total > seen.len() as i64;
     Ok((rows, sess_rows, truncated))
 }
 
@@ -1808,11 +1873,16 @@ pub fn buddy_ai_credits_history(
 }
 
 /// buddy-ai 账号池导出（P8 对齐 workbuddy_accounts_export；include_credentials=true
-/// 附带凭证明文副本——前端强确认 + 本地落盘，导出文件等同密码请妥善保管）
+/// 附带凭证副本）。审查修复（第5项）：含凭证导出不再明文落盘——载荷以 AIWQENC1
+/// 信封（Argon2id KDF + AES-256-GCM）加密后写入导出文件（对齐 Qoder 侧「含凭证
+/// 必须设密码」口径），未提供密码直接拒绝导出；凭证副本导出前剥离
+/// machine_id/machine_token（设备指纹/设备级凭证不随文件扩散）。
 #[tauri::command(async)]
 pub fn buddy_ai_accounts_export(
     state: State<'_, AppState>,
     include_credentials: Option<bool>,
+    // 审查修复（第5项）：含凭证导出的加密口令（前端可传 null；无凭证导出忽略）
+    password: Option<String>,
 ) -> Result<Value, String> {
     let pool = load_buddy_pool(&state);
     let mut v = serde_json::to_value(&pool).map_err(|e| format!("序列化失败: {e}"))?;
@@ -1820,20 +1890,104 @@ pub fn buddy_ai_accounts_export(
     v["exported_at"] = json!(chrono::Utc::now().to_rfc3339());
     if include_credentials.unwrap_or(false) {
         // 凭证副本（vault 回填后明文，仅内存）；落盘由前端 save 对话框完成
-        v["tokens"] = load_buddy_tokens(&state).get("tokens").cloned().unwrap_or_default();
+        let mut tokens = load_buddy_tokens(&state).get("tokens").cloned().unwrap_or_default();
+        // 审查修复（第5项）：导出前剥离 machine_id/machine_token——token store
+        // 正常不落设备指纹，历史版本/旁路写入存在时防泄漏（对齐 Qoder 侧 §5.10）
+        if let Some(map) = tokens.as_object_mut() {
+            for rec in map.values_mut() {
+                if let Some(obj) = rec.as_object_mut() {
+                    obj.remove("machine_id");
+                    obj.remove("machine_token");
+                }
+            }
+        }
+        v["tokens"] = tokens;
     } else {
         // 脱敏导出：不含任何凭证字段（安全红线：默认路径零明文）
         v["tokens"] = json!({});
     }
-    Ok(v)
+    // 审查修复（第5项）：含凭证载荷打 AIWQENC1 加密信封（无密码拒绝），无凭证明文
+    buddy_ai_export_seal(v, password)
+}
+
+/// 审查修复（第5项）：含凭证载荷 → AIWQENC1 加密信封（纯函数，可单测）。
+/// tokens 中任一账号含非空 access_token/refresh_token 即视为含凭证：未提供密码
+/// → 拒绝导出（文案对齐 Qoder 侧口径）；提供密码 → 载荷整体序列化后 seal_payload
+/// 加密（Argon2id KDF + AES-256-GCM），base64 随信封 JSON `data` 字段导出，内层
+/// 保留 buddy-ai 原有 export_kind/accounts/tokens 结构。无凭证载荷原样明文导出
+/// （无敏感数据，与 Qoder 不含凭证导出同口径）。
+fn buddy_ai_export_seal(payload: Value, password: Option<String>) -> Result<Value, String> {
+    let has_creds = payload
+        .get("tokens")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.values().any(|rec| {
+                rec.get("access_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                    || rec.get("refresh_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if !has_creds {
+        return Ok(payload);
+    }
+    // 密码归一化：trim 后为空视为未提供（防误触空白密码）
+    let pwd = password.filter(|p| !p.trim().is_empty()).ok_or(
+        "导出内容含凭证（access_token/refresh_token），必须设置导出密码：\
+         凭证将以 AES-256-GCM 加密后写入导出文件，不提供密码将拒绝导出",
+    )?;
+    let plain = serde_json::to_vec(&payload).map_err(|e| format!("序列化失败: {e}"))?;
+    let sealed = crate::commands::qoder::seal_payload(&plain, &pwd)?;
+    use base64::Engine as _;
+    Ok(json!({
+        "export_kind": "buddy-ai-pool",
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "encrypted": true,
+        "cipher": "AES-256-GCM",
+        // 新导出一律 Argon2id（导入侧按此字段分派，Qoder 旧 sha256-iter-N 文件同样兼容）
+        "kdf": "argon2id",
+        "data": base64::engine::general_purpose::STANDARD.encode(&sealed),
+    }))
+}
+
+/// 审查修复（第5项）：导入载荷信封解包（纯函数，可单测）。顶层 `data` 字段
+/// base64 解码后以 AIWQENC1 魔数开头 → 加密信封，必须提供非空密码，按信封
+/// `kdf` 字段分派方案解密（密码错误/文件损坏返回业务 Err）；其余形态（旧明文
+/// 导出文件）原样返回，向后兼容。
+fn buddy_ai_import_unseal(payload: Value, password: Option<String>) -> Result<Value, String> {
+    match crate::commands::qoder::envelope_data_of(&payload) {
+        Some(sealed) => {
+            // 密码归一化：trim 后为空视为未提供（与导出侧同口径）
+            let pwd = password.filter(|p| !p.trim().is_empty()).ok_or(
+                "该导出文件已加密（AIWQENC1 信封），需要提供导出时设置的密码才能导入",
+            )?;
+            let plain = crate::commands::qoder::open_payload(
+                &sealed,
+                &pwd,
+                crate::commands::qoder::kdf_scheme_of(&payload)?,
+            )?;
+            serde_json::from_slice::<Value>(&plain).map_err(|e| format!("解密后内容解析失败: {e}"))
+        }
+        None => Ok(payload),
+    }
 }
 
 /// buddy-ai 账号池导入（P8 对齐 workbuddy_accounts_import；accounts_export 的回导）。
-/// 合并语义：同 id 账号跳过（不覆盖池内现状），新账号追加；tokens 副本仅对
-/// token store 中不存在的账号回灌（避免覆盖池内更新的轮换凭证）。
-/// 返回 {added, skipped, invalid, tokens_added}。
+/// 审查修复（第5项）：AIWQENC1 加密信封（导出侧新格式）必须提供非空密码解密后
+/// 再走统一导入链路（密码错误给业务 Err）；无信封的旧明文导出文件原样透传，向后
+/// 兼容（password 提供了也忽略）。合并语义：同 id 账号跳过（不覆盖池内现状），
+/// 新账号追加；tokens 副本仅对 token store 中不存在的账号回灌（避免覆盖池内更新
+/// 的轮换凭证）。返回 {added, skipped, invalid, tokens_added}。
 #[tauri::command(async)]
-pub fn buddy_ai_accounts_import(state: State<'_, AppState>, pool_json: Value) -> Result<Value, String> {
+pub fn buddy_ai_accounts_import(
+    state: State<'_, AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    pool_json: Value,
+    // 审查修复（第5项）：加密信封（AIWQENC1）解密口令（明文旧文件可传 null）
+    password: Option<String>,
+) -> Result<Value, String> {
+    // 审查修复（第5项）：信封解包在 accounts 提取之前（信封外层无 accounts 字段）；
+    // 解包后的热重载/凭证回灌逻辑保持不变
+    let pool_json = buddy_ai_import_unseal(pool_json, password)?;
     let arr = pool_json
         .get("accounts")
         .and_then(Value::as_array)
@@ -1856,6 +2010,19 @@ pub fn buddy_ai_accounts_import(state: State<'_, AppState>, pool_json: Value) ->
 
     let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_buddy_pool(&state);
+    // 审查修复（回灌防覆盖）：先读一次 token store——store 中已有该 id 凭证时其
+    // refresh_token 可能已被网关轮换，导入文件里的过期副本不得覆盖（保留 store 现值）
+    let store_tokens = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);
+    let has_store_creds = |id: &str| -> bool {
+        store_tokens
+            .get("tokens")
+            .and_then(|t| t.get(id))
+            .map(|rec| {
+                rec.get("access_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                    || rec.get("refresh_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+            })
+            .unwrap_or(false)
+    };
     let mut token_targets: Vec<(String, Value)> = Vec::new();
     for a in new_accounts {
         // id 硬校验（与 buddy_ai_account_remove 的 64 字符上限同口径；防超长/带空白脏数据入池）
@@ -1867,13 +2034,16 @@ pub fn buddy_ai_accounts_import(state: State<'_, AppState>, pool_json: Value) ->
             skipped += 1;
             continue;
         }
-        // 凭证副本回灌：仅当 token store 中该 id 不存在（避免覆盖池内轮换后的新凭证）
-        if let Some(tmap) = &imported_tokens {
-            if let Some(rec) = tmap.get(&a.id) {
-                if rec.get("access_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
-                    || rec.get("refresh_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
-                {
-                    token_targets.push((a.id.clone(), rec.clone()));
+        // 凭证副本回灌：仅当 store 无该 id 凭证且导入文件带非空凭证
+        //（store 已有 = 凭证已轮换更新，回灌过期副本会致凭证永久失效）
+        if !has_store_creds(&a.id) {
+            if let Some(tmap) = &imported_tokens {
+                if let Some(rec) = tmap.get(&a.id) {
+                    if rec.get("access_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                        || rec.get("refresh_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                    {
+                        token_targets.push((a.id.clone(), rec.clone()));
+                    }
                 }
             }
         }
@@ -1893,6 +2063,13 @@ pub fn buddy_ai_accounts_import(state: State<'_, AppState>, pool_json: Value) ->
         &state.data_dir,
         &format!("buddy-ai: 导入账号池 added={added} skipped={skipped} invalid={invalid} tokens={tokens_added}"),
     );
+    drop(_guard);
+    // 审查修复（导入热重载）：新增账号/凭证联动网关池热重载——对齐 import_creds /
+    // account_remove 惯例（修改账号的路径均触发热重载），运行中网关不重载看不到
+    // 新账号；锁外重载（锁序纪律：热重载不持池锁）
+    if added > 0 || tokens_added > 0 {
+        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+    }
     Ok(json!({ "added": added, "skipped": skipped, "invalid": invalid, "tokens_added": tokens_added }))
 }
 
@@ -2188,5 +2365,48 @@ mod tests {
         assert_eq!(intl_domain_or(Some(String::new())), INTL_DOMAIN);
         assert_eq!(intl_domain_or(Some("copilot.tencent.com".into())), INTL_DOMAIN);
         assert_eq!(intl_domain_or(Some("www.workbuddy.ai".into())), "www.workbuddy.ai");
+    }
+
+    /// 审查修复（第5项）：export 加密 → import 解密往返——信封形态对齐 Qoder 侧
+    /// （data/kdf/encrypted 字段），密文不含明文凭证，无密码/错误密码均拒绝，
+    /// 正确密码还原原载荷
+    #[test]
+    fn buddy_ai_加密导出导入往返() {
+        let payload = json!({
+            "export_kind": "buddy-ai-pool",
+            "accounts": [{ "id": "wb-x1" }],
+            "tokens": { "wb-x1": { "access_token": "at-secret", "refresh_token": "rt-secret" } },
+        });
+        let env = buddy_ai_export_seal(payload.clone(), Some("pw-口令".into())).unwrap();
+        assert_eq!(env.get("export_kind").and_then(Value::as_str), Some("buddy-ai-pool"));
+        assert_eq!(env.get("kdf").and_then(Value::as_str), Some("argon2id"));
+        assert_eq!(env.get("encrypted").and_then(Value::as_bool), Some(true));
+        let env_str = env.to_string();
+        assert!(!env_str.contains("at-secret"), "信封不得含明文 access_token");
+        assert!(!env_str.contains("rt-secret"), "信封不得含明文 refresh_token");
+        // 无密码 / 错误密码：必须拒绝（业务 Err），不得静默导入
+        assert!(buddy_ai_import_unseal(env.clone(), None).is_err());
+        assert!(buddy_ai_import_unseal(env.clone(), Some("wrong".into())).is_err());
+        let round = buddy_ai_import_unseal(env, Some("pw-口令".into())).unwrap();
+        assert_eq!(round, payload);
+    }
+
+    /// 审查修复（第5项）：无凭证载荷明文导出（不加密）；旧明文导出文件（无 data
+    /// 信封字段）兼容导入——原样透传走原导入链路
+    #[test]
+    fn buddy_ai_明文旧文件兼容导入() {
+        let legacy = json!({
+            "export_kind": "buddy-ai-pool",
+            "accounts": [{ "id": "wb-x1" }],
+            "tokens": {},
+        });
+        let out = buddy_ai_import_unseal(legacy.clone(), None).unwrap();
+        assert_eq!(out, legacy, "明文旧文件应原样透传");
+        let out = buddy_ai_import_unseal(legacy.clone(), Some("whatever".into())).unwrap();
+        assert_eq!(out, legacy, "明文旧文件传了密码也忽略");
+        // 无凭证载荷：即便误传密码也明文导出（无敏感数据，与 Qoder 同口径）
+        let bare = json!({ "export_kind": "buddy-ai-pool", "accounts": [], "tokens": {} });
+        let out = buddy_ai_export_seal(bare.clone(), None).unwrap();
+        assert_eq!(out, bare);
     }
 }

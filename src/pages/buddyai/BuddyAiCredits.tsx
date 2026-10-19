@@ -1312,9 +1312,10 @@ export default function BuddyAiCredits() {
         ) : listF.length === 0 ? (
           <div className="flex h-40 items-center justify-center text-sm text-slate-400">
             {/* 审查修复（M9 同款）：引导文案与账号管理页实际按钮实名对齐
-                （「扫码登录/导入凭证」均非该页按钮名，用户照提示找不到入口） */}
+                （「扫码登录/导入凭证」均非该页按钮名，用户照提示找不到入口）；
+                审查修复：docker 版已裁剪「扫描本机账号」入口，引导句同步移除该表述 */}
             {list.length === 0
-              ? '暂无国际账号，先到「账号管理」点「OAuth登录」授权入池，或「扫描本机账号」「导入账号」。'
+              ? '暂无国际账号，先到「账号管理」点「OAuth登录」授权入池，或「导入账号」。'
               : '当前筛选条件下无账号。'}
           </div>
         ) : (

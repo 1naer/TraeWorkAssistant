@@ -193,6 +193,11 @@ export default function QoderApiService() {
         600,
       );
       pushToast('success', 'Qoder 上游配置已保存（服务运行中即时生效）');
+      // 审查修复（H3）：保存成功后回读后端最新池配置（对齐 BuddyAiApiService.savePool 模式）——
+      // 本页 poolSet 用页面加载时的 pool 旧快照原样回传 uids/strategy/groups，其他端改过的
+      // 池配置会被旧快照静默回退；回读顺带把后端归一化后的真实落库值同步回编辑态。
+      // 回读容错：失败静默保留现状（此时保存已成功，不能让外层 catch 误报「保存失败」）
+      await refresh().catch(() => {});
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -221,6 +226,9 @@ export default function QoderApiService() {
           ? '已开启：Qwen3.8-Flash 倍率按 0 处理，零积分账号可参与该模型调度'
           : '已关闭：Qwen3.8-Flash 恢复官方同步倍率',
       );
+      // 审查修复（H3）：同 saveFlags——保存成功后回读最新池配置，避免其他端改动被
+      // 页面加载时的旧快照静默回退后本地无感知（回读失败静默，不误报保存失败）
+      await refresh().catch(() => {});
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {

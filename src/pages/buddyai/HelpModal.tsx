@@ -16,9 +16,10 @@ export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: ()
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
             <li>
               {/* 审查修复（M9 同款）：原「扫码登录/导入凭证」均非本页按钮实名，且「手工粘贴 token」
-                  机制不存在（导入仅接受账号池 JSON 文件），照帮助操作会找不到入口 */}
-              <b>添加账号</b>：点右上角「OAuth登录」走 workbuddy.ai 授权自动入池；「扫描本机账号」识别本机客户端
-              登录账号；或「导入账号」导入账号池 JSON（凭证须为 .workbuddy.ai 域，国内账号会被区域校验拒绝）。
+                  机制不存在（导入仅接受账号池 JSON 文件），照帮助操作会找不到入口；
+                  审查修复：docker 版已裁剪「扫描本机账号」入口，此处同步移除该表述 */}
+              <b>添加账号</b>：点右上角「OAuth登录」走 workbuddy.ai 授权自动入池；或「导入账号」导入账号池
+              JSON（凭证须为 .workbuddy.ai 域，国内账号会被区域校验拒绝）。
             </li>
             <li>
               <b>同步积分</b>：到「积分看板」点「刷新数据」拉取各账号余额与积分包明细。

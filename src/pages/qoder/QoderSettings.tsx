@@ -151,7 +151,8 @@ export default function QoderSettings() {
       Math.min(90, Math.max(1, Math.round(Number(compactDays) || 3))),
     );
     if (compactEnabled && !/^\d+$/.test(compactDays.trim())) {
-      pushToast('error', `合并保留窗天数无效：${compactDays}（应为 1-90 的整数）`);
+      // 审查修复（L37）：空串时报错文案缺值，空值显示「（空）」
+      pushToast('error', `合并保留窗天数无效：${compactDays.trim() || '（空）'}（应为 1-90 的整数）`);
       return;
     }
     const creditsHours = String(

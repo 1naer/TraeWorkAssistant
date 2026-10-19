@@ -111,10 +111,17 @@ export default function GeneralSettingsPanel() {
   };
 
   const save = async () => {
-    if (!form) return;
+    if (!form || !settings) return;
     setSaving(true);
     try {
-      await withMinDelay(saveSettings(form));
+      // 审查修复（L35）：逐字段 diff，只把与已保存值不同的字段提交（saveSettings 即 patch 语义），不回传整份表单快照
+      const patch: Partial<SettingsType> = {};
+      (Object.keys(form) as (keyof SettingsType)[]).forEach((k) => {
+        if (JSON.stringify(form[k] ?? null) !== JSON.stringify(settings[k] ?? null)) {
+          (patch as Record<string, unknown>)[k] = form[k];
+        }
+      });
+      await withMinDelay(saveSettings(patch));
       toast('success', '设置已保存');
     } catch {
       /* toast 已发出 */

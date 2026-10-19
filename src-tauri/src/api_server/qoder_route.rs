@@ -422,6 +422,10 @@ struct QoderRaceWin {
     /// 胜者信封的 (request_id, session_id, record_id)（G4）：主账号胜 = 主信封 id，
     /// 对冲接管 = 对冲信封 id；记账按胜者落定，与会话行 uid 同源
     session_ids: Option<(String, String, String)>,
+    /// 审查修复（L2）：竞速败者已死标记（EOF/IO/超窗，随 RaceOutcome 透传），
+    /// settle_qoder_hedge 据此对败者补记错误/冷却（镜像 wb_route::settle_hedge）
+    primary_failed: bool,
+    hedge_failed: bool,
 }
 
 /// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -454,6 +458,8 @@ fn race_qoder_first_byte(
             hedge: None,
             takeover: false,
             session_ids: primary_session_ids.clone(),
+            primary_failed: false,
+            hedge_failed: false,
         });
     }
     let state2 = state.clone();
@@ -466,6 +472,10 @@ fn race_qoder_first_byte(
     let entry2 = entry.clone();
     let mk2 = model_key.to_string();
     let ms2 = model_source.to_string();
+    // 审查修复（L2）：捕获对冲账号 uid（仅建连成功 = 对冲实际发起时记录）——
+    // 双败 Err 路径租约随竞速 Drop、无从取 uid，Err 时据此对对冲侧补记错误
+    let hedge_uid_cell = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let hedge_uid_slot = hedge_uid_cell.clone();
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
         let (picked2, ev) = state2
             .qoder_pool
@@ -481,6 +491,7 @@ fn race_qoder_first_byte(
         let session_ids = extract_envelope_ids(&converted2);
         let lease = QoderHedgeLease::acquire(&state2, &picked2.uid, session_ids);
         let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
+        *hedge_uid_slot.borrow_mut() = Some(picked2.uid.clone());
         Some((reader2, lease))
     };
     match lines_with_first_byte_hedged(primary_reader, hedge_ms, spawn_backup) {
@@ -505,21 +516,39 @@ fn race_qoder_first_byte(
                 hedge: out.hedge,
                 takeover: out.takeover,
                 session_ids,
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
             })
         }
-        Err(()) => Err(()),
+        Err(()) => {
+            // 审查修复（L2）：双败时对冲侧同样记 Server 错误（主侧由调用方按
+            // picked.uid 记，与本处对齐）——镜像 wb_route::race_first_byte
+            if let Some(huid) = hedge_uid_cell.borrow().as_deref() {
+                state.qoder_pool.note_error(huid, ErrKind::Server);
+            }
+            Err(())
+        }
     }
 }
 
 /// 竞速结束后处理对冲计数与日志（镜像 wb_route::settle_hedge）：
 /// 释放对冲账号竞速窗口占用；接管时 guard 重绑到对冲账号；[SCHED] 日志记录
-/// hedge_takeover / hedge_lost
+/// hedge_takeover / hedge_lost；审查修复（L2）：竞速败者记账——已死一侧
+/// （EOF/IO/超窗）补记 Server 错误触发冷却，仅「输竞速但未死」一侧不记
 fn settle_qoder_hedge(
     state: &ApiSharedState,
     win: &mut QoderRaceWin,
     mut guard: InflightGuard,
     primary_uid: &str,
 ) -> InflightGuard {
+    if win.primary_failed {
+        state.qoder_pool.note_error(primary_uid, ErrKind::Server);
+    }
+    if win.hedge_failed {
+        if let Some(lease) = win.hedge.as_ref() {
+            state.qoder_pool.note_error(&lease.uid, ErrKind::Server);
+        }
+    }
     let Some(lease) = win.hedge.take() else {
         return guard;
     };

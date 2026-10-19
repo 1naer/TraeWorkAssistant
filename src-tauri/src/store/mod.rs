@@ -213,6 +213,55 @@ impl Store {
         })
     }
 
+    /// 整表替换 + kv 元数据写入（单事务）——审查修复（M7）：「行表 + kv 元数据」
+    /// 原拆为 rows_replace 与 kv_set 两个独立事务提交，进程崩溃/并发竞争下可分叉
+    /// （行表已换新而元数据未写或反之，api_keys 行表与鉴权开关分叉最敏感）。
+    /// 本原语在同一事务内完成两者；kv_content 为最终入库字符串（与 kv_set_raw
+    /// 同语义），Value 形态由调用方在事务外先序列化（对齐 rows_replace 时机）。
+    pub fn rows_replace_with_kv(
+        &self,
+        table: &str,
+        rows: &[(String, serde_json::Value)],
+        kv_key: &str,
+        kv_content: &str,
+    ) -> Result<(), String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        // 序列化在事务外完成（闭包内仅做 rusqlite 操作）
+        let mut texts: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        for (pk, data) in rows {
+            texts.push((
+                pk.clone(),
+                serde_json::to_string(data).map_err(|e| format!("序列化失败: {e}"))?,
+            ));
+        }
+        let kv_text = kv_content.to_string();
+        self.with_conn(move |c| {
+            c.execute_batch(&format!("BEGIN; DELETE FROM [{table}];"))?;
+            {
+                let mut stmt = c.prepare(&format!(
+                    "INSERT INTO [{table}](pk, data, updated_at) VALUES(?1, ?2, datetime('now','localtime'))"
+                ))?;
+                for (pk, text) in &texts {
+                    stmt.execute(rusqlite::params![pk, text])?;
+                }
+            }
+            c.execute(
+                "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+                 ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                rusqlite::params![kv_key, kv_text],
+            )?;
+            c.execute_batch("COMMIT;")?;
+            Ok(())
+        })
+        .or_else(|e| {
+            // 事务中途失败回滚（连接可能残留未结束的事务）
+            let _ = self.with_conn(|c| c.execute_batch("ROLLBACK;"));
+            Err(e)
+        })
+    }
+
     /// 单行 UPSERT（多写方 map 的增量更新路径，如 wb_tokens / account_cooldowns）
     pub fn row_upsert(&self, table: &str, pk: &str, data: &serde_json::Value) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {

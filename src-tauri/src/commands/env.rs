@@ -101,7 +101,14 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
         if let Some(obj) = current.as_object_mut() {
             obj.insert(key.to_string(), serde_json::json!(exe));
         }
-        let _ = store.kv_set("app_settings", &current);
+        // 审查修复（M13）：写失败原被 `let _` 吞掉——探测路径持久化兜底失效
+        // （注册表/默认目录变化后无法用上次成功路径启动）且无迹可循，落 app.log 留痕
+        if let Err(e) = store.kv_set("app_settings", &current) {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("app_settings 写入失败（探测路径 {key} 持久化兜底失效）: {e}"),
+            );
+        }
     }
 }
 

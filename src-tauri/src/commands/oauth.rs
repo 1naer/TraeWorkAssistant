@@ -75,20 +75,54 @@ fn default_exchange_url() -> String {
     OAUTH_EXCHANGE_URL.to_string()
 }
 
+/// OAuth 域外置资源根目录解析：`AIWORK_DATA_DIR` 环境变量优先（已设置且非空 →
+/// 直接作为应用数据目录，conf/、certs/、logs/ 均在其下；容器/自定义部署挂载点），
+/// 未设置回退 `%APPDATA%` + DATA_DIR_NAME（Windows 桌面行为不变）；两者皆不可得
+/// 返回 None。
+// 审查修复（外置 OAuth 目录）：原 oauth_client 与 exchange_agent 两处恒读 %APPDATA%，
+// Docker 容器内 APPDATA 恒空 → 外置 oauth_client.json / 本地 CA 永远读不到且无日志；
+// 现抽本函数统一两处口径（AIWORK_DATA_DIR 优先），回落路径行为不变。
+// 注意：state.rs::new 仍只读 APPDATA，本函数仅覆盖 OAuth 域这两处调用
+fn oauth_data_root() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("AIWORK_DATA_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir));
+        }
+    }
+    std::env::var("APPDATA")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME))
+}
+
 /// 读取外置 OAuth 客户端配置（全局一次；缺失/损坏回退默认值）
 pub fn oauth_client() -> &'static OAuthClientConfig {
     static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|d| {
-                std::path::PathBuf::from(d)
-                    .join(crate::state::DATA_DIR_NAME)
-                    .join("conf")
-                    .join("oauth_client.json")
-            })
-            .map(|p| fs_utils::read_json::<OAuthClientConfig>(&p))
-            .unwrap_or_default()
+        // 审查修复（外置 OAuth 目录）：目录解析走 oauth_data_root（AIWORK_DATA_DIR 优先），
+        // 回落内置默认时补一条轻量日志不再静默（进程级 OnceLock 仅记一条）
+        match oauth_data_root() {
+            Some(root) => {
+                let p = root.join("conf").join("oauth_client.json");
+                if !p.exists() {
+                    fs_utils::app_log(
+                        &root,
+                        &format!(
+                            "[OAuth] 外置 OAuth 客户端配置缺失（{}），回落内置默认 client_id/secret",
+                            p.display()
+                        ),
+                    );
+                }
+                fs_utils::read_json::<OAuthClientConfig>(&p)
+            }
+            None => {
+                // 数据目录不可解析时 app.log 无处可写，走 stderr（容器日志可见）兜底
+                eprintln!(
+                    "[OAuth] 数据目录不可解析（AIWORK_DATA_DIR/APPDATA 均未设置），外置 OAuth 客户端配置不可用，回落内置默认"
+                );
+                OAuthClientConfig::default()
+            }
+        }
     })
 }
 
@@ -140,7 +174,8 @@ fn short_agent() -> ureq::Agent {
 /// 交换/用户信息请求 Agent（F-78 批次 3 抓包调试）：
 /// 默认与 short_agent 同款直连；设置环境变量 AIWORK_OAUTH_DEBUG_PROXY（值如
 /// `127.0.0.1:8899`，即本软件 MITM 代理端口）时改走该代理并信任本地 CA
-/// （%APPDATA%/AIWorkAssistant/certs/ca.crt，目录解析与 state.rs::new 同源），
+/// （AIWORK_DATA_DIR/certs/ca.crt，未设置时 %APPDATA%/AIWorkAssistant/certs/ca.crt，
+/// 目录解析见 oauth_data_root），
 /// ExchangeToken/GetUserInfo 流量落入代理日志（api.trae.com.cn 已默认入抓包域名），
 /// 供抓包固化 client_secret 校验行为与 refresh_token 轮换语义。
 /// 仅影响 OAuth 交换链路，签到/续期等其余直连请求不受影响。
@@ -154,9 +189,9 @@ fn exchange_agent() -> Result<ureq::Agent, String> {
     };
     // 调试代理容错（2026-09-16 实测）：设置了调试代理但尚未启动过代理（CA 未生成）
     // 时降级直连并记日志，不阻断登录闭环；只有 CA 存在但损坏才视为错误
-    let dir = std::env::var("APPDATA")
-        .ok()
-        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME));
+    // 审查修复（外置 OAuth 目录）：CA 目录解析改走 oauth_data_root（AIWORK_DATA_DIR
+    // 优先），与外置 oauth_client.json 同口径；降级直连逻辑不变
+    let dir = oauth_data_root();
     let ca_path = dir.as_ref().map(|d| d.join("certs").join("ca.crt"));
     let ca_pem = match ca_path.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(p) => p,
@@ -1603,18 +1638,22 @@ pub fn oauth_login(
         .unwrap_or_else(|| select_login_device(&state).0);
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
-    let new_pair = if let Some(ref at) = callback_info.access_token {
-        Some((at.clone(), None))
-    } else {
-        // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
-        // server_rejected 分支仅转为错误信息，不涉及生命周期标记
-        exchange_token_refresh(&state, &callback_info.refresh_token, Some(&login_device_id))
-            .map_err(|e| e.msg)
-            .ok()
-            .map(|(a, r, _)| (a, r))
+    // 审查修复（M12）：交换失败原经 .map_err(|e| e.msg).ok() 压扁，恒报
+    // 「refresh_token 交换失败」通用文案，上游信封详情丢失排查失据；现透传
+    // RefreshExchangeError.msg（内含 volcano_error 解析的火山信封 code/msg 或
+    // 旧形态 message/请求失败原因）
+    let new_pair: Result<(String, Option<String>), String> = match callback_info.access_token {
+        Some(ref at) => Ok((at.clone(), None)),
+        None => {
+            // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
+            // server_rejected 分支仅转为错误信息，不涉及生命周期标记
+            exchange_token_refresh(&state, &callback_info.refresh_token, Some(&login_device_id))
+                .map(|(a, r, _)| (a, r))
+                .map_err(|e| e.msg)
+        }
     };
-    let (access_token, new_refresh_token) = new_pair
-        .ok_or_else(|| "refresh_token 交换失败".to_string())?;
+    let (access_token, new_refresh_token) =
+        new_pair.map_err(|e| format!("refresh_token 交换失败: {e}"))?;
 
     // 3. 规范化 JWT 格式
     let jwt = if access_token.starts_with("Cloud-IDE-JWT ") {

@@ -465,8 +465,18 @@ struct KeysEntry {
 /// 日志只记条数，不落 Key 值。
 fn registry_load(data_dir: &Path) -> ApiKeysFile {
     if let Some(v) = crate::vault::ns_get(data_dir, VAULT_NS, VAULT_KEY) {
-        if let Ok(f) = serde_json::from_value::<ApiKeysFile>(v) {
-            return f;
+        match serde_json::from_value::<ApiKeysFile>(v) {
+            Ok(f) => return f,
+            Err(e) => {
+                // 审查修复（M4）：fail-closed——vault 记录存在但反序列化失败时，
+                // 不得落入下方遗留库迁移把陈旧 legacy 快照覆盖回 vault
+                //（已删 Key 复活）；报错并返回空表拒绝迁移覆盖（无 Key 放行
+                // 仅在显式 auth_disabled 时生效，缺省即全拒绝，等人工修复 vault）
+                eprintln!(
+                    "[api_keys] vault 注册表反序列化失败，拒绝遗留库迁移覆盖（fail-closed，防止陈旧快照复活已删 Key）: {e}"
+                );
+                return ApiKeysFile::default();
+            }
         }
     }
     let legacy = crate::store::docs::api_keys_load(&crate::store::db(data_dir));

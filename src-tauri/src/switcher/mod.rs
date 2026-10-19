@@ -701,7 +701,16 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             {
                 Ok(()) => {
                     set_current_account(&sess, uid.trim());
-                    proc::start_app(&mut sess, sink)?;
+                    // 审查修复：保存已完成，重启失败仅 Warn 提醒手动打开后照常 done
+                    // 收尾——不回滚、不整体报错（报错会诱导用户重试造成重复 save/backup；
+                    // 与失败分支的还原现场 Warn 处理对称）
+                    if let Err(se) = proc::start_app(&mut sess, sink) {
+                        sink.step(
+                            "start",
+                            StepStatus::Warn,
+                            &format!("客户端重启失败，请手动打开: {se}"),
+                        );
+                    }
                     done(sink, &format!("已保存账号 {} 的当前登录态", uid.trim()))
                 }
                 Err(e) => {
@@ -728,7 +737,15 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             {
                 Ok(()) => {
                     set_current_account(&sess, uid.trim());
-                    proc::start_app(&mut sess, sink)?;
+                    // 审查修复：同 SaveCurrentLogin——备份已完成，重启失败仅 Warn
+                    // 提醒手动打开后照常 done 收尾，不回滚、不整体报错
+                    if let Err(se) = proc::start_app(&mut sess, sink) {
+                        sink.step(
+                            "start",
+                            StepStatus::Warn,
+                            &format!("客户端重启失败，请手动打开: {se}"),
+                        );
+                    }
                     done(sink, "备份完成")
                 }
                 Err(e) => {
@@ -752,7 +769,11 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             restore_profile(&mut sess, uid.trim(), sink)?;
             apply_fingerprint_override(&sess, sink);
             set_current_account(&sess, uid.trim());
-            proc::start_app(&mut sess, sink)?;
+            // 审查修复（L11）：恢复已完成，start_app 失败不应 `?` 整体报错掩盖恢复
+            // 成果——对齐 SaveCurrentLogin/BackupCurrent Ok 分支：Warn 提示手动打开
+            if let Err(se) = proc::start_app(&mut sess, sink) {
+                sink.step("start", StepStatus::Warn, &format!("客户端重启失败，请手动打开: {se}"));
+            }
             done(
                 sink,
                 &format!(
@@ -1055,7 +1076,11 @@ fn switch_flow(
         restore_profile(sess, "last", sink).map_err(|re| {
             format!("恢复账号 {uid} 登录态失败（{e}），且回滚到切换前状态也失败: {re}")
         })?;
-        proc::start_app(sess, sink)?;
+        // 审查修复（L11）：回滚已完成，start_app 失败不应 `?` 短路丢失回滚上下文
+        //——Warn 后继续原 fatal 收尾（回滚结果不掩盖，失败详情仍然可见）
+        if let Err(se) = proc::start_app(sess, sink) {
+            sink.step("start", StepStatus::Warn, &format!("客户端重启失败，请手动打开: {se}"));
+        }
         let msg = format!(
             "恢复账号 {uid} 登录态失败，已回滚到切换前状态并重启客户端；请重试或重新「保存当前登录态」: {e}"
         );
@@ -1116,7 +1141,11 @@ fn switch_flow(
             ),
         );
         restore_profile(sess, "last", sink)?;
-        proc::start_app(sess, sink)?;
+        // 审查修复（L11）：回滚已完成，start_app 失败不应 `?` 短路丢失回滚上下文
+        //——Warn 后继续原 fatal 收尾（回滚结果不掩盖，失败详情仍然可见）
+        if let Err(se) = proc::start_app(sess, sink) {
+            sink.step("start", StepStatus::Warn, &format!("客户端重启失败，请手动打开: {se}"));
+        }
         let msg = format!(
             "账号 {uid} 的快照无效（{}），已回滚到切换前状态。请在客户端手动登录账号 {uid}\
              （登录成功后点「保存当前登录态」重建快照；勿再「切换」到该账号，会重复此错误）；\

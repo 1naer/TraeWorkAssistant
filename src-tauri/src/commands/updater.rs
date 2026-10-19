@@ -8,8 +8,11 @@
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
 //                      latest.json（scripts/rename_release.mjs 生成随 Release 上传）取安装包 SHA256，
 //                      清单存在即 fail-closed（缺失/损坏/版本不符均阻止自动更新），无清单回退正文约定行；
-//   update_download    下载资产到临时目录（emit update-download-progress），完成后与发布方
-//                      SHA256 比对（不匹配即删除并报错），返回文件路径由前端确认后再安装；
+//   update_download    下载资产到临时目录（emit update-download-progress）。完整性三道闸：
+//                      ① 拒绝缺失/非法的发布方 SHA256（None 不放行）；② 下载完成与发布方
+//                      SHA256 比对（不匹配即删除并报错），通过后落 .sha256 sidecar；
+//                      ③ update_run_installer 安装前校验「文件名与资产名绑定 + SHA256 复验」。
+//                      返回文件路径由前端确认后再安装；
 //   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
 //                      /P 被动模式（仅显示进度条）+ /UPDATE 跳过卸载直接覆盖 + /R 安装完成后自动重启应用
 //                      （自定义模板 build-assets/installer.nsi 支持上述标志），随后应用退出。
@@ -40,7 +43,7 @@ pub struct UpdateCheckResult {
     pub size: u64,
     pub release_page: String,
     /// 发布方提供的安装包 SHA256（优先取发布校验清单 latest.json，回退 release 正文约定行；
-    /// 存量旧 release 两者皆无时为 None，跳过校验）
+    /// 存量旧 release 两者皆无时为 None——update_download 将拒绝下载，fail-closed）
     pub sha256: Option<String>,
 }
 
@@ -490,7 +493,9 @@ pub fn update_download(
 ) -> Result<UpdateDownloaded, String> {
     validate_target(&asset_name, &expected_version)?;
 
-    // 防御：发布方摘要必须为合法 SHA-256 格式（update_check 已 fail-closed 保证存在，此处双保险）
+    // 审查修复（H4，闸①）：发布方摘要是强制闸门——None（存量旧 release 无清单无正文行）
+    // 与格式非法同样拒绝下载，绝不放行无校验的安装包（原实现 None 直接跳过校验，
+    // 篡改/损坏的安装包可直通安装）
     let expected = match expected_sha256.as_deref() {
         Some(s) => {
             let s = s.trim().to_ascii_lowercase();
@@ -500,9 +505,14 @@ pub fn update_download(
                         .to_string(),
                 );
             }
-            Some(s)
+            s
         }
-        None => None,
+        None => {
+            return Err(
+                "发布方 SHA-256 缺失（旧版发布方式，无校验信息），已中止下载。请手动下载安装"
+                    .to_string(),
+            )
+        }
     };
 
     // 下载目录：%TEMP%\ai-work-assistant-update\
@@ -515,7 +525,9 @@ pub fn update_download(
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             if name.as_deref() != Some(asset_name.as_str())
                 && p.is_file()
-                && p.extension().map(|e| e == "exe" || e == "msi").unwrap_or(false)
+                && p.extension()
+                    .map(|e| e == "exe" || e == "msi" || e == "sha256")
+                    .unwrap_or(false)
             {
                 let _ = std::fs::remove_file(&p);
             }
@@ -524,6 +536,10 @@ pub fn update_download(
     let dest = dir.join(&asset_name);
     // 清理同名旧文件（可能是不完整下载）
     let _ = std::fs::remove_file(&dest);
+    // 审查修复（H4，闸②）：校验文件 sidecar 路径（<资产名>.sha256，下载校验通过后写入，
+    // 供 update_run_installer 安装前复验）；先清理同名旧 sidecar，避免跨轮次残留误配
+    let sidecar = dir.join(format!("{asset_name}.sha256"));
+    let _ = std::fs::remove_file(&sidecar);
 
     // 逐通道尝试下载（系统代理 → 环境变量代理 → 直连）。
     // 超时策略：连接 10s + 读 60s，不设整体超时（大文件慢速下载不能被整体超时掐断）。
@@ -534,17 +550,21 @@ pub fn update_download(
     {
         match download_via(&app, &agent, &download_url, &dest) {
             Ok(received) => {
-                // 完整性校验：发布方提供 SHA256 时必须匹配，不匹配删除文件并中止（防供应链篡改）
-                if let Some(expected) = expected.as_deref() {
-                    let actual = file_sha256(&dest).unwrap_or_default();
-                    if actual != expected {
-                        let _ = std::fs::remove_file(&dest);
-                        return Err(format!(
-                            "安装包完整性校验失败（SHA256 不匹配），已删除下载文件。\
-                             可能为网络劫持或下载损坏，请重试或手动下载：{RELEASES_PAGE}"
-                        ));
-                    }
+                // 完整性校验（闸②前半）：下载完成立即与发布方 SHA256 比对，不匹配删除文件并中止
+                // （防供应链篡改；expected 已在入口强制非空，无「跳过校验」路径）
+                let actual = file_sha256(&dest).unwrap_or_default();
+                if actual != expected {
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(format!(
+                        "安装包完整性校验失败（SHA256 不匹配），已删除下载文件。\
+                         可能为网络劫持或下载损坏，请重试或手动下载：{RELEASES_PAGE}"
+                    ));
                 }
+                // 审查修复（H4，闸②后半）：校验通过后落 .sha256 sidecar（sha256sum 风格：
+                // <hex>  <资产名>），供 update_run_installer 安装前复验，覆盖
+                // 「下载后、安装前」窗口期的文件替换/篡改
+                std::fs::write(&sidecar, format!("{expected}  {asset_name}\n"))
+                    .map_err(|e| format!("写入校验文件失败: {e}"))?;
                 let _ = app.emit(
                     "update-download-progress",
                     DownloadProgress { received, total: received, percent: 100 },
@@ -642,6 +662,40 @@ pub fn update_run_installer(
     match version_from_asset(&asset_name) {
         Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
+    }
+
+    // 审查修复（H4，闸③）：安装前两道校验——
+    // ① 文件名与资产名绑定：拒绝「A 文件路径 + B 资产名」的组合，防止借合法资产名
+    //    通过版本校验后执行任意文件
+    // ② SHA256 复验：读取下载时落盘的 .sha256 sidecar，对磁盘文件重新计算并比对，
+    //    覆盖「下载后、安装前」窗口期的替换/篡改；sidecar 缺失或损坏同样拒绝
+    //    （fail-closed：正常流程必有 sidecar，缺失说明文件不是本次更新流程下载的）
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("非法的安装包路径，已中止：{file_path}"))?;
+    if file_name != asset_name {
+        return Err(format!(
+            "安装包文件名与资产名不一致（{file_name} / {asset_name}），已中止"
+        ));
+    }
+    let sidecar = expected_dir.join(format!("{asset_name}.sha256"));
+    let expected = std::fs::read_to_string(&sidecar).map_err(|_| {
+        "安装包校验文件缺失，已中止安装。请重新走「检查更新 → 下载」流程，或手动下载安装"
+            .to_string()
+    })?;
+    let expected = expected
+        .split_whitespace()
+        .next()
+        .filter(|h| is_sha256_hex(h))
+        .ok_or("安装包校验文件损坏，已中止安装。请重新下载")?
+        .to_ascii_lowercase();
+    let actual = file_sha256(path).unwrap_or_default();
+    if actual != expected {
+        return Err(
+            "安装包完整性校验失败（SHA256 与下载时不一致），文件可能在下载后被改动，已中止安装。请重新下载"
+                .to_string(),
+        );
     }
 
     // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用

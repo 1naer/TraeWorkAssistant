@@ -141,10 +141,12 @@ pub fn enable_oauth_bypass(data_dir: &Path) -> Result<bool, String> {
     if added.is_empty() {
         return Ok(false);
     }
+    // 审查修复（L8）：marker 先于注册表写落盘——原顺序在注册表写成功与
+    // marker 落盘之间存在崩溃窗口，残留已改写的白名单且无标记可清理；
+    // 反转后窗口内至多「marker 已落而条目未加」，下次启动按清单清理为无害空跑（幂等）
+    save_marker(data_dir, &added);
     win::run_reg(key, "ProxyOverride", "REG_SZ", &merged.join(";"))?;
     win::notify_wininet_changed();
-    // 持久化追加清单：进程崩溃未还原时下次启动清理（缺陷13）
-    save_marker(data_dir, &added);
     Ok(true)
 }
 

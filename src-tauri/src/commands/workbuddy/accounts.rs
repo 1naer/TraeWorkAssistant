@@ -659,12 +659,18 @@ pub fn workbuddy_refresh_token(
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
 
     // 回写工具侧副本 + 账号池过期时间
-    let creds = serde_json::json!({
+    let mut creds = serde_json::json!({
         "access_token": new_access,
         "refresh_token": new_refresh,
         "expires_at_ms": exp_ms,
         "refresh_expires_at_ms": rexp_ms,
     });
+    // 审查修复（M19）：上游未回发新 refreshToken（缺失/空串）时保留本次刷新成功
+    // 所用的旧 rt——upsert_token_store 是「非 null 才覆盖」的合并语义，空串非 null
+    // 会穿透覆盖 store 旧 rt，导致下轮刷新拿已作废的空串必然失败（被迫重登）
+    if new_refresh.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        creds["refresh_token"] = serde_json::json!(refresh);
+    }
     upsert_token_store(&state, &acct.id, &creds)?;
     // 短临界区写回：重读最新池 → 按 id 更新仍存在的账号；窗口内账号已被删除
     // 则跳过池回写（token store 副本已更新，删除方本就不保留该账号）

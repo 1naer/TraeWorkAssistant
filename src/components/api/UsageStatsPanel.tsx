@@ -8,7 +8,7 @@
  * api_custom_usage_stats / api_qoder_usage_stats
  * （落盘数据，服务未运行也可查看，口径与键名不变 §9.6）。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { BarChart3, RefreshCw } from 'lucide-react';
 import {
   Bar,
@@ -168,8 +168,12 @@ export default function UsageStatsPanel() {
   const [customUsage, setCustomUsage] = useState<UsageDayView[]>([]);
   const [qoderUsage, setQoderUsage] = useState<UsageDayView[]>([]);
   const [loading, setLoading] = useState(false);
+  // 审查修复（L30）：快速切换 7/14/30 天时并发 load 的旧响应可能晚于新响应到达，
+  // 用序号门控：响应到达时仅当仍是最新一次发起才 setState，防止旧数据覆盖新结果
+  const loadSeqRef = useRef(0);
 
   const load = async (d: number) => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     try {
       const [trae, buddy, buddyAi, custom, qoder] = await Promise.all([
@@ -179,13 +183,14 @@ export default function UsageStatsPanel() {
         api.apiServer.customUsageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.qoderUsageStats(d).catch(() => [] as UsageDayView[]),
       ]);
+      if (seq !== loadSeqRef.current) return;
       setTraeUsage(trae);
       setBuddyUsage(buddy);
       setBuddyAiUsage(buddyAi);
       setCustomUsage(custom);
       setQoderUsage(qoder);
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) setLoading(false);
     }
   };
 

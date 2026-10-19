@@ -195,11 +195,9 @@ impl Drop for TempDirGuard {
 /// -wal/-shm 一并复制避免读到未 checkpoint 的空库），返回命中的账号数
 #[cfg(windows)]
 fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usize, String> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let td = std::env::temp_dir().join(format!("aw_trae_ck_{}_{nanos}", std::process::id()));
+    // 审查修复（L7）：临时目录名改用 uuid 随机——原 pid+纳秒时间戳可被推测，
+    // 存在抢先创建/植入文件的竞态；uuid v4 不可预测，TempDirGuard 清理与名字无关
+    let td = std::env::temp_dir().join(format!("aw_trae_ck_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
     let _guard = TempDirGuard(td.clone());
     let tmp_db = td.join("Cookies");

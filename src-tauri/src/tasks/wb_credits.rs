@@ -283,7 +283,11 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
         let mut s = 0.0;
         let mut has = false;
         for item in items {
-            if let Some(v) = num_of(fs_utils::dig(item, &["CycleRemainCapacity", "RemainingCapacity", "remaining"])) {
+            // 审查修复（M3）：逐项走 remaining_of 宽键链（含 CycleCapacityRemainPrecise
+            // 与 used/total 倒推）——此前键链窄于 remaining_of，明细仅携带
+            // CycleCapacityRemainPrecise 时 coded 求和落空、静默跌回全量和，
+            // issue #120 翻倍复发
+            if let Some(v) = remaining_of(item, total_of(item)) {
                 s += v;
                 has = true;
             }
@@ -304,9 +308,10 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
             return Some(s);
         }
     }
-    sum_of(&found).or_else(|| {
-        num_of(fs_utils::dig(body, &["CycleCapacitySizePrecise", "CycleTotalCapacity", "CapacitySize"]))
-    })
+    // 审查修复（M3）：删除「总量键」回退分支——CycleCapacitySizePrecise/
+    // CycleTotalCapacity/CapacitySize 是周期总量而非余额，末级把总量当余额
+    // 会凭空放大（宁缺勿错，交由调用方按失败处理）
+    sum_of(&found)
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求

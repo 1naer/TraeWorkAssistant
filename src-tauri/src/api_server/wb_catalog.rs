@@ -36,8 +36,21 @@ pub struct WbModel {
     #[serde(default)]
     pub effort_override: Option<String>,
     /// 积分倍率（展示用，成本模型按无缓存估算 §5.5 #10）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rate")]
     pub rate: f64,
+}
+
+/// 审查修复（M5）：rate 哨兵通路——JSON 无 NaN 字面量，serde_json 把
+/// f64::NAN 序列化为 null；null 反序列化回 f64 默认会报错，导致
+/// buddy_ai_load / load 的 from_str::<WbCatalogFile> 整体失败回落内置表，
+/// NaN 哨兵（元数据缺失）无法在 kv 存取回路中存活。此处把 null 还原为
+/// NaN 哨兵（数字与缺失字段行为不变：缺失仍走 serde default = 0.0）。
+fn deserialize_rate<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<f64> = Option::deserialize(deserializer)?;
+    Ok(v.unwrap_or(f64::NAN))
 }
 
 impl WbModel {
@@ -206,7 +219,7 @@ pub fn parse_v3_config(body: &Value) -> Vec<WbModel> {
                     m
                 }
                 // 元数据缺失（data.models 未覆盖的清单条目）：rate 用 NaN 哨兵，
-                // 由 merge_static_fallback 决定内置表继承或 1.0 占位
+                // 由 merge_static_fallback 决定内置表继承或保留哨兵（M5 防假定价）
                 None => WbModel {
                     id,
                     display: String::new(),
@@ -301,8 +314,9 @@ pub fn parse_v3_config(body: &Value) -> Vec<WbModel> {
 /// 动态目录静态回填（2026-10-16 实抓配套）：仅对动态解析**缺失**的字段
 /// 按 id 从内置静态表继承（display/上下文/档位/effort 修正层/rate）；
 /// 动态实抓值（含免费档 credits "x0.00"）永远优先，不被内置快照覆盖。
-/// rate 的 NaN 哨兵 = 元数据缺失，内置命中继承内置倍率、未命中 1.0 占位
-/// （目录不参与 buddy-ai credits 成本估算，仅展示与可用性语义）。
+/// rate 的 NaN 哨兵 = 元数据缺失，内置命中继承内置倍率、未命中保留哨兵
+/// （审查修复 M5 防假定价：unified_catalog rate_of 靠 is_finite() 把 NaN 挡为
+/// None 展示「—」；目录不参与 buddy-ai credits 成本估算，仅展示与可用性语义）。
 fn merge_static_fallback(models: Vec<WbModel>) -> Vec<WbModel> {
     let builtin = builtin_buddy_ai();
     models
@@ -325,7 +339,13 @@ fn merge_static_fallback(models: Vec<WbModel>) -> Vec<WbModel> {
                 m.effort_override = b.and_then(|b| b.effort_override.clone());
             }
             if m.rate.is_nan() {
-                m.rate = b.map(|b| b.rate).unwrap_or(1.0);
+                // 审查修复（M5）：NaN 哨兵=元数据缺失，仅在内置表命中时继承内置
+                // 倍率；未命中保留哨兵不强转 1.0——unified_catalog rate_of 的
+                // is_finite() 检查会把 NaN 挡为 None，强转 1.0 则绕过该防线放行
+                // 假定价（既有缺陷即在此处强转后 is_finite() 放行）
+                if let Some(b) = b {
+                    m.rate = b.rate;
+                }
             }
             m
         })
@@ -1067,7 +1087,8 @@ mod tests {
     }
 
     /// 元数据缺失兜底（data.models 未覆盖 / 旧形态纯 id 清单）：
-    /// 内置表命中 → 继承 display/rate/上下文；未命中 → 1.0 占位（NaN 哨兵路径）
+    /// 内置表命中 → 继承 display/rate/上下文；未命中 → 保留 NaN 哨兵
+    /// （M5 防假定价：unified_catalog rate_of 的 is_finite() 保持 None）
     #[test]
     fn parse_v3_config_static_fallback_for_missing_metadata() {
         let body: Value = serde_json::json!({
@@ -1085,7 +1106,7 @@ mod tests {
         assert_eq!(ds.display, "DeepSeek V4.1 Flash", "内置表继承 display");
         let k3 = m.iter().find(|x| x.id == "brand-new-model").unwrap();
         assert_eq!(k3.display, "brand-new-model");
-        assert!((k3.rate - 1.0).abs() < 1e-9, "未命中内置表 → 1.0 占位");
+        assert!(k3.rate.is_nan(), "未命中内置表 → 保留 NaN 哨兵（M5 防假定价）");
     }
 
     #[test]

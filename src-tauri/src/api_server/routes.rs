@@ -26,6 +26,10 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
             InflightGuard,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
+// 审查修复（L3）：备案注释——Trae 池轮换上限有意收窄为 3，与 WB/Qoder 池的
+// 全池轮换（while 循环不限次）口径不同系有意为之，非遗漏：Trae 上游建连成本高
+// （设备指纹/机器号绑定），扩全池轮换会线性放大排队请求的首字延迟与上游压力，
+// 且 Trae 池换号对空完成类故障收益有限。调整前需先评估首字延迟回归
 const MAX_ROTATE: usize = 3;
 /// 请求体上限（issue #21）：axum `Bytes` 提取器受 DefaultBodyLimit 约束（默认 2MiB），
 /// build_router 已显式放开到本值，两处阈值必须一致。32MiB 适配长上下文客户端
@@ -325,9 +329,12 @@ pub(crate) fn dispatch_error_response(
                 "trae_pool_disabled",
                 "invalid_request_error",
             ),
-            DispatchError::ModelCooling(rem) => (
+            // 审查修复（模型冷却归因）：池标识改取错误携带的真实目标池，不再
+            // 硬编码 "buddy"——buddy-ai/qoder 的模型级 429 在 API 请求日志与
+            // 用量看板中按发起池准确归因
+            DispatchError::ModelCooling(rem, pool) => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "buddy",
+                pool.as_str(),
                 format!("model {model} cooling down, retry after {rem}s"),
                 "model_cooldown",
                 "rate_limit_error",
@@ -825,6 +832,11 @@ pub async fn chat_completions(
         ),
         Ok(r) => match r.pool {
             // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
+            // 审查修复备案：/v1/chat 与 /v1/responses 的 Intl 分流存在已知不对称——
+            // 本路径 Intl 专属模型（buddy_intl_only）经 dispatch available 门控
+            // （Buddy(CN) 池不服务该模型）走 buddy-ai 国际池，而 /v1/responses 在
+            // wb 开启时会把同模型投 CN 上游；与蓝本同位一致，属有意设计——
+            // 若要统一需改 resolve_wb_target 签名波及多处调用，暂不处理。
             TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
                 let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
@@ -957,6 +969,10 @@ pub async fn responses_api(
     };
     // buddy-ai（阶段 2）：wb 档关闭且国际档开启时走国际池（与 /v1/chat 的
     // priority 语义一致：buddy 优先、buddy-ai 兜底；wb 开时保持现状 CN 路径）
+    // 审查修复备案：/v1/responses 与 /v1/chat 的 Intl 分流存在已知不对称——wb 开启时
+    // Intl 专属模型（buddy_intl_only；/v1/chat 经 dispatch available 门控不走 CN 池）
+    // 在此处因 `buddy_ai = !wb_enabled && buddy_ai_enabled` 可能投给 CN 上游；
+    // 与蓝本同位一致，属有意设计——若要统一需改 resolve_wb_target 签名波及多处调用，暂不处理。
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let buddy_ai_enabled = state
         .buddy_ai_enabled
@@ -1655,6 +1671,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 })
         });
         let mut tried = HashSet::new();
+        // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
+        // 防换号重试期间断连落 "none" 致账单排查失据（对齐 wb_route）
+        let mut last_bound_uid: Option<String> = None;
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
@@ -1671,8 +1690,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
             // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
             if tx.is_closed() {
+                // 审查修复（L1）：归因复用最近绑定账号（从未绑定才落 "none"）
+                let uid = last_bound_uid.as_deref().unwrap_or("none");
                 state.record_usage(
-                    false, &model, "none", &key_id, false, true,
+                    false, &model, uid, &key_id, false, true,
                     start_ts.elapsed().as_millis() as u64, 0, 0,
                 );
                 return;
@@ -1706,6 +1727,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             if !bound {
                 continue;
             }
+            // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
+            last_bound_uid = Some(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let mut converted = super::payload::prepare_llm_chat_body(

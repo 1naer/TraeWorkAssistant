@@ -32,7 +32,7 @@ fn name_matches(prof: &AppProfile, name: &str) -> bool {
 /// 返回 false = 本档案在当前安装布局下无权操作该映像（并存布局杀国际会误杀
 /// 国内实例、老单布局杀国内会误杀国际实例），调用方必须跳过该进程。
 /// 仅歧义映像名受仲裁；白名单内其余无歧义名（"CodeBuddy CN" 等）直通。
-/// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_all。
+/// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_pids。
 fn ark_allows(prof: &AppProfile, name: &str) -> bool {
     let Some(ark) = &prof.image_ark else {
         return true;
@@ -200,13 +200,17 @@ pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), Strin
             sess.prof.graceful_wait_secs
         ),
     );
-    if !wait_gone(&sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
-        // 二级：仍有存活进程 → 强杀
+    // 审查修复（L12）：等待与强杀收窄到 stop 前捕获的 PID 集合——优雅关闭等待
+    // 期间用户新启的实例不属本次关闭目标，不应被映像名全量匹配连带关闭
+    //（对齐 stop_spawned 的 PID 精确语义，含 PID 复用防护）
+    let pids: Vec<u32> = procs.iter().map(|(pid, _)| *pid).collect();
+    if !wait_gone_pids(&pids, &sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
+        // 二级：仍有存活进程 → 强杀（仅限捕获的 PID）
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，强制结束进程");
-        kill_all(&sess.prof);
+        kill_pids(&pids, &sess.prof);
     }
     // 三级：等待完全退出 ≤5 秒（强杀后 handle 释放）
-    if !wait_gone(&sess.prof, Duration::from_secs(5)) {
+    if !wait_gone_pids(&pids, &sess.prof, Duration::from_secs(5)) {
         sink.step(
             "stop",
             super::StepStatus::Error,
@@ -263,13 +267,13 @@ pub fn stop_spawned(sess: &mut Session, sink: &dyn ProgressSink, pids: &[u32]) -
             sess.prof.graceful_wait_secs
         ),
     );
-    if !wait_gone_pids(&alive, Duration::from_secs(sess.prof.graceful_wait_secs)) {
+    if !wait_gone_pids(&alive, &sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
         // 二级：仍有存活 PID → 按 PID 强杀（不使用映像名 kill_all，防误伤）
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，按 PID 强制结束");
-        kill_pids(&alive);
+        kill_pids(&alive, &sess.prof);
     }
     // 三级：等待完全退出 ≤5 秒
-    if !wait_gone_pids(&alive, Duration::from_secs(5)) {
+    if !wait_gone_pids(&alive, &sess.prof, Duration::from_secs(5)) {
         sink.step(
             "stop",
             super::StepStatus::Error,
@@ -289,12 +293,15 @@ fn pid_alive_matching(sys: &System, pid: u32, prof: &AppProfile) -> bool {
         .unwrap_or(false)
 }
 
-/// 在 deadline 内等待给定 PID 全部退出（1s 轮询）
-fn wait_gone_pids(pids: &[u32], timeout: Duration) -> bool {
+/// 在 deadline 内等待给定 PID 全部退出（1s 轮询）。
+/// 审查修复（PID 复用防护，与 stop_spawned 初始 alive 过滤同口径）：
+/// 按「存活 + 映像名匹配」判定——原进程退出后 PID 被无关进程复用时，
+/// 身份不匹配视同已退出，不再无谓等满超时。
+fn wait_gone_pids(pids: &[u32], prof: &AppProfile, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
         let sys = snapshot();
-        if !pids.iter().any(|pid| sys.process(sysinfo::Pid::from_u32(*pid)).is_some()) {
+        if !pids.iter().any(|pid| pid_alive_matching(&sys, *pid, prof)) {
             return true;
         }
         if start.elapsed() >= timeout {
@@ -304,10 +311,15 @@ fn wait_gone_pids(pids: &[u32], timeout: Duration) -> bool {
     }
 }
 
-/// 按 PID 强杀（sysinfo TerminateProcess；PID 已退出时静默跳过）
-fn kill_pids(pids: &[u32]) {
+/// 按 PID 强杀（sysinfo TerminateProcess）。
+/// 审查修复（PID 复用防护，与 stop_spawned 初始 alive 过滤同口径）：
+/// PID 已退出或身份不匹配（复用为无关进程）时静默跳过，绝不误杀。
+fn kill_pids(pids: &[u32], prof: &AppProfile) {
     let sys = snapshot();
     for pid in pids {
+        if !pid_alive_matching(&sys, *pid, prof) {
+            continue;
+        }
         if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
             let _ = p.kill();
         }
@@ -372,20 +384,6 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
     Ok(pid)
 }
 
-/// 在 deadline 内等待目标进程全部退出（1s 轮询，对齐 PS Start-Sleep 1s 循环）
-fn wait_gone(prof: &AppProfile, timeout: Duration) -> bool {
-    let start = Instant::now();
-    loop {
-        if list_procs(prof).is_empty() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
 /// 向 pid 的所有顶层窗口投递 WM_CLOSE（PS $proc.CloseMainWindow() 的全窗口版，
 /// 覆盖多窗口 Electron 应用；投递不阻塞）
 pub fn post_wm_close(pid: u32) {
@@ -403,17 +401,6 @@ pub fn post_wm_close(pid: u32) {
         1 // TRUE：继续枚举
     }
     unsafe { EnumWindows(Some(cb), pid as isize) };
-}
-
-/// 强杀全部白名单进程（sysinfo TerminateProcess，等价 PS Stop-Process -Force）
-fn kill_all(prof: &AppProfile) {
-    let sys = snapshot();
-    for (_, p) in sys.processes() {
-        let name = p.name().to_string_lossy();
-        if name_matches(prof, &name) && ark_allows(prof, &name) {
-            let _ = p.kill();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -595,14 +582,29 @@ mod tests {
 
     #[test]
     fn wait_gone_pids_不存在pid立即返回true() {
-        // 第一轮枚举即无命中 → 立即 true，不做 1s 轮询空转
-        assert!(wait_gone_pids(&[u32::MAX - 1, u32::MAX - 2], Duration::from_secs(5)));
+        // 第一轮枚举即无命中（PID 不存在 → 身份匹配 false）→ 立即 true，不做 1s 轮询空转
+        assert!(wait_gone_pids(
+            &[u32::MAX - 1, u32::MAX - 2],
+            &prof(TargetApp::Doubao),
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]
     fn wait_gone_pids_存活pid超时返回false() {
-        // 自身进程在等待期间必然存活 → 走满超时返回 false（负路径）
-        assert!(!wait_gone_pids(&[std::process::id()], Duration::from_millis(100)));
+        // 身份匹配口径引入后，「存活」必须同时映像名匹配：白名单临时替换为本测试
+        // 进程映像名（leak 成 'static 适配 &'static [&'static str]，同
+        // pid_alive_matching_白名单命中存活pid返回true），自身 PID 存活且匹配
+        // → 走满超时返回 false（负路径）
+        let stem = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .expect("无法获取测试进程映像名");
+        let leaked: &'static str = Box::leak(stem.into_boxed_str());
+        let whitelist: &'static [&'static str] = Box::leak(vec![leaked].into_boxed_slice());
+        let mut p = prof(TargetApp::Doubao);
+        p.proc_names = whitelist;
+        assert!(!wait_gone_pids(&[std::process::id()], &p, Duration::from_millis(100)));
     }
 
     #[test]

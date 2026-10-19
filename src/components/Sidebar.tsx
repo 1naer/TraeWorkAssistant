@@ -138,7 +138,8 @@ export default function Sidebar({
     if (!settings) return;
     const next = nextTheme(settings.theme);
     try {
-      await saveSettings({ ...settings, theme: next.id });
+      // 审查修复（L34）：saveSettings 即 patch 语义，只提交 theme 字段，不回传整份 settings 快照（patch 纪律）
+      await saveSettings({ theme: next.id });
       pushToast('success', `主题已切换：${next.name}`);
     } catch {
       /* toast 已发出 */

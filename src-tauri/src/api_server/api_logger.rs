@@ -418,7 +418,18 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
                 st.date = today;
             }
             // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行
-            Err(_) => {
+            Err(e) => {
+                // 审查修复（L4）：打开失败不再无痕丢整批——stderr + app_log 落一条
+                // 观测行（含丢弃行数与目标路径），防磁盘满/权限故障期间日志静默丢失
+                let msg = format!(
+                    "[api_logger] 打开日志文件失败，丢弃本批 {} 行（path={}）: {e}",
+                    st.queue.len(),
+                    path.display()
+                );
+                eprintln!("{msg}");
+                if let Some(data_dir) = dir.parent() {
+                    crate::fs_utils::app_log(data_dir, &msg);
+                }
                 st.queue.clear();
                 st.date = today;
                 return;

@@ -385,10 +385,22 @@ pub(crate) fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex
 
 /// 账号移除路径主动清理（P3-L，对齐 qoder refresh_lock_remove）：回收刷新锁表项，
 /// 防止账号删除后条目永驻 HashMap（进程生命周期内每次增删账号泄漏一把锁）。
+/// 审查修复（M20）：仅当 Arc::strong_count==1（仅剩表内自身引用）时才回收——
+/// remove 与旧持有者 drop 守卫之间有窗口，贸然 remove 会让新读者经
+/// refresh_lock_for 重建新锁与旧持有者并行进入临界区，互斥失效；条目留待后续
+/// 移除再回收，仅延迟不泄漏。
 pub(crate) fn refresh_lock_remove(acct_id: &str) {
     let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = g.as_mut() {
-        map.remove(acct_id);
+        // 持表锁期间 check-then-remove 与 refresh_lock_for 的 get_or_insert 互斥，
+        // get 的借用不计入 strong_count，判定可靠
+        if map
+            .get(acct_id)
+            .map(|arc| std::sync::Arc::strong_count(arc) == 1)
+            .unwrap_or(false)
+        {
+            map.remove(acct_id);
+        }
     }
 }
 
@@ -897,6 +909,30 @@ const QUOTA_PATH: &str = "/api/v1/quota";
 const QUOTA_PORT_CANDIDATES: [u16; 4] = [18789, 11101, 8890, 8899];
 const QUOTA_PORT_RANGE: std::ops::RangeInclusive<u16> = 18780..=18795;
 
+// 审查修复（quota 探测闸门）：容器/无桌面客户端环境下本机无 quota 端点可连，
+// *.port 恒空后仍会对固定候选 + 有界端口段逐端口串行探测，每端口烧满 0.8s
+// 超时，阻塞积分/调度线程。环境变量 AIWORK_DISABLE_LOCAL_QUOTA 置 1/true
+//（不区分大小写）时整体跳过本地探测，直接空返回（与探测失败同语义：上游
+// local_quota_balance → None，按「云端全链失败且无本地兜底」处理）。
+const LOCAL_QUOTA_DISABLE_ENV: &str = "AIWORK_DISABLE_LOCAL_QUOTA";
+
+/// 闸门取值判定：仅 1 / true（不区分大小写、容忍首尾空白）视为开启；
+/// 未设置/0/false/其他值均不开启（fail-open 保持原探测行为）。
+fn env_flag_on(v: Option<&str>) -> bool {
+    v.map(|s| {
+        let s = s.trim();
+        s.eq_ignore_ascii_case("1") || s.eq_ignore_ascii_case("true")
+    })
+    .unwrap_or(false)
+}
+
+fn local_quota_disabled() -> bool {
+    match std::env::var(LOCAL_QUOTA_DISABLE_ENV) {
+        Ok(v) => env_flag_on(Some(&v)),
+        Err(_) => false,
+    }
+}
+
 /// 响应含 remaining/credits/quota/balance 任一键即认定 quota 端点（浅层宽容）。
 fn quota_looks_valid(v: &Value, depth: usize) -> bool {
     if depth > 3 {
@@ -936,6 +972,11 @@ pub fn discover_local_quota_services(
     agent: &ureq::Agent,
     limit: usize,
 ) -> Vec<(u16, Value)> {
+    // 审查修复（quota 探测闸门）：AIWORK_DISABLE_LOCAL_QUOTA=1/true 时视本地
+    // quota 数据不可用，跳过 *.port / 固定候选 / 端口段的逐端口探测循环，直接空返回
+    if local_quota_disabled() {
+        return vec![];
+    }
     let mut found: Vec<(u16, Value)> = vec![];
     let mut seen: std::collections::HashSet<u16> = Default::default();
     let mut ports: Vec<u16> = vec![];
@@ -1220,5 +1261,27 @@ mod tests {
         assert!(refresh_fail_hint("user is banned").contains("禁用"));
         // 通用拒绝 → 重新登录/导入凭证
         assert!(refresh_fail_hint("invalid_client").contains("重新登录或重新导入"));
+    }
+
+    // ==================== 本地 quota 探测闸门（审查第 5 项） ====================
+
+    #[test]
+    fn local_quota_disable_flag_only_accepts_1_or_true() {
+        // 审查修复（quota 探测闸门）：仅 1/true（任意大小写、容忍首尾空白）开启；
+        // 未设置/0/false/其他值一律不开启（fail-open 保持原探测行为）。
+        // 直接测纯函数而非 set_var：进程级 setenv 在并行测试下有竞态（见 api_server.rs）。
+        assert!(env_flag_on(Some("1")));
+        assert!(env_flag_on(Some("true")));
+        assert!(env_flag_on(Some("TRUE")));
+        assert!(env_flag_on(Some("True")));
+        assert!(env_flag_on(Some(" 1 ")));
+        assert!(env_flag_on(Some(" true ")));
+        assert!(!env_flag_on(None));
+        assert!(!env_flag_on(Some("")));
+        assert!(!env_flag_on(Some("0")));
+        assert!(!env_flag_on(Some("false")));
+        assert!(!env_flag_on(Some("yes")));
+        assert!(!env_flag_on(Some("10")));
+        assert!(!env_flag_on(Some("enabled")));
     }
 }

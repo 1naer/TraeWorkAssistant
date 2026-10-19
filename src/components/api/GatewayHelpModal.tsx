@@ -7,7 +7,7 @@
  * 并指向「资源总览 → 调度策略中心」调整入口（任务7）。
  * 数据源：unified_models（实时聚合 Trae / Buddy / BuddyAI 国际 / Qoder / 自定义 多池）+ gateway_settings_get（端口）。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CircleHelp, Copy, Search } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
@@ -53,6 +53,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [query, setQuery] = useState('');
   const [copied, setCopied] = useState(false);
+  // 审查修复（L36）：复制成功态停留 2 秒的定时器句柄（重复点击重置、卸载清理防泄漏）
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 局域网网卡 IPv4（issue #34：网关 0.0.0.0 监听后的接入地址展示）
   const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
@@ -108,17 +110,27 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
     "stream": true
   }'`;
     try {
-      // 复制成功后才置 copied（复制中态仅在实际耗时场景出现，避免快速完成时闪烁）
+      // 复制成功后才置 copied
       if (await copyText(example)) {
         setCopied(true);
         toast('success', 'cURL 示例已复制到剪贴板');
+        // 审查修复（L36）：成功态停留 2 秒再复位（原先 finally 立即复位，用户看不到「已复制」反馈）；
+        // 重复点击时重置定时器，卸载时统一清理防泄漏
+        if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = setTimeout(() => setCopied(false), 2000);
       } else toast('error', '复制失败');
     } catch {
       toast('error', '复制失败');
-    } finally {
-      setCopied(false);
     }
   };
+
+  // 审查修复（L36）：卸载时清理成功态定时器，避免泄漏
+  useEffect(
+    () => () => {
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    },
+    [],
+  );
 
   return (
     <Modal
@@ -194,8 +206,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 disabled={copied}
                 title="复制 cURL 示例"
               >
-                <Copy size={12} className={copied ? 'animate-pulse' : ''} />
-                {copied ? '复制中…' : '复制'}
+                <Copy size={12} />
+                {copied ? '已复制' : '复制'}
               </button>
             </div>
             <code className="block break-all text-[11px] leading-relaxed text-slate-500 dark:text-zinc-400">

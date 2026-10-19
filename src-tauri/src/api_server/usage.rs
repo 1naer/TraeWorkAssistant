@@ -395,12 +395,15 @@ impl UsageFile {
         d.record_credits(model, credits, original);
     }
 
-    /// 按桶记录一次缓存读 tokens 测量到当日 entry（M4 审查修复：
-    /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）
-    pub fn record_cached_in(&mut self, bucket: UsageBucket, cached: u64) {
-        let day = today_key();
+    /// 按桶记录一次缓存读 tokens 测量到指定日期 entry（M4 审查修复：
+    /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）。
+    /// 审查修复（用量跨日归行）：`day` 由调用方在持锁期间取定并传入，
+    /// 写入路径内不再自行取 today——杜绝跨零点时 cached_tokens 与同一请求
+    /// 其他统计/标脏落盘行分裂到不同日期行（对齐 record_in_ttfb_on 的
+    /// 「调用方定日」语义）
+    pub fn record_cached_in(&mut self, bucket: UsageBucket, day: &str, cached: u64) {
         self.bucket_mut(bucket)
-            .entry(day)
+            .entry(day.to_string())
             .or_default()
             .record_cached(cached);
     }

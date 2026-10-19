@@ -39,9 +39,17 @@ export default function BuddyAiCheckin() {
 
   const load = async () => {
     try {
+      // 审查修复（L24）：原两路 .catch(()=>[]) 吞错，外层 catch 不可达，失败静默空态；
+      // 改为逐路 catch 里 toast 报错后再回落空数组
       const [accs, recs] = await Promise.all([
-        api.buddyai.accountsList().catch(() => [] as BuddyAiAccountView[]),
-        api.buddyai.checkinResults(90).catch(() => [] as WbCheckinRecord[]),
+        api.buddyai.accountsList().catch((err) => {
+          pushToast('error', `账号列表加载失败：${String(err).slice(0, 120)}`);
+          return [] as BuddyAiAccountView[];
+        }),
+        api.buddyai.checkinResults(90).catch((err) => {
+          pushToast('error', `打卡记录加载失败：${String(err).slice(0, 120)}`);
+          return [] as WbCheckinRecord[];
+        }),
       ]);
       setAccounts(accs);
       setRecords(recs);

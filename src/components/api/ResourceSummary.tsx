@@ -102,6 +102,10 @@ function DispatchCenterCard({
   const toast = useAppStore((s) => s.pushToast);
   const settings = useAppStore((s) => s.settings);
   const [policy, setPolicy] = useState<DispatchPolicy | null>(null);
+  // 审查修复（第7项7a）：调度策略读取失败此前被 .catch 静默吞掉，整块 UI 消失无提示——
+  // 现改为错误态：toast 报错一次 + 卡内渲染错误提示与「重试」按钮（reloadSeq 递增重触发拉取）
+  const [policyError, setPolicyError] = useState(false);
+  const [reloadSeq, setReloadSeq] = useState(0);
   const [saving, setSaving] = useState(false);
   // per_model 新增绑定行（本地输入态，添加时才落 policy；实际生效值见 newOrderEff 派生）
   const [newPerModelName, setNewPerModelName] = useState('');
@@ -115,13 +119,16 @@ function DispatchCenterCard({
   const saveSeqRef = useRef(0);
 
   useEffect(() => {
+    setPolicyError(false);
     api.apiServer
       .dispatchPolicyGet()
       .then(setPolicy)
-      .catch(() => {
-        /* 保留空态 */
+      .catch((e) => {
+        // 审查修复（第7项7a）：读取失败不再静默保留空态——toast 报错一次并转卡内错误态
+        setPolicyError(true);
+        toast('error', `调度策略读取失败：${String(e).slice(0, 120)}`);
       });
-  }, []);
+  }, [reloadSeq, toast]);
 
   /** 当前组合命中的预设（匹配规则见 dispatchPresets.matchPreset） */
   const activePreset = useMemo(() => matchPreset(pool, policy), [pool, policy]);
@@ -165,15 +172,26 @@ function DispatchCenterCard({
         patch.buddy,
       );
       if (seq === saveSeqRef.current) {
-        // 本地合并仅覆盖本次修改的维度，其余保持父级现值
-        onPoolChanged({
-          ...pool,
-          ...(patch.trae !== undefined ? { strategy: patch.trae } : null),
-          ...(patch.buddy !== undefined ? { wb_strategy: patch.buddy } : null),
-          ...(patch.qoder !== undefined ? { qoder_strategy: patch.qoder } : null),
-          ...(patch.buddyAi !== undefined ? { buddy_ai_strategy: patch.buddyAi } : null),
-        });
-        toast('success', '调度策略已保存，运行中网关即时生效');
+        // 审查修复（H3）：保存成功后回读后端最新池配置刷新父级状态（poolSet 的
+        // uids/group_ids 参数为页面加载时的旧快照，其他端改过的池配置会被旧快照
+        // 静默回退，原先仅做本地合并无法感知）。回读失败时退回本地合并（仅覆盖
+        // 本次修改维度），保证 UI 至少反映本次保存结果
+        const latest = await api.apiServer.poolList().catch(() => null);
+        if (seq === saveSeqRef.current) {
+          if (latest) {
+            onPoolChanged(latest);
+          } else {
+            // 本地合并仅覆盖本次修改的维度，其余保持父级现值
+            onPoolChanged({
+              ...pool,
+              ...(patch.trae !== undefined ? { strategy: patch.trae } : null),
+              ...(patch.buddy !== undefined ? { wb_strategy: patch.buddy } : null),
+              ...(patch.qoder !== undefined ? { qoder_strategy: patch.qoder } : null),
+              ...(patch.buddyAi !== undefined ? { buddy_ai_strategy: patch.buddyAi } : null),
+            });
+          }
+          toast('success', '调度策略已保存，运行中网关即时生效');
+        }
       }
     } catch (e) {
       if (seq === saveSeqRef.current) {
@@ -230,7 +248,28 @@ function DispatchCenterCard({
     }
   };
 
-  if (!policy) return null;
+  if (!policy) {
+    // 审查修复（第7项7a）：读取失败不再整块消失——渲染错误态（提示 + 重试）；
+    // 首次加载中（无错误）仍保持隐藏，避免闪现空卡
+    if (policyError) {
+      return (
+        <div className="card p-4">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <SlidersHorizontal size={16} className="text-slate-400" />
+            <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">调度策略中心</span>
+            <Badge tone="red">读取失败</Badge>
+          </div>
+          <p className="text-xs text-rose-600 dark:text-rose-400">
+            调度策略读取失败，组合预设与池间 / 池内调度编辑暂不可用（下方各资源池摘要不受影响）。
+          </p>
+          <button className="btn-outline mt-3" onClick={() => setReloadSeq((n) => n + 1)}>
+            重试
+          </button>
+        </div>
+      );
+    }
+    return null;
+  }
 
   return (
     <div className="card p-4">

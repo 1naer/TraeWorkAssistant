@@ -1011,6 +1011,10 @@ pub(crate) fn validate_hhmm(time: &str) -> Result<(), String> {
     Ok(())
 }
 
+// 审查修复（L16）：本函数是全仓唯一允许的 `cmd /c … && schtasks` shell 包装点。
+// 安全红线：args 仅允许调用方以参数数组传入的 schtasks 子命令/任务名/路径等受控
+// 字面量，禁止拼接任何不可信输入；外部来源参数必须先经白名单校验（如 validate_hhmm）
+// 才能进入。新增调用方须遵守本约定，不得绕过本封装直接派生 cmd。
 pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),

@@ -22,7 +22,18 @@ use crate::state::AppState;
 
 use super::common::{account_id_of, as_str, load_pool, save_pool, upsert_token_store, WorkBuddyAccount, WbPool};
 
+/// OAuth 防重入（CN/Intl 共享闸门，一次仅允许一个流程）
 static OAUTH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 闸门 RAII 守卫（对齐 qoder OAuthGuard 同款）：drop 自动复位 OAUTH_RUNNING，
+/// 覆盖线程内 panic 与一切提前退出路径——防共享闸门永久卡死（前端弹框永挂
+/// loading，CN/Intl 后续登录全被拒）
+struct OAuthGuard;
+impl Drop for OAuthGuard {
+    fn drop(&mut self) {
+        OAUTH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// 捕获响应 Set-Cookie 到独立 jar（简化：保留 name=value，忽略 Path/Expires 等属性）
 fn oauth_capture_cookies(jar: &mut std::collections::HashMap<String, String>, resp: &ureq::Response) {
@@ -431,6 +442,11 @@ pub(super) fn oauth_flow(
     // last_daily_chat（当日打卡幂等失效→重复跑六步链）/uid/domain 等既有键——
     // 与导入路径 BL-2 同类缺陷。新键优先，旧键缺省补齐；新码未回发 rt 时保留旧 rt
     if matches!(sink, PoolSink::BuddyAi) {
+        // 审查修复（M14）：凭证读-合并-写全程持每账号刷新锁（对齐导入路径
+        // buddy_ai_account_import_creds 同款锁域）——与网关 401 自愈轮换并发时，
+        // 锁外读旧 rec 再整行 upsert 会覆盖刚轮换落库的新 rt（账号被迫重登）
+        let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+        let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = sink.load_token(state, &target_id);
         let mut creds = creds;
         if let (Some(obj), Some(eobj)) = (creds.as_object_mut(), existing.as_object()) {
@@ -483,30 +499,41 @@ pub(super) fn oauth_login_async(
     // 原 AppState::new() 在本线程构造全新实例，锁域互不相干 → OAuth 写池与
     // 命令/调度写池并发时失去互斥，可能整池覆盖丢账号。
     let st = app.state::<AppState>().inner().clone();
-    std::thread::spawn(move || {
-        // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
-        //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
-        // catch_unwind 确保复位 + 补发失败终态
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            oauth_flow(&app, &st, ep, sink)
-        }));
-        let payload = match outcome {
-            Ok(Ok((id, nickname))) => serde_json::json!({
-                "ok": true,
-                "id": id,
-                "nickname": nickname,
-                "message": format!("账号「{nickname}」已扫码登录并自动入池"),
-            }),
-            Ok(Err(e)) => serde_json::json!({ "ok": false, "message": e }),
-            Err(_) => serde_json::json!({
-                "ok": false,
-                "message": "OAuth 流程内部异常（已恢复），请重试或查看日志"
-            }),
-        };
-        // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
-        crate::events::emit_logged(&app, &done_event, payload, None);
-        OAUTH_RUNNING.store(false, Ordering::SeqCst);
-    });
+    // 审查修复：裸 thread::spawn 线程创建失败即 panic 且发生在闸门复位之外 →
+    // OAUTH_RUNNING 永久 true、done 事件永不发出，CN/Intl 共享闸门后续登录全被拒。
+    // 改为 Builder 命名线程 + spawn 返回 io::Result：失败复位闸门并返回 Err；
+    // 线程内闸门复位统一由 OAuthGuard RAII 承担（含 panic 路径）
+    let spawned = std::thread::Builder::new()
+        .name("wb-oauth".into())
+        .spawn(move || {
+            let _guard = OAuthGuard;
+            // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
+            //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
+            // catch_unwind 确保复位 + 补发失败终态
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                oauth_flow(&app, &st, ep, sink)
+            }));
+            let payload = match outcome {
+                Ok(Ok((id, nickname))) => serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "nickname": nickname,
+                    "message": format!("账号「{nickname}」已扫码登录并自动入池"),
+                }),
+                Ok(Err(e)) => serde_json::json!({ "ok": false, "message": e }),
+                Err(_) => serde_json::json!({
+                    "ok": false,
+                    "message": "OAuth 流程内部异常（已恢复），请重试或查看日志"
+                }),
+            };
+            // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
+            crate::events::emit_logged(&app, &done_event, payload, None);
+            // OAUTH_RUNNING 复位由 _guard drop 承担（含 panic 路径）
+        });
+    if spawned.is_err() {
+        OAUTH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err("OAuth 后台线程启动失败，请重试".into());
+    }
     Ok(())
 }
 
