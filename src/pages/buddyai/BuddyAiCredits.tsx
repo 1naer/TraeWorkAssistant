@@ -191,9 +191,11 @@ export default function BuddyAiCredits() {
   // 本地 Token 统计（~/.workbuddy-ai/projects 会话扫描；懒加载：Token Tab 首次激活才拉取）
   const [tokenStats, setTokenStats] = useState<BuddyAiTokenStats | null>(null);
   const tokensLoadedRef = useRef(false);
-  // 载入/同步序号守卫（审查 #22）：积分同步与列表加载交叉时后到的旧快照不得覆盖
-  // 新余额——共享序号，仅最新一次请求允许写数据/状态
+  // 载入/同步双守卫（审查 #22 + 复审 No.1）：loadSeqRef 单调分配请求序号；
+  // dataSeqRef 为数据写权版本——仅 seq 更大的请求允许写数据并推进版本，失败不占号
+  // （失败的同步不剥夺被其取代的在途加载的写权，避免有效新快照被误弃成误导空态）
   const loadSeqRef = useRef(0);
+  const dataSeqRef = useRef(0);
 
   const load = useCallback(async () => {
     const seq = ++loadSeqRef.current;
@@ -210,14 +212,18 @@ export default function BuddyAiCredits() {
         api.buddyai.creditsHistory(90).catch(() => [] as CreditSnap[]),
         api.groups.sharedList().catch(() => [] as GroupView[]),
       ]);
-      if (seq !== loadSeqRef.current) return;
-      if (accs) setAccounts(accs);
-      setRecords(recs);
-      setGroups(gs);
-      setUsage(usg);
-      setHistory(hist);
+      // 写权版本门控（复审 No.1）：仅比已落盘版本更新的请求允许写数据并推进版本
+      if (seq > dataSeqRef.current) {
+        dataSeqRef.current = seq;
+        if (accs) setAccounts(accs);
+        setRecords(recs);
+        setGroups(gs);
+        setUsage(usg);
+        setHistory(hist);
+      }
     } finally {
-      if (seq === loadSeqRef.current) setLoading(false);
+      // 无条件复位加载态：本请求只复位自己发起的 loading（取代它的请求自行管理）
+      setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -258,13 +264,14 @@ export default function BuddyAiCredits() {
   }, [tab, creditsSource, tokensSource, loadOfficial, loadTokenStats]);
 
   const syncCredits = async () => {
-    // 与 load 共享序号（审查 #22）：慢败/慢成的积分同步不得覆盖其后已完成的加载，
-    // 反向同理——仅最新一次请求写 accounts/toast/syncing
+    // 与 load 共享双守卫（审查 #22 + 复审 No.1）：请求序号单调分配；成功写数据须通过
+    // 写权版本门控并推进版本，失败仅报错不占号（不剥夺被其取代的在途 load 的写权）
     const seq = ++loadSeqRef.current;
     setSyncing(true);
     try {
       const n = await withMinDelay(api.buddyai.creditsFetch(), 800);
-      if (seq === loadSeqRef.current) {
+      if (seq > dataSeqRef.current) {
+        dataSeqRef.current = seq;
         setAccounts(n);
         const ok = n.filter((a) => a.credits_balance != null).length;
         pushToast('success', `积分已同步（${ok}/${n.length} 个账号取数成功）`);
@@ -275,13 +282,11 @@ export default function BuddyAiCredits() {
         setSessReload((k) => k + 1);
       }
     } catch (err) {
-      if (seq === loadSeqRef.current) pushToast('error', `积分同步失败：${String(err).slice(0, 160)}`);
+      // 失败不占号：无条件报错（不写数据、不推进写权版本）
+      pushToast('error', `积分同步失败：${String(err).slice(0, 160)}`);
     } finally {
-      if (seq === loadSeqRef.current) {
-        setSyncing(false);
-        // 同步补位清 loading：交叉的旧 load 被本请求取代后不再负责复位加载态
-        setLoading(false);
-      }
+      // 无条件复位同步态；loading 由发起它的 load 自行复位（原「补位清 loading」不再需要）
+      setSyncing(false);
     }
   };
 

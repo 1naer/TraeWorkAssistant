@@ -194,6 +194,10 @@ export default function BuddyAiApiService() {
           return revert;
         });
         pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
+      } else {
+        // 复审 No.2：本次失败已被更新的保存取代，静默不上报（后续保存成功以全量
+        // payload 提交会自动收敛，弹 toast 反成虚假提示）；仅补诊断日志便于排查
+        console.warn('[BuddyAiApiService] 保存请求已被更新的保存取代，失败已静默：', err);
       }
       return false;
     } finally {
