@@ -8,6 +8,8 @@
 //! 4. Claude Code 指纹触发腾讯内容审核 → 指纹清洗（身份句改写 + cc_xxx 键值
 //!    剥离 + x-anthropic-* 引用剥离）+ 审核模板黑名单最小改写（映射表外置
 //!    `wb_template_map.json` 可热更新，§5.5 #9 cat-and-mouse，禁硬编码扩散）。
+//!    issue #122 方案 C 增强：`to` 支持 `|` 多候选按请求种子轮换（C1）、
+//!    空完成换号重试追加激进短前缀规则（C2）、首条 system 残指纹自检（C3）。
 //!
 //! 另：连续同角色消息自动合并（生态实测，§5.8 #9）。
 
@@ -15,8 +17,10 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-/// 默认审核模板映射（映射表文件缺失时的内置兜底，§5.5 #9：
-/// CLI→CLI tool、based on→built on——任何一字改动即绕过逐字匹配）。
+/// 默认审核模板映射（映射表文件缺失时的内置兜底，§5.5 #9）：以最小改写
+/// （CLI→CLI tool、based on→built on——任何一字改动即绕过逐字匹配）为主；
+/// issue #122 起实证句升级为整句同义改写——单词级改写后品牌词/n-gram 残留
+/// （opencode、DeepSeek Harness、interactive CLI 等）仍被上游特征识别秒拒。
 /// Codex 两条身份句前缀不带句号，兼容 GPT-5/GPT-5-Codex 等模型后缀变体。
 pub fn default_template_map() -> Vec<(String, String)> {
     vec![
@@ -83,48 +87,60 @@ pub fn default_template_map() -> Vec<(String, String)> {
         (
             "You are an interactive CLI agent specializing in software engineering tasks."
                 .to_string(),
-            "You are an interactive CLI assistant specializing in software engineering tasks."
-                .to_string(),
+            // issue #122 方案 C3 口径：「interactive CLI」属上游特征 n-gram，
+            // 改写句自身亦不得残留（residual_fingerprint_note 特征词表成员）
+            "You are a CLI assistant specializing in software engineering tasks.".to_string(),
         ),
         // OpenCode harness（公开 prompt 可查证，issue #57 布防）：按 provider
-        // 分多套 flavor，首句身份声明各不相同，逐条最小改写（含大小写变体）
+        // 分多套 flavor，首句身份声明各不相同，逐条改写（含大小写变体）。
+        // issue #122 升级（2026-10-18 实证 ×24：模板命中仍在涨、上游 server-timing
+        // inner 212~364ms 秒拒）——tool→assistant 最小改写后残留品牌词 opencode /
+        // interactive CLI / software engineering tasks 等 n-gram，整句同义改写
+        // 三类特征一并消除
         (
             "You are opencode, an interactive CLI tool that helps users with software engineering tasks."
                 .to_string(),
-            "You are opencode, an interactive CLI assistant that helps users with software engineering tasks."
+            "You are a pragmatic senior engineer helping the user get coding work done in a terminal."
                 .to_string(),
         ),
+        // issue #122 方案 C3 口径适用于本块全部规则：改写句自身含品牌词/特征
+        // n-gram = 指纹仍在（首轮请求激进规则不兜底）+ residual_fingerprint_note
+        // 设计性误报——to 值一律不得残留 opencode / interactive CLI / DeepSeek
+        // Harness（default_map_outputs_are_residue_free_and_idempotent 回归锁定）
         (
             "You are OpenCode, You and the user share the same workspace.".to_string(),
-            "You are OpenCode, You and the user work in the same workspace.".to_string(),
+            "You and the user work in the same workspace.".to_string(),
         ),
         (
             "You are OpenCode, the best coding agent on the planet.".to_string(),
-            "You are OpenCode, a top coding agent for software engineering.".to_string(),
+            "You are a top software engineer for coding work.".to_string(),
         ),
         (
             "You are opencode, an interactive CLI agent specializing in software engineering tasks."
                 .to_string(),
-            "You are opencode, an interactive CLI assistant specializing in software engineering tasks."
+            "You are a pragmatic senior engineer helping users with coding work in a terminal."
                 .to_string(),
         ),
         (
             "You are operating as and within the OpenCode CLI, a terminal-based agentic coding assistant built by OpenAI."
                 .to_string(),
-            "You are operating as and within the OpenCode CLI, a terminal-based agentic coding tool built by OpenAI."
+            "You are operating as and within a terminal-based agentic coding tool built by OpenAI."
                 .to_string(),
         ),
         // DeepSeek Harness（DSH，2026-10-06 测试机日志实证：pool=trae 空完成影子
         // 风控，4 账号全 healthy 仍全灭；请求日志抓到身份句原文）。首句身份声明 +
-        // 模型句 "powered by" 复现（glm 前缀匹配覆盖 5.3/5.3-flash 变体），
-        // 改写手法对齐 Codex 规则 based on→built on
+        // 模型句 "powered by" 复现（glm 前缀匹配覆盖 5.3/5.3-flash 变体）。
+        // issue #122 升级（2026-10-18 实证 ×45）：based on→built on 后品牌词
+        // DeepSeek Harness 原样残留仍是强指纹——首句整句同义改写连根消除；
+        // glm 句换掉 "You are a coding agent" 自我声明句式，保留 glm- 前缀衔接
+        // （后接模型名语法不断）
         (
             "You are an AI agent powered by DeepSeek Harness.".to_string(),
-            "You are an AI agent built on DeepSeek Harness.".to_string(),
+            "You are an AI agent that helps the user with programming work.".to_string(),
         ),
         (
             "You are a coding agent powered by the glm-".to_string(),
-            "You are a coding agent built on the glm-".to_string(),
+            "You help the user with programming work using the glm-".to_string(),
         ),
     ]
 }
@@ -138,12 +154,49 @@ pub struct TemplateMapFile {
     pub updated_at: Option<i64>,
 }
 
+// ==================== 激进清洗规则（issue #122 方案 C2） ====================
+
+/// 空完成升级式清洗的内置激进规则（issue #122 方案 C2）：仅在「同一请求发生
+/// 空完成后的换号重试」时追加于生效表之后应用（首轮请求不应用，避免对存量
+/// 正常请求引入改写差异）。短前缀匹配——兜住生效表逐字规则覆盖不到的未知
+/// 变体（不同后缀/flavor 的同源身份句）；误伤面：仅身份句前缀形态，用户正文
+/// 以该形态开头的概率极低，可接受。应用顺序在生效表之后：整句规则先行改写
+/// （品牌词连根消除），激进规则只兜改写后仍残留前缀的漏网变体
+pub fn aggressive_template_rules() -> Vec<(String, String)> {
+    vec![
+        // OpenCode 未知 flavor 变体（默认表 4 条逐字规则只覆盖已知句式）
+        (
+            "You are opencode".to_string(),
+            "You are a pragmatic senior engineer".to_string(),
+        ),
+        (
+            "You are OpenCode".to_string(),
+            "You are a pragmatic senior engineer".to_string(),
+        ),
+        // 未知 CLI harness（REASONIX/ZCode 等无公开资料客户端）的通用身份前缀
+        (
+            "You are an interactive CLI".to_string(),
+            "You are a terminal-based assistant".to_string(),
+        ),
+        // 「powered by <harness>」句式兜底（默认表覆盖 DeepSeek Harness 逐字句，
+        // 变体后缀/新 harness 名由此兜住；改写后接续原文句尾标点不断）
+        (
+            "powered by DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
+    ]
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TemplateRule {
     pub from: String,
     /// None（缺省/null）= 停用该规则（从生效表移除，原句透传）；
     /// Some("")（空串）= 剥离（改写为空串，删除指纹原文）——两种空态必须区分，
-    /// 存量数据 to:"" 反序列化为 Some("")，剥离行为不因合并语义翻转
+    /// 存量数据 to:"" 反序列化为 Some("")，剥离行为不因合并语义翻转。
+    /// issue #122 方案 C1：`|` 分隔多候选（如 "A|B|C"）——WB 池按请求种子
+    /// 稳定选一、跨换号重试变化，消除「全网统一改写句」二次指纹化；
+    /// Trae 池（payload.rs 走 apply_template_map seed=0）按规则名哈希稳定
+    /// 选一。候选可为空串（剥离语义合法）
     #[serde(default)]
     pub to: Option<String>,
 }
@@ -245,28 +298,7 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         return "body 解析失败".to_string();
     };
     // 首条 system 消息文本（string 与 text blocks 两种形态）
-    let system = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|msgs| {
-            msgs.iter().find(|msg| {
-                msg.get("role")
-                    .and_then(|r| r.as_str())
-                    .map(|r| r.eq_ignore_ascii_case("system"))
-                    .unwrap_or(false)
-            })
-        })
-        .and_then(|msg| msg.get("content"))
-        .map(|c| match c {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        })
-        .unwrap_or_default();
+    let system = first_system_text(&v);
     let sys: String = system
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -297,21 +329,119 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
     out
 }
 
+/// 首条 system 消息文本提取（string 与 text blocks 两种形态；无 → 空串）。
+/// fingerprint_sample 与 residual_fingerprint_note 共用
+fn first_system_text(v: &Value) -> String {
+    v.get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| {
+            msgs.iter().find(|msg| {
+                msg.get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| r.eq_ignore_ascii_case("system"))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|msg| msg.get("content"))
+        .map(|c| match c {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+}
+
+// ==================== 残指纹自检（issue #122 方案 C3） ====================
+
+/// 已知上游风控特征词（issue #122 实证：opencode / DeepSeek Harness 品牌词与
+/// 「interactive CLI」n-gram 残留即秒拒）：整句改写后首条 system 应零残留。
+/// 默认表通用 CLI 规则的改写句已同步去除 interactive（见 default_template_map）
+const RESIDUAL_MARKERS: &[&str] = &["opencode", "deepseek harness", "interactive cli"];
+
+/// 残指纹自检（issue #122 方案 C3）：模板改写后对首条 system 消息扫描已知
+/// 特征词，命中返回小写特征词列表（逗号连接），无命中 None。
+/// 仅查首条 system——用户正文/工具结果含品牌词属正常业务内容，不参与自检
+/// 避免误报；调用方在 sanitize 开启时落 debug 日志（按请求去重）
+pub fn residual_fingerprint_note(body: &[u8]) -> Option<String> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return None;
+    };
+    let system = first_system_text(&v).to_lowercase();
+    if system.is_empty() {
+        return None;
+    }
+    let hits: Vec<&str> = RESIDUAL_MARKERS
+        .iter()
+        .copied()
+        .filter(|m| system.contains(m))
+        .collect();
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits.join(","))
+    }
+}
+
 /// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
 /// 外置映射表新增规则的命中词可能不含内置三短语，预检会永久漏改）；
-/// 条目少（个位数），逐条 contains 代价可接受
+/// 条目少（个位数），逐条 contains 代价可接受。
+/// seed=0 稳定入口（Trae 池 payload.rs 沿用 + 兼容旧调用）：多候选规则按
+/// 规则名哈希稳定选一，行为可复现；WB 池走 apply_template_map_seeded 按请求
+/// 种子轮换候选
 pub fn apply_template_map(text: &str, templates: &[(String, String)]) -> String {
+    apply_template_map_seeded(text, templates, 0)
+}
+
+/// 带请求种子的模板改写（issue #122 方案 C1）：`to` 含 `|` 分隔多候选时按
+/// 种子稳定选一——同请求内可复现、跨换号重试（种子随轮换更新）变化，消除
+/// 「全网统一改写句」的二次指纹化；单候选规则行为与种子无关（存量零影响）
+pub fn apply_template_map_seeded(text: &str, templates: &[(String, String)], seed: u64) -> String {
     if templates.is_empty() {
         return text.to_string();
     }
     let mut out = text.to_string();
     for (from, to) in templates {
         if out.contains(from.as_str()) {
-            out = out.replace(from.as_str(), to.as_str());
-            record_hit(from, to);
+            let chosen = pick_candidate(from, to, seed);
+            out = out.replace(from.as_str(), chosen);
+            record_hit(from, chosen);
         }
     }
     out
+}
+
+/// FNV-1a 64（零依赖、跨进程稳定——std DefaultHasher 不保证跨版本/进程一致，
+/// 改写候选选择需要可复现）
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
+/// 请求级改写种子（issue #122 方案 C1）：conv_id 绑定请求、attempt 随换号
+/// 轮换/工具执行轮次递增——跨重试候选必变、请求间互不相同
+pub fn variant_seed(conv_id: &str, attempt: u64) -> u64 {
+    fnv1a(conv_id) ^ attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// 多候选选择（issue #122 方案 C1）：`to` 无 `|` → 原样（存量规则零影响）；
+/// 多候选 → (种子 ^ 规则名哈希) 取模稳定选一。规则名混入使各规则独立翻转
+/// （不必同步换候选）；空候选（`|` 首尾/连续）= 剥离语义，合法保留
+fn pick_candidate<'a>(from: &str, to: &'a str, seed: u64) -> &'a str {
+    match to.split('|').count() {
+        1 => to,
+        n => {
+            let idx = (seed ^ fnv1a(from)) % n as u64;
+            to.split('|').nth(idx as usize).unwrap_or(to)
+        }
+    }
 }
 
 /// 剥离 cc_xxx=...; 键值对与 x-anthropic-* 引用（F-30 指纹清洗，零正则依赖）
@@ -381,13 +511,14 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// 对单条消息 content 施加清洗（string 与 text blocks 两种形态）
-fn sanitize_content(content: &mut Value, templates: &[(String, String)], sanitize: bool) {
+/// 对单条消息 content 施加清洗（string 与 text blocks 两种形态）；
+/// seed 透传多候选改写选择（issue #122 方案 C1）
+fn sanitize_content(content: &mut Value, templates: &[(String, String)], sanitize: bool, seed: u64) {
     match content {
         Value::String(s) => {
             let mut t = if sanitize { strip_cc_fingerprints(s) } else { s.clone() };
             if sanitize {
-                t = apply_template_map(&t, templates);
+                t = apply_template_map_seeded(&t, templates, seed);
             }
             *s = t;
         }
@@ -396,7 +527,7 @@ fn sanitize_content(content: &mut Value, templates: &[(String, String)], sanitiz
                 if let Some(Value::String(t)) = b.get_mut("text") {
                     let mut v = if sanitize { strip_cc_fingerprints(t) } else { t.clone() };
                     if sanitize {
-                        v = apply_template_map(&v, templates);
+                        v = apply_template_map_seeded(&v, templates, seed);
                     }
                     *t = v;
                 }
@@ -412,6 +543,11 @@ fn sanitize_content(content: &mut Value, templates: &[(String, String)], sanitiz
 /// `prompt_cache_key`（agent2api normalize.rs 情报互证，2026-10-03）：命中上游
 /// 前缀缓存可带来数量级的费用差；**键必须按账号硬隔离**——跨账号命中前缀缓存
 /// 等于把 A 账号对话内容泄露给 B 账号（作者实测教训），故键首段为账号 uid。
+///
+/// `variant_seed`：多候选改写种子（issue #122 方案 C1，wb_payload::variant_seed
+/// 生成——conv_id 绑定请求、attempt 随换号轮换递增）；`aggressive`：激进清洗
+/// 开关（issue #122 方案 C2，仅空完成换号重试时为 true，追加短前缀规则兜
+/// 未知身份句变体；sanitize 关闭时不生效）
 pub fn prepare_wb_chat_body(
     src: &[u8],
     model: &str,
@@ -420,7 +556,20 @@ pub fn prepare_wb_chat_body(
     effort: Option<&str>,
     sanitize: bool,
     templates: &[(String, String)],
+    variant_seed: u64,
+    aggressive: bool,
 ) -> Vec<u8> {
+    // 激进清洗（issue #122 方案 C2）：生效表后追加激进短前缀规则（仅重试路径，
+    // 分配代价可忽略）；sanitize 关闭时无清洗即无升级
+    let aggressive_rules: Vec<(String, String)>;
+    let templates: &[(String, String)] = if aggressive && sanitize {
+        let mut v = templates.to_vec();
+        v.extend(aggressive_template_rules());
+        aggressive_rules = v;
+        &aggressive_rules
+    } else {
+        templates
+    };
     let mut obj: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
         Err(_) => return src.to_vec(),
@@ -454,7 +603,7 @@ pub fn prepare_wb_chat_body(
         }
         for msg in merged.iter_mut() {
             if let Some(c) = msg.get_mut("content") {
-                sanitize_content(c, templates, sanitize);
+                sanitize_content(c, templates, sanitize, variant_seed);
             }
             // 指纹清洗覆盖 tool_calls[].function.arguments（审核模板最小改写；
             // 不套用 strip_cc_fingerprints——其删段语义可能破坏 JSON 结构）
@@ -465,7 +614,7 @@ pub fn prepare_wb_chat_body(
                         .and_then(|f| f.get_mut("arguments"))
                     {
                         if sanitize {
-                            *s = apply_template_map(s, templates);
+                            *s = apply_template_map_seeded(s, templates, variant_seed);
                         }
                     }
                 }
@@ -483,7 +632,7 @@ pub fn prepare_wb_chat_body(
                     .get_mut("function")
                     .and_then(|f| f.get_mut("description"))
                 {
-                    *d = apply_template_map(d, templates);
+                    *d = apply_template_map_seeded(d, templates, variant_seed);
                 }
             }
         }
@@ -825,7 +974,7 @@ mod tests {
 
     fn rewrite(v: Value, effort: Option<&str>) -> Value {
         let src = serde_json::to_vec(&v).unwrap();
-        let out = prepare_wb_chat_body(&src, "glm-5.3", "4487568582777872", "conv-1", effort, true, NO_TPL);
+        let out = prepare_wb_chat_body(&src, "glm-5.3", "4487568582777872", "conv-1", effort, true, NO_TPL, 0, false);
         serde_json::from_slice(&out).unwrap()
     }
 
@@ -834,21 +983,21 @@ mod tests {
     fn prompt_cache_key_hard_isolated_per_account() {
         let src = json!({"messages":[{"role":"system","content":"s"}]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "4487568582777872", "conv-1", None, false, NO_TPL);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "4487568582777872", "conv-1", None, false, NO_TPL, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let key = v["prompt_cache_key"].as_str().unwrap();
         assert!(key.starts_with("wb-44875685-"), "键首段为账号 uid 前 8 位: {key}");
         // 同账号同会话：稳定（可重复调用命中同一缓存键）
-        let out2 = prepare_wb_chat_body(&src_bytes, "m", "4487568582777872", "conv-1", None, false, NO_TPL);
+        let out2 = prepare_wb_chat_body(&src_bytes, "m", "4487568582777872", "conv-1", None, false, NO_TPL, 0, false);
         let v2: Value = serde_json::from_slice(&out2).unwrap();
         assert_eq!(v2["prompt_cache_key"], v["prompt_cache_key"]);
         // 跨账号：键必不同（硬隔离——跨账号命中前缀缓存 = 对话内容泄露）
-        let out3 = prepare_wb_chat_body(&src_bytes, "m", "1335050000000000", "conv-1", None, false, NO_TPL);
+        let out3 = prepare_wb_chat_body(&src_bytes, "m", "1335050000000000", "conv-1", None, false, NO_TPL, 0, false);
         let v3: Value = serde_json::from_slice(&out3).unwrap();
         assert_ne!(v3["prompt_cache_key"], v["prompt_cache_key"]);
         assert!(v3["prompt_cache_key"].as_str().unwrap().starts_with("wb-13350500-"));
         // uid 缺失不注入（宁缺勿造）
-        let out4 = prepare_wb_chat_body(&src_bytes, "m", "", "conv-1", None, false, NO_TPL);
+        let out4 = prepare_wb_chat_body(&src_bytes, "m", "", "conv-1", None, false, NO_TPL, 0, false);
         let v4: Value = serde_json::from_slice(&out4).unwrap();
         assert!(v4.get("prompt_cache_key").is_none());
     }
@@ -859,7 +1008,7 @@ mod tests {
     fn leading_system_message_ensured() {
         let src = json!({"messages":[{"role":"user","content":"hi"}]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
@@ -870,7 +1019,7 @@ mod tests {
         // system-first 不重复注入
         let src = json!({"messages":[{"role":"system","content":"真实系统提示"},{"role":"user","content":"hi"}]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
@@ -879,7 +1028,7 @@ mod tests {
         // 空 messages 不注入
         let src = json!({"messages":[]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"].as_array().unwrap().len(), 0);
     }
@@ -954,13 +1103,62 @@ mod tests {
     #[test]
     fn template_rewrites_deepseek_harness_identity() {
         // DSH（DeepSeek Harness）身份句：2026-10-06 测试机空完成影子风控实证，
-        // 首句 + 模型句 "powered by" 均需改写（glm- 前缀匹配覆盖模型变体）
+        // 首句 + 模型句 "powered by" 均需改写（glm- 前缀匹配覆盖模型变体）。
+        // issue #122 升级：单词级改写（built on）后品牌词残留仍被秒拒，
+        // 整句同义改写须连品牌词与自我声明句式一并消除
         let tpl = default_template_map();
         let dsh = "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the glm-5.3-flash model.";
         let out = apply_template_map(dsh, &tpl);
-        assert!(out.contains("built on DeepSeek Harness."), "{out}");
-        assert!(out.contains("built on the glm-5.3-flash model."), "{out}");
+        assert!(
+            out.contains("You are an AI agent that helps the user with programming work."),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "You help the user with programming work using the glm-5.3-flash model."
+            ),
+            "{out}"
+        );
         assert!(!out.contains("powered by"), "{out}");
+        // 品牌词与句式形态零残留（issue #122：残留即指纹）
+        assert!(!out.contains("DeepSeek Harness"), "{out}");
+        assert!(!out.contains("coding agent"), "{out}");
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out);
+    }
+
+    /// OpenCode 身份句整句同义改写（issue #122 ×24 实证：tool→assistant 单词级
+    /// 改写后 opencode / interactive CLI / software engineering tasks 残留仍被
+    /// 上游特征识别秒拒——整句替换三类特征一并消除）
+    #[test]
+    fn opencode_identity_sentence_whole_rewrite() {
+        let tpl = default_template_map();
+        let src = "You are opencode, an interactive CLI tool that helps users with software engineering tasks.";
+        let out = apply_template_map(src, &tpl);
+        assert!(out.contains("pragmatic senior engineer"), "{out}");
+        // 品牌/特征词零残留
+        assert!(!out.contains("opencode"), "{out}");
+        assert!(!out.contains("interactive CLI"), "{out}");
+        assert!(!out.contains("software engineering tasks"), "{out}");
+        // 改写结果不再命中触发词（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out);
+    }
+
+    /// 默认表全部改写句零残指纹 + 幂等（issue #122 方案 C3 口径回归锁定）：
+    /// 改写句自身含特征词 = 指纹仍在（首轮请求激进规则不兜底）+
+    /// residual_fingerprint_note 设计性误报；任何新增/修改默认规则必须过此门
+    #[test]
+    fn default_map_outputs_are_residue_free_and_idempotent() {
+        let tpl = default_template_map();
+        for (from, to) in &tpl {
+            assert_ne!(from, to, "规则未改写: {from}");
+            let out = apply_template_map(from, &tpl);
+            let low = out.to_lowercase();
+            for m in RESIDUAL_MARKERS {
+                assert!(!low.contains(*m), "改写句残留特征词 {m}: {from} → {out}");
+            }
+            assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等: {from} → {out}");
+        }
     }
 
     #[test]
@@ -994,13 +1192,13 @@ mod tests {
         let src = json!({"messages":[{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."}]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
         assert!(s.contains("CLI tool"));
         assert!(!s.contains("official CLI for Claude."));
         // sanitize 关闭时跳过该预处理（与指纹清洗开关联动 §5.5 #9）
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"][0]["content"], json!("You are Claude Code, Anthropic's official CLI for Claude."));
     }
@@ -1063,7 +1261,7 @@ mod tests {
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let args = v["messages"][1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
         assert!(args.contains("CLI tool"));
@@ -1075,7 +1273,7 @@ mod tests {
             json!("You are Claude Code, Anthropic's official CLI tool for Claude.")
         );
         // sanitize=false 不清洗
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v["messages"][1]["tool_calls"][0]["function"]["arguments"]
             .as_str()
@@ -1144,7 +1342,7 @@ mod tests {
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
         assert!(s.contains("built on GPT-5"));
@@ -1152,7 +1350,7 @@ mod tests {
         // user 消息不受影响
         assert_eq!(v["messages"][1]["content"], json!("帮我写个函数"));
         // sanitize=false 原样透传（清洗开关联动）
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v["messages"][0]["content"].as_str().unwrap().contains("based on GPT-5"));
     }
@@ -1179,7 +1377,7 @@ mod tests {
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
         assert!(s.contains("agent running in TraeCode"));
@@ -1211,7 +1409,7 @@ mod tests {
         });
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let tools = v["tools"].as_array().unwrap();
 
@@ -1231,9 +1429,146 @@ mod tests {
         assert!(tools[2].get("function").is_none());
 
         // sanitize=false 原样透传（清洗开关联动）
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let d0 = v["tools"][0]["function"]["description"].as_str().unwrap();
         assert!(d0.contains("based on GPT-5"));
+    }
+
+    /// issue #122 方案 C1：多候选改写——`|` 分隔候选按种子稳定选一，跨种子
+    /// 变化、同种子可复现；单候选规则与种子无关（存量零影响）
+    #[test]
+    fn multi_candidate_seeded_rewrite() {
+        let tpls = vec![("FP_M".to_string(), "Alpha|Beta|Gamma".to_string())];
+        // 任一种子：结果必为候选之一（不产生残句拼接）
+        for seed in [0u64, 1, 2, 3, 42, 0xdead_beef] {
+            let out = apply_template_map_seeded("x FP_M y", &tpls, seed);
+            assert!(
+                out == "x Alpha y" || out == "x Beta y" || out == "x Gamma y",
+                "seed={seed} out={out}"
+            );
+        }
+        // 跨种子变化：连续 8 个种子命中全部 3 个候选（idx = (seed^哈希)%3
+        // 在连续种子下取遍所有余数）
+        let outs: std::collections::HashSet<String> = (0u64..8)
+            .map(|s| apply_template_map_seeded("FP_M", &tpls, s))
+            .collect();
+        assert_eq!(outs.len(), 3, "连续种子应取遍全部候选: {outs:?}");
+        // 同种子可复现（同请求内稳定）
+        assert_eq!(
+            apply_template_map_seeded("FP_M", &tpls, 7),
+            apply_template_map_seeded("FP_M", &tpls, 7)
+        );
+        // 单候选规则：种子无关
+        let single = vec![("FP_S".to_string(), "Only".to_string())];
+        for seed in [0u64, 9, 12345] {
+            assert_eq!(apply_template_map_seeded("FP_S", &single, seed), "Only");
+        }
+        // seed=0 稳定入口（Trae 池）：确定性行为
+        assert_eq!(apply_template_map("FP_M", &tpls), apply_template_map("FP_M", &tpls));
+        // 剥离候选（空串）合法：命中即删除原文
+        let strip = vec![("FP_X".to_string(), String::new())];
+        assert_eq!(apply_template_map_seeded("a FP_X b", &strip, 5), "a  b");
+    }
+
+    /// issue #122 方案 C1：variant_seed 请求种子——同入参稳定、任一变化即漂移
+    /// （跨换号重试/工具执行轮次的候选必变）
+    #[test]
+    fn variant_seed_stable_per_inputs_and_varies() {
+        assert_eq!(variant_seed("conv-1", 1), variant_seed("conv-1", 1));
+        assert_ne!(variant_seed("conv-1", 1), variant_seed("conv-1", 2));
+        assert_ne!(variant_seed("conv-1", 1), variant_seed("conv-2", 1));
+    }
+
+    /// issue #122 方案 C1 端到端：prepare 按种子对 messages 内身份句选候选，
+    /// 跨种子产生不同改写句、品牌词零残留
+    #[test]
+    fn prepare_applies_seeded_multi_candidate() {
+        let tpls = vec![(
+            "You are FP_E2E".to_string(),
+            "You are Candidate One|You are Candidate Two".to_string(),
+        )];
+        let src = json!({"messages":[{"role":"system","content":"You are FP_E2E, a test harness."}]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let mut outs = std::collections::HashSet::new();
+        for seed in 0u64..6 {
+            let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpls, seed, false);
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            let s = v["messages"][0]["content"].as_str().unwrap().to_string();
+            assert!(s.starts_with("You are Candidate "), "{s}");
+            assert!(!s.contains("FP_E2E"), "{s}");
+            outs.insert(s);
+        }
+        assert!(outs.len() > 1, "种子轮换应产生不同候选: {outs:?}");
+    }
+
+    /// issue #122 方案 C3：残指纹自检——已知句整句改写零残留不报；未知变体
+    /// 前缀残留命中注记；用户正文品牌词不参与（不误报）；坏 body / 无 system
+    /// 不 panic 返回 None
+    #[test]
+    fn residual_fingerprint_detection() {
+        let tpl = default_template_map();
+        // 已知句整句改写 → 首条 system 零残留；user 正文含品牌词不参与自检
+        let ok = json!({"messages":[
+            {"role":"system","content":"You are opencode, an interactive CLI tool that helps users with software engineering tasks."},
+            {"role":"user","content":"聊聊 opencode 这个项目"}
+        ]});
+        let b = serde_json::to_vec(&ok).unwrap();
+        let washed = prepare_wb_chat_body(&b, "m", "", "", None, true, &tpl, 0, false);
+        assert_eq!(residual_fingerprint_note(&washed), None);
+        // 未知变体（默认表未覆盖、激进规则未启用）→ 前缀残留 → 命中注记
+        let leak = json!({"messages":[
+            {"role":"system","content":"You are opencode, a secret new flavor."}
+        ]});
+        let b2 = serde_json::to_vec(&leak).unwrap();
+        let washed2 = prepare_wb_chat_body(&b2, "m", "", "", None, true, &tpl, 0, false);
+        let note = residual_fingerprint_note(&washed2).expect("未知变体应命中残指纹");
+        assert!(note.contains("opencode"), "{note}");
+        // 非 JSON body → None 不 panic
+        assert_eq!(residual_fingerprint_note(b"not json"), None);
+        // 无 system 消息 → None（user 正文品牌词不误报）
+        let nosys =
+            serde_json::to_vec(&json!({"messages":[{"role":"user","content":"opencode"}]})).unwrap();
+        assert_eq!(residual_fingerprint_note(&nosys), None);
+    }
+
+    /// issue #122 方案 C2：激进清洗仅在 aggressive=true（空完成换号重试）时
+    /// 应用——未知变体短前缀兜底；已知句默认表整句规则先行（激进不产生二次
+    /// 差异）；sanitize=false 时激进规则不生效
+    #[test]
+    fn aggressive_rewrite_gated_by_flag_and_normal_first() {
+        // 默认表未覆盖的未知 opencode 变体：aggressive=false 原样、true 兜底改写
+        let variant = "You are opencode, a brand new interactive CLI flavor that helps users with code.";
+        let src = json!({"messages":[{"role":"system","content":variant}]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let tpl = default_template_map();
+        let out0 = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
+        let v0: Value = serde_json::from_slice(&out0).unwrap();
+        assert_eq!(v0["messages"][0]["content"], json!(variant), "首轮不应用激进规则");
+        let out1 = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, true);
+        let v1: Value = serde_json::from_slice(&out1).unwrap();
+        let s1 = v1["messages"][0]["content"].as_str().unwrap();
+        assert!(s1.contains("pragmatic senior engineer"), "{s1}");
+        assert!(!s1.contains("opencode"), "{s1}");
+        // 已知句：默认表整句规则先行，激进前缀不再命中（改写结果与仅默认表一致）
+        let known = "You are opencode, an interactive CLI tool that helps users with software engineering tasks.";
+        let src2 = json!({"messages":[{"role":"system","content":known}]});
+        let b2 = serde_json::to_vec(&src2).unwrap();
+        let out2 = prepare_wb_chat_body(&b2, "m", "", "", None, true, &tpl, 0, true);
+        let out2b = prepare_wb_chat_body(&b2, "m", "", "", None, true, &tpl, 0, false);
+        assert_eq!(out2, out2b, "默认表已整句改写，激进规则不应产生二次差异");
+        // sanitize=false 时激进规则不生效（无清洗即无升级）
+        let out3 = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl, 0, true);
+        let v3: Value = serde_json::from_slice(&out3).unwrap();
+        assert_eq!(v3["messages"][0]["content"], json!(variant));
+        // 「powered by <harness>」未知句式兜底（默认表逐字句之外的变体）
+        let dsh_variant = "You are an AI agent powered by DeepSeek Harness, running in a terminal.";
+        let src4 = json!({"messages":[{"role":"system","content":dsh_variant}]});
+        let b4 = serde_json::to_vec(&src4).unwrap();
+        let out4 = prepare_wb_chat_body(&b4, "m", "", "", None, true, &tpl, 0, true);
+        let v4: Value = serde_json::from_slice(&out4).unwrap();
+        let s4 = v4["messages"][0]["content"].as_str().unwrap();
+        assert!(s4.contains("that helps the user with programming work"), "{s4}");
+        assert!(!s4.contains("DeepSeek Harness"), "{s4}");
     }
 }

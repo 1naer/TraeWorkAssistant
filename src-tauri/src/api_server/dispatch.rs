@@ -472,10 +472,14 @@ pub fn resolve_target(
                 let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
                 // 审查 #19：双收录模型可能落 buddy-ai 池（Intl 上游）——降级候选出自
                 // CN 目录，若候选 id 不在 Intl 目录，降级后发往 buddy-ai 池上游不存在。
-                // buddy_in_both 时候选取 CN∩Intl 交集；单收录保持 CN 目录候选不变
+                // buddy_in_both 时候选取 CN∩Intl 交集；单收录保持 CN 目录候选不变。
+                // Intl 收录过滤以国际档开启为前提（对齐 Intl 折入门控口径）：国际档
+                // 关闭时 buddy-ai 池不可用、请求必落 Buddy CN 池，CN 专属低价候选
+                // （如 hy4-preview 0.00，Intl 目录未收录）不得被排除（t38/t38a 回归锁定）
                 let in_wl_intl = |m: &str| {
                     in_wl(m)
-                        && (!buddy_in_both
+                        && (!buddy_ai_enabled
+                            || !buddy_in_both
                             || super::wb_catalog::find(&intl_catalog, m).is_some())
                 };
                 let final_model = if !buddy_intl_only
@@ -2295,6 +2299,30 @@ mod tests {
         super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
         let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
         assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
+    }
+
+    /// 审查 #19 Case A 回归锁定：国际档开启 + 双收录模型（glm-5.3 ∈ CN∩Intl），
+    /// 降级候选须限 CN∩Intl 交集（防降级后发往 buddy-ai 池上游模型不存在）——
+    /// CN 专属的 hy4-preview(0.00) 被排除，交集内最低价为 hy3(0.00)。
+    /// 与 t38（国际档关闭不过滤）构成双向口径。
+    #[test]
+    fn t38a_bg_downgrade_intl_filter_requires_intl_enabled() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.state
+            .buddy_ai_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.state
+            .wb_bg_downgrade
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
+        let bg = json!({"model": "glm-5.3", "max_tokens": 16,
+               "messages": [{"role": "user", "content": "生成标题"}]});
+        let r = resolve_target(&f.state, "glm-5.3", &bg, None).unwrap();
+        assert_eq!(
+            r.model, "hy3",
+            "国际档开启 + 双收录 → 降级候选限 CN∩Intl 交集最低价（hy4-preview 非 Intl 收录被排除）"
+        );
     }
 
     // ==================== Qoder 源参与调度（p3-3） ====================

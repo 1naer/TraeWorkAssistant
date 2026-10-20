@@ -733,6 +733,7 @@ fn run_wb_stream(
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+    let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
     // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
     // 防换号重试期间断连落 "none" 致账单排查失据
     let mut last_bound_uid: Option<String> = None;
@@ -837,9 +838,28 @@ fn run_wb_stream(
         let catalog = super::wb_catalog::load(&state.data_dir);
         let effort = super::wb_catalog::find(&catalog, model)
             .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
+        // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定请求、tried.len()
+        // 随换号轮换递增——跨重试候选必变；空完成后（empty_hits>0）追加激进
+        // 清洗（issue #122 方案 C2，升级式：首轮不应用）
+        let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
         let mut converted = wb_payload::prepare_wb_chat_body(
             body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+            seed, empty_hits > 0,
         );
+        // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
+        // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
+        if sanitize {
+            if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                if last_residual_note.as_deref() != Some(note.as_str()) {
+                    last_residual_note = Some(note.clone());
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                        state.pool_label(),
+                        picked.uid
+                    ));
+                }
+            }
+        }
         let mut creds = WbCreds {
             id: picked.uid.clone(),
             uid: picked.uid.clone(),
@@ -1001,6 +1021,7 @@ fn run_wb_stream(
                             ));
                             converted = wb_payload::prepare_wb_chat_body(
                                 body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                seed, false,
                             );
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
@@ -1180,6 +1201,7 @@ pub async fn wb_aggregate_chat(
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
 
         loop {
             let picked = match first_pick.take() {
@@ -1244,9 +1266,26 @@ pub async fn wb_aggregate_chat(
             let catalog = super::wb_catalog::load(&state.data_dir);
             let effort = super::wb_catalog::find(&catalog, &model)
                 .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
+            // 多候选改写种子 + 激进清洗开关（issue #122 方案 C1/C2，同流式路径口径：
+            // 种子随换号轮换递增，空完成后追加激进规则）
+            let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
             let mut converted = wb_payload::prepare_wb_chat_body(
                 &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                seed, empty_hits > 0,
             );
+            // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
+            if sanitize {
+                if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                    if last_residual_note.as_deref() != Some(note.as_str()) {
+                        last_residual_note = Some(note.clone());
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                            state.pool_label(),
+                            picked.uid
+                        ));
+                    }
+                }
+            }
             let mut creds = WbCreds {
                 id: picked.uid.clone(),
                 uid: picked.uid.clone(),
@@ -1369,6 +1408,7 @@ pub async fn wb_aggregate_chat(
                                 ));
                                 converted = wb_payload::prepare_wb_chat_body(
                                     &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                    seed, false,
                                 );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
@@ -1566,6 +1606,7 @@ pub async fn wb_tool_exec_chat(
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
@@ -1640,9 +1681,25 @@ pub async fn wb_tool_exec_chat(
                 round += 1;
 
                 let body_bytes = serde_json::to_vec(&chat_body).unwrap_or_default();
+                // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定账号、round 随
+                // 工具执行轮次递增；空完成后追加激进清洗（issue #122 方案 C2）
                 let converted = wb_payload::prepare_wb_chat_body(
                     &body_bytes, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                    wb_payload::variant_seed(&conv_id, round as u64), empty_hits > 0,
                 );
+                // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
+                if sanitize {
+                    if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                        if last_residual_note.as_deref() != Some(note.as_str()) {
+                            last_residual_note = Some(note.clone());
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                                state.pool_label(),
+                                picked.uid
+                            ));
+                        }
+                    }
+                }
 
                 // F-76① 各轮记首字耗时（最终轮即最终回复的 TTFT）
                 let ttfb_start = Instant::now();
