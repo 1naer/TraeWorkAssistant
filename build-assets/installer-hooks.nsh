@@ -11,11 +11,15 @@
   ;    应用内「检查更新」自动安装时安装器先于应用退出启动，靠此兜底解锁文件占用
   ;    （正常流程应用已自行退出）。
   ;    注意：不结束老品牌进程 "Trae Work 助手.exe"——两版并存，不得干扰老版本运行。
-  nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe" /T'
+  ;    注意：本产品两行禁用 /T（树杀，issue #135）——应用内更新场景下安装器是本产品
+  ;    主程序的子进程，/T 会连同安装器一起强杀，安装中途静默中断升级失败；主程序
+  ;    文件锁由主进程映像持有，杀主进程即解锁，无需树杀（CheckIfAppIsRunning 会兜底）。
+  ;    老品牌二进制行保留 /T：老品牌进程不可能是本安装器的祖先，树杀无副作用。
+  nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe"'
   Pop $R9
   nsExec::Exec 'taskkill /F /IM "trae-work-assistant.exe" /T'
   Pop $R9
-  nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe" /T'
+  nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe"'
   Pop $R9
 !macroend
 
