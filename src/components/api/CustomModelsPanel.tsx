@@ -1,9 +1,10 @@
 /**
  * 全局 API 管理 · 自定义模型（custom_models.json）
  * 列表方式维护 OpenAI 兼容自定义模型：名称（请求模型名，路由键）/ API 地址 / Key /
- * 其他字段（上下文长度 / 最大输出 / 图片支持 / 倍率 / 备注 / 启用开关）。
- * 调度语义：请求模型名 canonical 命中 enabled 条目即直达该上游（用户显式配置优先），
- * 未命中回落 Trae/Buddy/Qoder 统一管线；数据源：custom_models_list / save / remove。
+ * 其他字段（上下文长度 / 最大输出 / 图片支持 / 倍率 / 负载权重 / 备胎 / 备注 / 启用开关）。
+ * 调度语义（v3）：同名多条 = 上游组（组内加权轮询 + 主备 failover + 熔断切换），
+ * 作为第五资源池参与统一调度（默认候选序尾部兜底），custom/ 前缀锁池直达；
+ * 数据源：custom_models_list / save / remove / custom_lb_status（熔断徽标）。
  * 子弹框（编辑/删除确认）沿用 Modal 叠加，onSubModalChange 上报供主弹窗屏蔽 ESC 双关。
  */
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
@@ -329,7 +330,7 @@ export default function CustomModelsPanel({
           <Blocks size={16} className="text-brand-500" />
           <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">自定义模型</h3>
           <span className="hidden text-xs text-slate-400 sm:inline">
-            OpenAI 兼容上游直通 · 模型名命中即直达，未命中回落 Trae/Buddy/Qoder 调度
+            OpenAI 兼容上游 · 同名多条组成上游组（负载均衡轮询），参与统一调度（默认尾部兜底），custom/前缀锁池直达
           </span>
         </div>
         <div className="flex items-center gap-1">
@@ -347,7 +348,7 @@ export default function CustomModelsPanel({
       {models.length === 0 ? (
         <p className="py-6 text-center text-sm text-slate-400">
           暂无自定义模型 — 点击「新建模型」接入任意 OpenAI 兼容 API（中转站 / 自建服务）；
-          模型名命中即直达，未命中回落 Trae/Buddy/Qoder 统一调度
+          同名多条组成上游组负载均衡，参与统一调度，未命中回落 Trae/Buddy/Qoder
         </p>
       ) : (
         <div className="overflow-x-auto">

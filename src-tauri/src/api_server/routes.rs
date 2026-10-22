@@ -754,7 +754,8 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 过滤结果派生，不重复过滤
     if source_labels {
         for m in list.iter().filter(|m| m.sources.len() >= 2) {
-            for s in m.sources.iter().filter(|s| s.pool != "custom") {
+            // v3：custom 入别名列表（custom/xxx 前缀锁池直达与其他池同语义）
+            for s in m.sources.iter() {
                 data.push(json!({
                     "id": format!("{}/{}", s.pool, m.id),
                     "object": "model",
