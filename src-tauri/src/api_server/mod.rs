@@ -191,6 +191,65 @@ pub struct ApiSharedState {
     pub custom_lb_counters: Mutex<std::collections::HashMap<String, std::sync::atomic::AtomicUsize>>,
 }
 
+/// 测试专用：全字段默认构造（custom_route 端到端轮换测试等无 fixture 的
+/// 测试模块复用；开关取生产默认值，池为空池）
+#[cfg(test)]
+pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState {
+    ApiSharedState {
+        pool: pool::ApiPool::new(),
+        wb_pool: pool::ApiPool::new(),
+        wb_enabled: std::sync::atomic::AtomicBool::new(true),
+        wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+        wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+        wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+        wb_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_sticky: wb_sticky::StickyStore::default(),
+        pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        default_model: String::new(),
+        logger: ApiLogger::new(data_dir.join("logs")),
+        data_dir,
+        total_requests: AtomicU64::new(0),
+        inflight: Arc::new(AtomicU64::new(0)),
+        active_uid: Mutex::new(None),
+        last_error: Mutex::new(None),
+        debug_enabled: std::sync::atomic::AtomicBool::new(false),
+        usage: Mutex::new(usage::UsageFile::default()),
+        usage_dirty: Mutex::new(Vec::new()),
+        wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
+        trae_jwt_refresh: None,
+        trae_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_pool: pool::ApiPool::new(),
+        qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_identity: None,
+        qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_sticky: wb_sticky::StickyStore::default(),
+        trae_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_pool: pool::ApiPool::new(),
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+        listen_host: Mutex::new("127.0.0.1".to_string()),
+        custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
+    }
+}
+
 impl ApiSharedState {
     /// 进入业务端点时获取并发 guard（§4.5）：inflight +1，Drop 时 -1。
     /// panic 展开 / 客户端断连（axum 丢弃 handler future）/ 流异常终止均兜底释放

@@ -1542,6 +1542,52 @@ mod tests {
         );
     }
 
+    /// v3 §7.4：Smart 重排四池——custom rate=0（免费）+ trae 同名（rate 未声明）
+    /// → Smart 按倍率键 custom 胜出（无 per_model/priority 显式覆盖时）
+    #[test]
+    fn t91_smart_free_custom_wins_over_trae() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true,
+                "rate": 0.0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // 默认 Smart 策略：可用源 = trae + custom ≥2 → 重排生效；
+        // custom rate=0（免费）< trae 未声明（f64::MAX 后置）→ custom 胜出
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Custom);
+    }
+
+    /// v3 §7.4：同名双源 trae 不健康（池空 = 无健康账号）→ 序回退落 custom
+    /// （per_model ["trae","custom"] 显式序；fallback 管线复用）
+    #[test]
+    fn t91_trae_unhealthy_falls_back_custom() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        p.per_model.insert("glm-5.3".into(), vec!["trae".into(), "custom".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&p));
+        // 不 seed trae 池（空池 = 无健康账号）；custom 组健康
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.fallback_from, Some(TargetPool::Trae));
+    }
+
 
     /// 覆写 Buddy 目录为仅含 `keep` 的显式条目（builtin_rev 拉平退出内置重建）：
     /// fixture 的 wb_model_catalog 写入缺 builtin_rev 会被 wb_catalog::load 重建为

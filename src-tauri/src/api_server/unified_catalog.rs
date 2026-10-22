@@ -1460,6 +1460,47 @@ mod tests {
         assert_eq!(m.sources[0].rate, Some(0.0));
     }
 
+    /// P1 上游组目录聚合（方案 §4.4/§4.6）：同 canonical 两条 custom 条目
+    /// 聚合后目录单行单 custom 源；倍率取组内最小；组内一条 disabled 不影响
+    /// 整体可命中（enabled = 任一条 enabled）
+    #[test]
+    fn t13b_custom_group_aggregates_single_row_min_rate() {
+        let f = fixture(&[], &[], None);
+        let cm = |id: &str, url: &str, rate: f64, enabled: bool| {
+            crate::api_server::custom_models::CustomModel {
+                id: id.into(),
+                name: "My-Relay-Model".into(),
+                base_url: url.into(),
+                enabled,
+                rate,
+                ..Default::default()
+            }
+        };
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![
+                    cm("cm-a", "https://a.example.com", 0.05, true),
+                    cm("cm-b", "https://b.example.com", 0.01, true),
+                    // 完全第三条：disabled —— find_enabled_all 已过滤，聚合不含其倍率
+                    cm("cm-c", "https://c.example.com", 99.0, false),
+                ],
+                updated_at: 0,
+            },
+        )
+        .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "custom_models");
+        let list = unified_models(&f.dir, true, true, true);
+        let hits: Vec<_> = list.iter().filter(|m| m.id == "My-Relay-Model").collect();
+        assert_eq!(hits.len(), 1, "同 canonical 多条必须聚合为目录单行");
+        let m = hits[0];
+        let custom_sources: Vec<_> = m.sources.iter().filter(|s| s.pool == "custom").collect();
+        assert_eq!(custom_sources.len(), 1, "单 custom 源标记（非多条）");
+        assert_eq!(custom_sources[0].rate, Some(0.01), "倍率取组内 enabled 最小");
+        assert!(custom_sources[0].enabled, "任一条 enabled 即整体可命中");
+        assert_eq!(m.rate, Some(0.01), "顶层展示倍率随聚合倍率");
+    }
+
     // ==================== issue #26 全局模型白名单 ====================
 
     /// save 归一（canonical + 去空 + 去重保序）/ 回读 / 判定语义（空 = 不限）

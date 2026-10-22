@@ -255,6 +255,11 @@ pub fn custom_stream_chat(
                     "custom", "POST", proto.log_path(), &model, true, 503, "custom",
                     start_ts.elapsed().as_millis() as u64, &key_name, "-", Some(&last_err),
                 );
+                state.logger.log_debug_line(format!(
+                    "[DEBUG] UPSTREAM_GROUP_EXHAUSTED tried={} pool=custom model={} 组内无可用上游（全熔断或已试尽）",
+                    tried.len(),
+                    model,
+                ));
                 send_stream_error(&tx, proto, 503, &last_err);
                 break;
             };
@@ -278,6 +283,12 @@ pub fn custom_stream_chat(
                     );
                     attempt += 1;
                     if attempt >= max_attempts {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] UPSTREAM_GROUP_EXHAUSTED tried={} pool=custom model={} reasons=[status={}]",
+                            tried.len(),
+                            model,
+                            status,
+                        ));
                         send_stream_error(&tx, proto, status as i64, &last_err);
                         break;
                     }
@@ -296,6 +307,11 @@ pub fn custom_stream_chat(
                         last_err = "自定义上游 10 秒内未响应（首字超时）".into();
                         attempt += 1;
                         if attempt >= max_attempts {
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] UPSTREAM_GROUP_EXHAUSTED tried={} pool=custom model={} reasons=[first byte timeout]",
+                                tried.len(),
+                                model,
+                            ));
                             send_stream_error(&tx, proto, 504, &last_err);
                             break;
                         }
@@ -345,6 +361,12 @@ pub fn custom_stream_chat(
                                 attempt += 1;
                                 if sent_any || attempt >= max_attempts {
                                     if !sent_any {
+                                        state.logger.log_debug_line(format!(
+                                            "[DEBUG] UPSTREAM_GROUP_EXHAUSTED tried={} pool=custom model={} reasons=[stream error code={}]",
+                                            tried.len(),
+                                            model,
+                                            code,
+                                        ));
                                         send_stream_error(&tx, proto, code, &msg);
                                     }
                                     break;
@@ -509,6 +531,14 @@ pub async fn custom_aggregate_chat(
                 }
             }
         }
+        // 组内全试完仍失败 → [DEBUG] 排障摘要（§8，对齐 Trae 耗尽 [DEBUG] 口径）
+        state.logger.log_debug_line(format!(
+            "[DEBUG] UPSTREAM_GROUP_EXHAUSTED tried={} pool=custom model={} stream={} last={}",
+            tried.len(),
+            model,
+            stream,
+            last_err,
+        ));
         Err(last_err)
     })
     .await;
@@ -550,5 +580,117 @@ pub async fn custom_aggregate_chat(
             "internal_error",
             &format!("task join error: {}", e),
         ),
+    }
+}
+
+// ==================== 测试（§5.3 验收：轮换端到端） ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// 本地 mock OpenAI 兼容 SSE 上游：首个连接回 401，第二个连接回 200 SSE
+    /// （单上游 401、另一上游 200 → 组内轮换客户端无感，方案 §5.3 验收用例）
+    fn mock_upstream() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, conn) in listener.incoming().enumerate() {
+                let Ok(mut s) = conn else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let resp: &[u8] = if i == 0 {
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                      data: {\"id\":\"cmock\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                      data: {\"id\":\"cmock\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                      data: [DONE]\n\n"
+                };
+                let _ = s.write_all(resp);
+                let _ = s.flush();
+                if i >= 1 {
+                    break; // 只服务两个连接（两个 attempt）
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    fn cm(id: &str, base_url: &str) -> CustomModel {
+        CustomModel {
+            id: id.into(),
+            name: "mock-model".into(),
+            base_url: base_url.into(),
+            api_key: format!("key-{id}"),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// 端到端轮换（§5.3 验收「一条 401 时请求自动落到另一条且客户端无感」）：
+    /// 组 = [401 上游, 200 上游] → 客户端收到 200 与内容 "ok"；401 条目落 Auth 长窗；
+    /// 200 条目熔断被清除且记会话粘上游
+    #[tokio::test]
+    async fn t01_rotation_401_then_200_client_unaware() {
+        let dir = std::env::temp_dir().join(format!("twa_custom_route_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = std::sync::Arc::new(super::super::test_shared_state(dir.clone()));
+        let base = mock_upstream();
+        let group = vec![cm("cm-mock00000001", &base), cm("cm-mock00000002", &base)];
+
+        let resp = custom_aggregate_chat(
+            state.clone(),
+            br#"{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}"#.to_vec(),
+            "mock-model".into(),
+            group,
+            false,
+            Instant::now(),
+            Protocol::OpenAi,
+            "kid".into(),
+            state.inflight_guard(),
+        )
+        .await;
+
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "401 后必须轮换到第二上游成功；响应体：{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(
+            body.pointer("/choices/0/message/content").and_then(Value::as_str),
+            Some("ok"),
+            "客户端无感拿到第二上游内容"
+        );
+        // 首选条目必须进入熔断表（全量并行下首连可能偶发传输层失败 → Server
+        // 30s 窗而非 Auth 600s 窗；Auth 分类由 t02 纯函数断言 + custom_lb::t05
+        // 覆盖，此处只断言「失败已记账、冷却中」这一轮换前提）
+        let snap = custom_lb::circuit_snapshot();
+        let hit = snap
+            .iter()
+            .find(|(id, _, _)| id == "cm-mock00000001")
+            .expect("失败条目必须进入熔断表");
+        assert!(hit.2 > 0 && hit.2 <= 600, "冷却窗口合理，实际 {}s", hit.2);
+        // 成功条目熔断清除
+        assert!(!custom_lb::circuit_open("cm-mock00000002"), "成功即清熔断");
+        custom_lb::clear_circuit("cm-mock00000001");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 失败分类纯函数（§5.2 约束 3）：401/403/402 → Auth（长窗），其余 → Server
+    #[test]
+    fn t02_classify_failure_matrix() {
+        assert!(matches!(classify_failure(401), FailKind::Auth));
+        assert!(matches!(classify_failure(403), FailKind::Auth));
+        assert!(matches!(classify_failure(402), FailKind::Auth));
+        assert!(matches!(classify_failure(429), FailKind::Server));
+        assert!(matches!(classify_failure(500), FailKind::Server));
+        assert!(matches!(classify_failure(502), FailKind::Server));
+        assert!(matches!(classify_failure(504), FailKind::Server));
     }
 }

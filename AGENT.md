@@ -5,7 +5,7 @@
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom 四池调度**，每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom / buddy-ai 多池统一调度**（custom 为自定义上游组：组内负载均衡 + 熔断；默认候选序尾部兜底），每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
 
 ## 2. Quick Start
 

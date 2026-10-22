@@ -384,6 +384,46 @@ mod tests {
         clear_circuit(&id);
     }
 
+    /// 窗口过期后的失败 = 新片段（§6.4）：片段 +1、窗口翻倍（30s → 60s）。
+    /// Instant 无法快进——直接改表把冷却截止拨到过去（对齐 qoder_route 测试
+    /// 直接操作 cooldown_map 的既有做法），验证递增条件 = 既有窗口已过期
+    #[test]
+    fn t05b_circuit_expiry_increments_fragment() {
+        let id = uid(8);
+        // 首次失败 → 基准窗（fails=1, 30s）
+        note_circuit_failure(&id, FailKind::Server);
+        {
+            let mut map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            // 拨到过去：模拟冷却窗口已过期（半开探测失败的前置状态）
+            let e = map.get_mut(&id).unwrap();
+            e.0 = Instant::now() - Duration::from_secs(1);
+        }
+        // 过期后再失败 → 片段 +1，窗口 = 30s << 1 = 60s（翻倍）
+        note_circuit_failure(&id, FailKind::Server);
+        {
+            let map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            let e = map.get(&id).unwrap();
+            assert_eq!(e.1, 2, "窗口过期后失败 → 片段 +1");
+            let left = e.0.saturating_duration_since(Instant::now()).as_secs();
+            assert!(left > 55 && left <= 60, "窗口翻倍至 60s，实际 {left}");
+        }
+        // 再次过期 → 第三片段 120s
+        {
+            let mut map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            let e = map.get_mut(&id).unwrap();
+            e.0 = Instant::now() - Duration::from_secs(1);
+        }
+        note_circuit_failure(&id, FailKind::Server);
+        {
+            let map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            let e = map.get(&id).unwrap();
+            assert_eq!(e.1, 3);
+            let left = e.0.saturating_duration_since(Instant::now()).as_secs();
+            assert!(left > 110 && left <= 120, "第三次片段窗口 120s，实际 {left}");
+        }
+        clear_circuit(&id);
+    }
+
     /// 粘性：同 session 粘同上游；粘住的上游熔断后失效重选
     #[test]
     fn t06_sticky() {
