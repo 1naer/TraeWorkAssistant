@@ -14,7 +14,7 @@
 //! 另：连续同角色消息自动合并（生态实测，§5.8 #9）。
 
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 /// 默认审核模板映射（映射表文件缺失时的内置兜底，§5.5 #9）：以最小改写
@@ -65,10 +65,20 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are a coding agent working in the Codex CLI".to_string(),
         ),
         // TraeCode harness：system 首句身份声明（日志实证 pool=trae 请求原文，
-        // 虽当前未被拦截，预防性兜底——同一指纹句一旦进入风控名单即全量 11128）
+        // 预防性兜底——同一指纹句一旦进入风控名单即全量 11128）。
+        // issue #129（buddy-ai 国际档实证）：品牌词 TraeCode 本身即竞品 harness
+        // 特征，最小改写（in→running in）后残留仍被渠道验证拦截——整句同义
+        // 改写连根消除；to 不得含 TraeCode（C3 口径，残指纹特征词表成员，
+        // default_map_outputs_are_residue_free_and_idempotent 回归锁定）
         (
             "You are an interactive agent in TraeCode that helps the USER with software engineering tasks.".to_string(),
+            "You are an interactive agent that helps the USER with software engineering tasks.".to_string(),
+        ),
+        // 旧版最小改写句形态（≤v3.8.0 发出的 "running in TraeCode"）作为 from
+        // 幂等兜底：存量自定义表抄录内置表 / 跨版本升级场景同样收敛零残留
+        (
             "You are an interactive agent running in TraeCode that helps the USER with software engineering tasks.".to_string(),
+            "You are an interactive agent that helps the USER with software engineering tasks.".to_string(),
         ),
         // issue #57 预防性布防：REASONIX/DSH 等第三方客户端指纹句（无真实请求
         // 日志可查证，按常见开源 CLI harness 身份句先布防——未命中即无操作）。
@@ -184,6 +194,25 @@ pub fn aggressive_template_rules() -> Vec<(String, String)> {
             "powered by DeepSeek Harness".to_string(),
             "that helps the user with programming work".to_string(),
         ),
+        // issue #129：Trae 客户端身份句前缀兜底（默认表只覆盖已知整句，chat
+        // 模式 / 新版本变体由此兜住）；长前缀规则先行，避免 "You are Trae AI"
+        // 被 "You are Trae" 短规则截断成 "assistant AI" 语义破句
+        (
+            "You are an interactive agent in TraeCode".to_string(),
+            "You are an interactive agent".to_string(),
+        ),
+        (
+            "You are an interactive agent running in TraeCode".to_string(),
+            "You are an interactive agent".to_string(),
+        ),
+        (
+            "You are Trae AI".to_string(),
+            "You are an AI assistant".to_string(),
+        ),
+        (
+            "You are Trae".to_string(),
+            "You are an AI assistant".to_string(),
+        ),
     ]
 }
 
@@ -284,6 +313,91 @@ pub fn template_hit_note() -> String {
     }
 }
 
+// ==================== 指纹样本环形缓冲（issue #125 增强：一键从样本生成规则） ====================
+
+/// 指纹样本条目：网关命中风控时随日志同步采入内存环形缓冲，UI「指纹清洗」
+/// tab 拉取展示、一键预填规则（from/to）。kind：`11128` = 显式指纹拦截
+/// （清洗已启用仍命中）；`empty` = 空完成影子风控收尾采样。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FingerprintSampleEntry {
+    pub kind: String,
+    pub pool: String,
+    /// unix 秒
+    pub ts: u64,
+    /// fingerprint_sample 输出（system="…" tools=[…]）
+    pub sample: String,
+    /// 模板命中注记（template_hit_note 输出，无命中为空串）
+    pub note: String,
+}
+
+const FP_SAMPLE_CAP: usize = 50;
+
+fn fingerprint_sample_store() -> &'static Mutex<VecDeque<FingerprintSampleEntry>> {
+    static STORE: OnceLock<Mutex<VecDeque<FingerprintSampleEntry>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// 采样入环形缓冲：容量上限 50 超限丢最旧；队列中已存在相同 (kind,pool,sample)
+/// 则跳过——换号轮换/跨 kind 交错重复命中样本恒定，不重复占位（全队列比对，
+/// cap 50 代价可忽略；与日志 last_11128_sample 按请求去重同口径）。仅内存态，
+/// 重启清空（持久反查走 app.log 样本行）。锁中毒则恢复内层守卫继续采样
+/// （对齐 routes.rs safe_lock 风格，静默丢样本会漏诊断信息）。
+pub fn record_fingerprint_sample(kind: &str, pool: &str, sample: &str, note: &str) {
+    let mut q = fingerprint_sample_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if q
+        .iter()
+        .any(|e| e.kind == kind && e.pool == pool && e.sample == sample)
+    {
+        return;
+    }
+    if q.len() >= FP_SAMPLE_CAP {
+        q.pop_front();
+    }
+    q.push_back(FingerprintSampleEntry {
+        kind: kind.to_string(),
+        pool: pool.to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        sample: sample.to_string(),
+        note: note.to_string(),
+    });
+}
+
+/// UI 拉取：最新在前
+pub fn fingerprint_sample_entries() -> Vec<FingerprintSampleEntry> {
+    fingerprint_sample_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .cloned()
+        .collect()
+}
+
+/// UI 清空
+pub fn fingerprint_sample_entries_clear() {
+    fingerprint_sample_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// 影子风控收尾采样（issue #99 ① + issue #125 增强）：空完成主导收尾时采样
+/// 入环形缓冲（kind=empty），返回「 指纹样本: …」日志注记；否则返回空串。
+/// pool 由调用方传入池标识（wb 池 pool_label()，trae/qoder 字面量）。
+pub fn empty_sample_note(exhaust_tag: &str, pool: &str, body: &[u8]) -> String {
+    if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
+        return String::new();
+    }
+    let sample = fingerprint_sample(body);
+    record_fingerprint_sample("empty", pool, &sample, &template_hit_note());
+    format!(" 指纹样本: {sample}")
+}
+
 /// 11128 清洗后仍命中的指纹样本提取（issue #99 诊断闭环）：首条 system 消息
 /// 文本前 300 字符（压缩空白单行化，内嵌引号转单引号）+ 工具名列表（前 10 个，
 /// 缺 function 回退顶层 name——Responses 原生工具形态）。
@@ -358,9 +472,10 @@ fn first_system_text(v: &Value) -> String {
 // ==================== 残指纹自检（issue #122 方案 C3） ====================
 
 /// 已知上游风控特征词（issue #122 实证：opencode / DeepSeek Harness 品牌词与
-/// 「interactive CLI」n-gram 残留即秒拒）：整句改写后首条 system 应零残留。
+/// 「interactive CLI」n-gram 残留即秒拒；issue #129 实证：TraeCode 品牌词被
+/// buddy-ai 国际档渠道验证拦截）：整句改写后首条 system 应零残留。
 /// 默认表通用 CLI 规则的改写句已同步去除 interactive（见 default_template_map）
-const RESIDUAL_MARKERS: &[&str] = &["opencode", "deepseek harness", "interactive cli"];
+const RESIDUAL_MARKERS: &[&str] = &["opencode", "deepseek harness", "interactive cli", "traecode"];
 
 /// 残指纹自检（issue #122 方案 C3）：模板改写后对首条 system 消息扫描已知
 /// 特征词，命中返回小写特征词列表（逗号连接），无命中 None。
@@ -386,12 +501,59 @@ pub fn residual_fingerprint_note(body: &[u8]) -> Option<String> {
     }
 }
 
+// ==================== 池级指纹拦截短记忆（issue #122 缺口2） ====================
+
+/// 渠道指纹拦截短记忆 TTL（秒）：轮换耗尽且空完成主导（CHANNEL_FINGERPRINT_BLOCK）
+/// 后，该时长内同池新请求直接以激进清洗起步——503 后客户端重试是新请求
+/// （empty_hits 归零、首轮无激进规则），无记忆会从零试探再烧一轮账号
+const FP_BLOCK_TTL_SECS: i64 = 600;
+
+/// 池 → 最近一次指纹拦截时间戳（秒）；池间互不影响，TTL 过期自然失效
+fn fp_block_registry() -> &'static Mutex<BTreeMap<String, i64>> {
+    static REG: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// 标记池级指纹拦截（各池轮换耗尽收尾调用；blocked=false 不动——仅空完成主导
+/// 的 CHANNEL_FINGERPRINT_BLOCK 收尾才标记，普通账号耗尽不触发激进升级）
+pub fn mark_channel_fp_block(pool: &str, blocked: bool) {
+    if !blocked {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 锁中毒恢复（审查修复：对齐同文件样本缓冲 into_inner 惯例——中毒仅意味
+    // 持锁线程 panic，注册表本身仍可用；静默丢标记会让 aggressive 起步判定失效）
+    let mut m = fp_block_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    m.insert(pool.to_string(), now);
+}
+
+/// 池级指纹拦截是否处于 TTL 内（prepare 调用方 aggressive 起步判定）
+pub fn fp_block_recent(pool: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    fp_block_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) // 锁中毒恢复，对齐同文件样本缓冲惯例
+        .get(pool)
+        .copied()
+        .map(|ts| now - ts < FP_BLOCK_TTL_SECS)
+        .unwrap_or(false)
+}
+
 /// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
 /// 外置映射表新增规则的命中词可能不含内置三短语，预检会永久漏改）；
 /// 条目少（个位数），逐条 contains 代价可接受。
-/// seed=0 稳定入口（Trae 池 payload.rs 沿用 + 兼容旧调用）：多候选规则按
-/// 规则名哈希稳定选一，行为可复现；WB 池走 apply_template_map_seeded 按请求
-/// 种子轮换候选
+/// seed=0 稳定入口：多候选规则按规则名哈希稳定选一，行为可复现；生产路径
+/// 已全部走 apply_template_map_seeded（issue #122 缺口1 后 Trae 池也带种子），
+/// 仅测试使用 → #[cfg(test)] 门控（零警告红线，usage.rs 同款先例）
+#[cfg(test)]
 pub fn apply_template_map(text: &str, templates: &[(String, String)]) -> String {
     apply_template_map_seeded(text, templates, 0)
 }
@@ -587,8 +749,27 @@ pub fn prepare_wb_chat_body(
     // 保留，合并会丢失 id 使上游无法把结果对齐到对应调用
     if let Some(msgs) = m.get_mut("messages").and_then(|v| v.as_array_mut()) {
         let mut merged: Vec<Value> = Vec::with_capacity(msgs.len());
-        for msg in msgs.drain(..) {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+        for mut msg in msgs.drain(..) {
+            let mut role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+            // role 大小写归一（上游 role 枚举小写敏感）："Developer"/"SYSTEM"/"TOOL"
+            // 等非小写变体统一转小写——与 ensure_leading_system_message 的判断
+            // 对齐，也堵住 "TOOL" 误参与合并的隐性缺口；空串/非字符串 role 原样透传
+            if !role.is_empty() {
+                role.make_ascii_lowercase();
+                if let Some(r) = msg.get_mut("role") {
+                    *r = json!(role);
+                }
+            }
+            // 11128 渠道校验（dsh-xdpool#58 实证 2026-10-20）：上游不认
+            // role:"developer"（国内版/国际版都 400 Illegal API invocation），
+            // 统一转 system——只换角色不重排，位置语义保持；转换后走既有
+            // 同角色合并（DSH 的 developer workspace 指令与 system 同类）
+            if role == "developer" {
+                if let Some(r) = msg.get_mut("role") {
+                    *r = json!("system");
+                }
+                role = "system".to_string();
+            }
             let mergeable = !role.is_empty() && role != "tool";
             if mergeable {
                 if let Some(last) = merged.last_mut() {
@@ -815,6 +996,33 @@ mod tests {
         let _ = apply_template_map("no match here", &tpls);
         let again = template_hit_summary().unwrap();
         assert_eq!(again.matches("FP_PROBE_FROM → FP_PROBE_TO").count(), 1);
+    }
+
+    /// 样本环形缓冲（issue #125）：入队/去重/容量上限/逆序拉取/清空
+    #[test]
+    fn fingerprint_sample_store_records_and_clears() {
+        fingerprint_sample_entries_clear();
+        record_fingerprint_sample("11128", "wb", "s1", "");
+        record_fingerprint_sample("11128", "wb", "s1", ""); // 队尾三元组重复 → 去重
+        record_fingerprint_sample("empty", "wb", "s1", ""); // kind 不同 → 保留
+        let got = fingerprint_sample_entries();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].kind, "empty", "最新在前");
+        assert_eq!(got[1].kind, "11128");
+        assert!(got[0].ts > 0, "unix 秒时间戳");
+        // 全队列去重：跨 kind 交错后再次入队相同三元组，不重复占位
+        record_fingerprint_sample("11128", "wb", "s1", "");
+        assert_eq!(fingerprint_sample_entries().len(), 2, "跨 kind 交错去重");
+        // 容量上限：超限丢最旧
+        for i in 0..(FP_SAMPLE_CAP + 5) {
+            record_fingerprint_sample("11128", "wb", &format!("cap{i}"), "");
+        }
+        let got = fingerprint_sample_entries();
+        assert_eq!(got.len(), FP_SAMPLE_CAP);
+        assert_eq!(got[0].sample, format!("cap{}", FP_SAMPLE_CAP + 4), "最新在前");
+        assert_eq!(got.last().unwrap().sample, "cap5", "最旧被挤出");
+        fingerprint_sample_entries_clear();
+        assert!(fingerprint_sample_entries().is_empty());
     }
 
     /// 11128 指纹样本提取（issue #99）：首条 system 文本（空白压缩、引号转义、
@@ -1083,6 +1291,47 @@ mod tests {
     }
 
     #[test]
+    fn developer_role_converted_to_system() {
+        // 11128 渠道校验（dsh-xdpool#58）：role:"developer" 统一转 system
+        // （国内版/国际版都 400；只换角色不重排）
+        let out = rewrite(
+            json!({"messages":[
+                {"role":"developer","content":"workspace 指令"},
+                {"role":"user","content":"hi"},
+                {"role":"developer","content":"中段指令"},
+            ]}),
+            None,
+        );
+        let msgs = out["messages"].as_array().unwrap();
+        assert!(msgs.iter().all(|m| m["role"] != "developer"), "{msgs:?}");
+        // 首条 developer → system：不触发兜底 system 注入（len 保持 3）
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], json!("workspace 指令"));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "system");
+    }
+
+    #[test]
+    fn developer_role_normalized_and_merged() {
+        // 归一化 + 合并联动：非小写变体（"Developer"/"SYSTEM"）先归一小写，
+        // developer 转 system 后走既有同角色合并——相邻两条并作一条
+        let out = rewrite(
+            json!({"messages":[
+                {"role":"Developer","content":"首条"},
+                {"role":"SYSTEM","content":"第二条"},
+                {"role":"user","content":"hi"},
+            ]}),
+            None,
+        );
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], json!("首条\n\n第二条"));
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
     fn template_blacklist_minimal_rewrite() {
         let tpl = default_template_map();
         let cc = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -1159,6 +1408,19 @@ mod tests {
             }
             assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等: {from} → {out}");
         }
+    }
+
+    /// issue #122 缺口2：池级指纹拦截短记忆——blocked=true 标记后同池 TTL 内
+    /// 命中、异池隔离；blocked=false 不标记；未标记池恒不命中
+    #[test]
+    fn fp_block_short_memory_scoped_by_pool() {
+        let pool = "test-fp-block-pool";
+        assert!(!fp_block_recent(pool));
+        mark_channel_fp_block(pool, false);
+        assert!(!fp_block_recent(pool));
+        mark_channel_fp_block(pool, true);
+        assert!(fp_block_recent(pool));
+        assert!(!fp_block_recent("test-fp-block-other-pool"));
     }
 
     #[test]
@@ -1355,17 +1617,25 @@ mod tests {
         assert!(v["messages"][0]["content"].as_str().unwrap().contains("based on GPT-5"));
     }
 
-    /// TraeCode 身份句最小改写（日志实证 pool=trae system 首句原文，预防性兜底）
+    /// TraeCode 身份句整句同义改写（日志实证 pool=trae system 首句原文；
+    /// issue #129：品牌词 TraeCode 连根消除——最小改写残留被 buddy-ai 国际档
+    /// 渠道验证拦截，改写句零品牌词）
     #[test]
-    fn trae_identity_sentence_minimal_rewrite() {
+    fn trae_identity_sentence_neutralized_rewrite() {
         let tpl = default_template_map();
         let src = "You are an interactive agent in TraeCode that helps the USER with software engineering tasks. Use the instructions below and the tools available to you to assist the USER.";
         let out = apply_template_map(src, &tpl);
         assert_ne!(out, src);
-        assert!(out.contains("interactive agent running in TraeCode"));
-        assert!(!out.contains("agent in TraeCode"));
+        assert!(out.contains("interactive agent that helps the USER"));
+        assert!(!out.contains("TraeCode"), "{out}");
+        // 旧版最小改写句形态（≤v3.8.0 发出的 "running in TraeCode"）同样收敛
+        let legacy = "You are an interactive agent running in TraeCode that helps the USER with software engineering tasks. Use the instructions below.";
+        let out2 = apply_template_map(legacy, &tpl);
+        assert!(out2.contains("interactive agent that helps the USER"));
+        assert!(!out2.contains("TraeCode"), "{out2}");
         // 改写结果不再命中触发词（幂等安全）
         assert_eq!(apply_template_map(&out, &tpl), out);
+        assert_eq!(apply_template_map(&out2, &tpl), out2);
     }
 
     /// TraeCode system 消息端到端清洗（pool=trae 请求形态）
@@ -1380,10 +1650,23 @@ mod tests {
         let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
-        assert!(s.contains("agent running in TraeCode"));
-        assert!(!s.contains("agent in TraeCode"));
+        assert!(s.contains("agent that helps the USER"));
+        assert!(!s.contains("TraeCode"));
         // user 消息不受影响
         assert_eq!(v["messages"][1]["content"], json!("fix the bug"));
+    }
+
+    /// aggressive Trae 规则顺序回归（issue #129）：长前缀 "You are Trae AI" 必须
+    /// 先于 "You are Trae" 应用——否则改写输出破句为 "an AI assistant AI,"；
+    /// 后续在 aggressive 规则表插队新增规则时由此锁定顺序不被无意识破坏
+    #[test]
+    fn aggressive_trae_rules_long_prefix_first() {
+        let mut tpl = default_template_map();
+        tpl.extend(aggressive_template_rules());
+        let src = "You are Trae AI, powered by the glm model. Help the user with coding.";
+        let out = apply_template_map(src, &tpl);
+        assert!(out.starts_with("You are an AI assistant, powered by"), "{out}");
+        assert!(!out.contains("assistant AI"), "{out}");
     }
 
     /// tools[].function.description 指纹清洗（CLI harness 将身份句嵌入工具
@@ -1417,10 +1700,10 @@ mod tests {
         let d0 = tools[0]["function"]["description"].as_str().unwrap();
         assert!(d0.contains("You are Codex, built on GPT-5"));
         assert!(d0.contains("official CLI tool for Claude"));
-        assert!(d0.contains("interactive agent running in TraeCode"));
+        assert!(d0.contains("interactive agent that helps the USER"));
         assert!(!d0.contains("based on GPT-5"));
         assert!(!d0.contains("CLI for Claude"));
-        assert!(!d0.contains("agent in TraeCode"));
+        assert!(!d0.contains("TraeCode"));
 
         // 工具 2：无指纹原样保留
         assert_eq!(tools[1]["function"]["description"], json!("Reads a file from disk."));

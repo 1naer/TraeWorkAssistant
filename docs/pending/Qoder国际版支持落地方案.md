@@ -1,9 +1,10 @@
 # Qoder 国际版支持落地方案（Qoder Global / qoder.com 体系）
 
-> - **日期**：2026-10-20（v1.1 增强轮）
+> - **日期**：2026-10-20（v1.2 对齐轮）
 > - **状态**：待评审（pending）
+> - **v1.2 变更说明**（本轮参考 `docs/completed/BuddyAI对齐国内Buddy六页开发计划.md` 的功能对齐逻辑补齐三层框架）：① §3.5.0 新增**能力边界总表**——国内 Qoder 功能逐项 → 国际版处置六类标注（直接可做 / 等效实现 / Intl 特有新增 / 降级等效 / 国际上游不适用 / 后续项），每项带依据，评审一眼看清「做哪些、怎么做、为何不做」；② §6 分阶段实施计划从 4 个基础设施导向粗阶段细化为 **P0-P6 页面推进式**（对齐 BuddyAI 计划「逐步开发、每阶段独立可验收」逻辑：P1 池骨架+账号管理 → P2 签到页 → P3 积分/看板 → P4 网关/API 服务 → P5 设置收尾 → P6 可选后续），每阶段绑定 Gate 前置、独立验收标准，并就地标注「国际不适用」UI 提示项（不静默隐藏）；③ 新增**统一验收口径**（cargo test + tsc + 逐页对照走查 + Gate/回归/安全三条红线）。
 > - **v1.1 变更说明**（本轮按「功能菜单 + API 管理尽量与国内 Qoder 功能一致」要求做对齐增强）：① §3.5 从 7 行粗粒度对照表扩充为 **10 个子节的菜单级逐项对照**（页面/卡片/按钮/弹框/命令/配置键六层全量，含 33 个 Tauri 命令逐一标注复用方式）；② 新增 **§3.6「API 管理详细对照」专章**（QoderApiService 页面逐区块 + 全局 API 管理集成点 + 后端网关改造点 10 项明细）；③ **修正 COSY 双域签名参数**（v1.0 把 openapi 域与 gateway 域两套参数混写为一套，本轮按代码核实：openapi 域 `Cosy-ClientType: "10"` + `Cosy-Version: "0.4.3"`，gateway 域 `Cosy-Clienttype: "5"` + `Cosy-Version: "1.1.38"`）；④ 全部代码锚点修正为 `AIWorkAssistant_main` 实际路径与行号（v1.0 误写 `_feature` 目录）；⑤ 新增关联文档 `docs/completed/开源生态仓库价值分析.md`。
-> - **关联**：`docs/pending/Buddy国际版支持落地方案.md`（独立池范式先例，2026-10-15 Gate 已全清零）/ `docs/completed/Qoder平台支持设计方案.md` v1.4.2（CN 版全量交付底稿，§5.8 页面表 + §5.10 指纹 + §5.11 网关池方案 + §六 R-1~R-13）/ `docs/completed/Qoder外部项目调研归档.md`（国际站实现级情报底稿）/ `docs/completed/开源生态仓库价值分析.md`（合规红线与网关工程参照来源，见附录 B）/ backlog F-80-余（Global 区 2026-10-02 决策留档：账号-区域关系 + COSY Global 域签名两大未决项）
+> - **关联**：`docs/completed/BuddyAI对齐国内Buddy六页开发计划.md`（功能对齐方法论参照：能力边界总表 + 页面推进式阶段计划 + 统一验收口径，v1.2 采纳）/ `docs/completed/Buddy国际版支持落地方案.md`（独立池范式先例，2026-10-15 Gate 已全清零）/ `docs/completed/Qoder平台支持设计方案.md` v1.4.2（CN 版全量交付底稿，§5.8 页面表 + §5.10 指纹 + §5.11 网关池方案 + §六 R-1~R-13）/ `docs/completed/Qoder外部项目调研归档.md`（国际站实现级情报底稿）/ `docs/completed/开源生态仓库价值分析.md`（合规红线与网关工程参照来源，见附录 B）/ backlog F-80-余（Global 区 2026-10-02 决策留档：账号-区域关系 + COSY Global 域签名两大未决项）
 > - **结论先行**：国际版走**独立池 `qoder-global`**，与国内 `qoder` 池账号、凭证、调度、指纹、记账、UI 六面完全隔离；内核（`qoder_common` / `qoder_checkin` / `qoder_credits` / `qoder_sign` / `qoder_upstream` / `qoder_route`）**区域参数化复用，不复制代码**。两个历史未决项均有现成底稿——① 账号-区域关系 → Gate 探测 R-G1；② COSY Global 域签名 → **调研归档 §2.1/2.2/2.7 即 Global 域 COSY 签名链完整底稿**（QoderGateway 全部面向 `.sh` 国际域），仅差现版客户端复核。
 > - **战略动因**：Qoder CN 桌面端官宣 **2027-09-05 停运**（仅剩约 11 个月），国际版是 Qoder 生态长期存续的唯一延续路径；且国际站免费积分稳态 **≈3,000 Credits/月/账号** + **Qwen3.8-Flash 0 系数免费模型**，网关侧多一个国际模型池（与 Trae / wb / buddy-ai / qoder-CN 形成互补）。Buddy 国际版已开「独立池」先例，架构范式已被项目方接受。
 > - **开工硬前置**：§5 Gate 探测清单（R-G1~G9）——一次真实国际账号登录收口阻塞层，**缺口未闭合前对应模块只做骨架不接线**（沿用 F-80「不写无端点的假实现」红线）。
@@ -174,6 +175,38 @@
 
 - **对齐口径**：「功能菜单尽量与国内 Qoder 一致」落在六层——① 页面（五页 + Dashboard 区块 + HelpModal）；② 页面内卡片/区块；③ 按钮（页头/行内/弹框内）；④ 弹框；⑤ Tauri 命令（33 个）；⑥ 配置键（Settings 键名镜像）。以下各节按此口径逐项标注复用方式；**国际版不新增与 CN 不对齐的独立菜单**（除 CLI 解密导入与 CN 停运提示两个 Intl 特有项）。
 - **默认态**：Intl 分区所有「待探测」功能（登录/签到/目录）在 Gate 未闭合前置灰 + 提示文案，**UI 先行分区、能力随 Gate 逐个点亮**（与 Buddy 国际版同款节奏）。
+
+**能力边界总表（国内功能 → 国际版处置）**：
+
+> 对齐 BuddyAI 计划总表逻辑：六类处置标注——**直接可做**（组件/数据源现成）/ **等效实现**（机制同构，端点/参数/目录按区切换）/ **Intl 特有新增**（CN 无对应，合规凭证优势）/ **降级等效**（端形态差异下降级对齐，不做假数据）/ **国际上游不适用**（明确不做 + 依据）/ **后续项**（顺延可选）。逐按钮/弹框/命令明细见 §3.5.1-3.5.10；阶段落位见 §6。
+
+| 国内功能 | 国际版处置 | 依据 |
+|---|---|---|
+| 打开 Qoder 客户端（IDE / Work 双端） | **等效实现（单端收敛）**：Intl 单桌面端，`qoder_open_ide` 复用开 Intl 端；Work 端步骤裁剪并 UI 标注 | §2.3 端形态差异（D-6） |
+| OAuth 设备流登录 | **等效实现**：client_id / 授权页 / poll 域换 Intl 值，命令同构 | 归档 §2.8（R-G2 复核） |
+| CLI 本地登录态导入 | **Intl 特有新增**：`~/.qoder/.auth/` id+user 解密导入（AES-128-CBC）——CN 无此通道，Intl 合规凭证优势 | 归档 §2.4 |
+| 扫描本地账号（IDE 数据目录） | **等效实现**：目录换 `com.qoder.app.<channel>` | R-G9 |
+| PAT 导入 / jobToken 交换 | **等效实现**：端点换 center.qoder.sh + appcode/signature 头 + `?Encode=1` 自定义 base64 | 归档 §2.7（R-G6） |
+| 账号编辑 / 移除 / 分组 / 标签 / 批量 | **直接可做**：命令域同构，表按池分区 | §3.5.2 / §3.5.9 |
+| 导出 / 导入账号（AIWQENC1 加密） | **直接可做**：kind=aiwork-qoder-global-pool + 区域必选校验 + device_profile 绝不覆盖 | 安全红线继承 |
+| 凭证续期（6h ensure_fresh） | **等效实现**：`jrt-` 前缀分派 + token_key 两分支字段名 | 归档 §2.5（R-G7） |
+| 每日签到（0 点 + 10 点双活动） | **等效实现（单活动化）**：Intl 单活动「每日领取 100」，10:15 单窗口调度；KNOWN_DAILY_CAMPAIGNS 盲发链同步裁剪 | 归档 §3.2 + 附录 A（R-G4） |
+| 一键签到表 / NDJSON 进度 / 90 天日历 | **直接可做**：组件复用，读 `qoder_global_checkin_results` | 表结构镜像 |
+| 积分余额 / 快照 / 趋势 / 到期日历 | **等效实现**：quota 端点 Intl 化；CLI `/usage` 解析兜底通道裁剪（双通道足够） | 归档 §2.5（R-G5） |
+| 积分榜 / 统计卡（KPI） | **直接可做**：同构聚合，读 `qoder_global_*` | §3.5.1 |
+| Token 统计 / 会话明细 | **等效实现**：`qoder-global` 记账桶 + 会话域随 R-G3 复核 | 记账分区（§3.6.3-9） |
+| 网关对话（qoder 档） | **等效实现**：`qoder-global` 独立池档位（默认关），上游 api3.qoder.sh | R-G3 硬前置 |
+| API Key / 池健康徽标 / ResourceSummary / UsageStatsPanel | **直接可做**：组件扩档（amber 徽标 / 五池徽标 / 预设行 / 六桶） | §3.6.2 / §3.5.8 |
+| 模型目录 / 倍率 | **等效实现**：目录源 Intl 化；倍率首版静态配置；Qwen3.8-Flash 0 系数标注（前端 override 手法） | R-G8 |
+| 切换登录态 / 快照管理（Work + IDE 双目标） | **降级等效（单目标）**：Intl 单桌面端，快照单目标 `profiles_qoder_global`，90s 看门狗逻辑原样复用 | §2.3（D-6） |
+| 环境重置（8 项清单） | **等效实现**：清单按 Intl 目录族重排，项数实测后定 | R-G9 |
+| CLI 桥状态（`qoder_cli_status`） | **等效实现**：探测目录换 `~/.qoder/.auth/` | §3.5.10-3 |
+| 调度策略中心（`qoder_strategy`） | **等效实现**：Intl 无独立策略键（跟随统一策略），仅档位可选 | §3.6.1 |
+| 会话压缩（`qoder_sessions_compact_*`） | **直接可做**：任务镜像 `qoder-global-sessions-compact` | §3.5.4 |
+| 14 天 Pro 试用 300 Credits 自动化 | **国际上游不适用（红线）**：多建试用账户直接冻结（虚拟机亦不支持），明确不做 | 官方明文（附录 A） |
+| 注册 / 验证码绕过 / 批量开户 | **国际上游不适用（红线）**：仅面向存量个人账号 | 官方明文 |
+| CN / Intl Credits 互通换算 | **国际上游不适用**：账号体系独立、定价不等价 | 附录 A |
+| macOS 端实施 | **后续项**：跟随 CN 池 macOS 排期（CN 方案 M5） | §5.9 平台兼容 |
 
 #### 3.5.1 Overview（概览页）
 
@@ -469,20 +502,76 @@ CN 现状（[QoderApiService.tsx](file:///d:/code/AIWorkAssistant_main/src/pages
 | R-G8 | **模型目录与倍率**：Intl model/list 端点与响应、倍率表、Qwen3.8-Flash 0 系数在目录中的表达 | MITM 复用 | catalog 区域化 + 帮助页倍率列 + §3.5.10-4 |
 | R-G9 | **风控与指纹**：设备指纹校验强度现版复核（machinetoken 随机可过?）、本地指纹覆写文件清单、sash 对非桌面渠道 claim 的风控表现 | 归档 §2.3/§6.2 底稿 + 观察 | §4.4 指纹区域实现 + §3.5.2 D-6 + §3.5.10-6 + 风险对策更新 |
 
-> **分层**：R-G2~G5 为**阻塞层**（池骨架与运营面动工前置）；R-G1/G6~G9 可随对应阶段顺延；R-G3 是网关转发阶段硬前置（沿 R-13「缺口未闭合不写上游转发层」红线）。
+> **分层**：R-G2~G5 为**阻塞层**（P0 收口，P1 池骨架与运营面动工前置）；R-G1/G6~G9 可随对应阶段顺延（R-G6/R-G9 → P1/P5，R-G4/R-G5 → P2/P3）；R-G3 是 P4 网关转发硬前置（沿 R-13「缺口未闭合不写上游转发层」红线）。
 
 ---
 
-## 🚀 6. 分阶段实施计划
+## 🚀 6. 分阶段实施计划（P0-P6 页面推进式）
 
-| 阶段 | 内容 | 前置 | 验收标准 |
-|---|---|---|---|
-| **0 侦察** | Gate 阻塞层（R-G2~G5）一次真实国际账号登录收口；R-G1 结论；端点矩阵回填；`QoderRegionEndpoints` 结构体落地（仅常量不接线，域 × 参数二维） | — | 阻塞层全部有结论；探测零脏数据入生产 KV（凭证在 Temp、已清理落盘） |
-| **1 池骨架** | `qoder-global` 池注册（四表 schema v4 + token store 命名空间 + 池锁）、Intl 导入通道（PAT / 设备流 / CLI 解密导入，探测未全过的置灰）、账号 id `qdg-` 前缀、健康徽标扩展、healthz 纳入 selectable | 阶段 0（R-G2） | `cargo test` 全绿（含 schema v3→v4 迁移用例）；Intl 导入幂等入池；CN 池回归零变化 |
-| **2 网关转发** | `QoderRegionEndpoints` 全量接线（common/checkin/credits/oauth 域切换）、`qoder_sign` Global 分支、`qoder_upstream` Global 分流、`qoder_route` 按池路由（守卫按池放行 + override 顺序保持）、dispatch `qoder-global` 档、`UsageBucket::QoderGlobal`、模型目录 Intl 化 + 倍率静态配置 | 阶段 0（R-G3/R-G8） | Global 池流式对话连通 `api3.qoder.sh`；CN 池行为逐字不变（对比迁移前后 app_log 关键行）；`record_usage` 记账落 `qoder-global` bucket；`tsc` 无错误 |
-| **3 运营面** | `qoder-global-checkin` 每日领取自动化（10:15 调度 + 启动补签 + 6h refresh 兜底）、积分同步 Intl 化 + 快照、前端五页区域分区收尾（§3.5 十子节逐项点亮）、Dashboard/HelpModal Intl 分区 | 阶段 2（R-G4/R-G5） | 每日领取全链路自动到账（幂等重跑无副作用、错过窗口显式提示）；积分余额/到期与官网 Settings > Usage 一致；国内侧回归：CN 签到/积分/对话全链路行为不变 |
+> 对齐 `BuddyAI对齐国内Buddy六页开发计划.md` 的推进逻辑：**按功能域/页面逐步开发，每阶段独立可验收**。与 Buddy 计划（上游能力已实测、纯开发计划）的差异是本方案多一层 **Gate 前置**——R-G 未闭合的对应能力只做骨架不接线，UI 先行分区置灰、能力随 Gate 逐个点亮。每阶段改动清单**就地标注「国际不适用」UI 提示项**（对齐 Buddy 计划做法，不静默隐藏）；能力边界逐项依据见 §3.5.0 总表。
+
+### P0 侦察收口（Gate 阻塞层，一切开发的前置）
+
+- R-G2~G5 一次真实国际账号登录收口（设备流登录 → 抓 campaigns → 抓 quota → 抓 chat MITM，同 Buddy 方案「一次登录收口」手法）；R-G1 结论；产物落 `docs/completed/f80-qoder-global-recon/` 回填 §3.3 端点矩阵
+- `QoderRegionEndpoints` 结构体落地（仅常量不接线，域 × 参数二维；CN 实例值与现状逐字一致，独立 commit 便于单独 revert）
+- **验收**：阻塞层全部有结论；探测零脏数据入生产 KV（凭证在 Temp、已清理落盘）；CN 回归零变化
+
+### P1 池骨架 + 账号管理对齐（Accounts 页，功能最重页先行）
+
+- 后端：`qoder_global_*` 四表（schema v3→v4 + 版本号置位 + 备份）、token store 命名空间 `qoder_global_tokens`、池锁、账号 id `qdg-` 前缀；命令域 region 分流入口统一（accounts / data_io / groups / ide_store / env_reset / cli_status 第一批，其余随 P2-P5 接入）
+- 导入三通道：设备流（R-G2）/ PAT（center.qoder.sh，R-G6）/ **CLI 登录态解密导入**（Intl 特有第 10 弹框，`~/.qoder/.auth/`）；探测未全过的入口置灰 + 提示
+- 前端：Accounts 页区域 Tab；页头 11 按钮 + 9 列账号表（区域徽标 Global 紫 + CLI 桥状态列）+ 行内 5 操作 + 弹框群（OAuth 进度 poll 域换 Intl、PAT 预检文案补 Intl 前缀、环境重置清单 Intl 重排）；healthz 纳入 qoder-global selectable；PoolHealthBadges 扩五池
+- **UI 标注项**：行内切换菜单收敛单项、快照单目标 `profiles_qoder_global`（Intl 单桌面端，D-6）；`qoder_open_work` 标注「国际不适用」
+- **前置**：P0（R-G2 必须；R-G6 / CLI 解密未过则对应入口置灰）
+- **验收**：`cargo test` 全绿（含 v3→v4 迁移用例）；Intl 导入幂等入池；区域必选校验拒绝跨区凭证；CN 池回归零变化
+
+### P2 签到页对齐（每日领取 100 Credits 自动化）
+
+- 后端：`qoder-global-checkin` 任务（10:15 单窗口 + gap 0-600s + 启动补签 + schtasks `AIWorkAssistant_QoderGlobalCheckin`）；campaigns → CLAIMABLE 过滤 → claim 幂等（`replayed==true` 视为 already）→ 失败复查恢复（CN 已落地直接继承）；结果落 `qoder_global_checkin_results`（90 天滚动）；`qoder-global-refresh` 6h 兜底任务
+- 前端：Checkin 页 Intl 区——**单活动说明卡**（10:00→次日 10:00 窗口、桌面端渠道、30 天有效、错过不补）+ 一键领取表（账号/状态/领取结果/获取积分/可用积分）+ NDJSON 实时进度 + 90 天日历（月历翻页）+ 调度入口卡
+- **UI 标注项**：CN「0 点签到」活动卡无对应——单活动化重写（骨架复用）；KNOWN_DAILY_CAMPAIGNS 盲发链裁剪为单活动形态
+- **前置**：P1 + R-G4（缺 `Cosy-ClientType` 头返回空列表的坑：empty_campaigns 显式区分「无活动」vs「头缺失」）
+- **验收**：全链路自动到账（幂等重跑无副作用）；错过窗口显式提示；`qoder_global_checkin_results` 出数
+
+### P3 积分与概述 / 看板对齐（Overview + Dashboard）
+
+- 后端：quota Intl 化（R-G5；双通道 Bearer + client_token，CLI `/usage` 解析兜底通道裁剪）；`qoder-global-credits-snapshot`（23:40，三键同拨口径继承）+ `qoder_global_credits_history`；source 枚举 `plan | addon_daily` 对齐；会话压缩任务镜像 `qoder-global-sessions-compact`
+- 前端：Overview Intl 区——5 StatCard + 近 30 天领取柱图 + 积分榜 Top10 + 配置导航（Intl 步骤收敛：装客户端 → 导入账号 → 开调度）+ **CN 停运倒计时特有卡**；Dashboard qoder 区 4 TABs Intl 分区（积分统计 / Token 统计 / 积分到期 / 会话明细）+ `qoderGlobalGatewayReady` 守卫；UsageStatsPanel 扩六桶
+- **前置**：P1 + R-G5
+- **验收**：余额 / 到期与官网 Settings > Usage 一致；快照 / 趋势图出数；逐包明细 30 天有效口径正确；国内侧 CN 签到/积分行为不变
+
+### P4 网关转发 + API 服务页对齐（QoderApiService）
+
+- 后端：§3.6.3 十项全量（签名 Global 分支域 × 参数二维 / `qoder_route` 双池按池路由 / 守卫按池放行 + `apply_flash_free_override` 顺序红线 / dispatch `qoder-global` 档默认关 / 冷却独立实例 / 粘性 `qg:` 前缀 / `UsageBucket::QoderGlobal` / 对话管线护栏全量继承）
+- 模型目录 Intl 化（R-G8；CatalogState global 槽）+ 倍率首版静态配置（官网实际值人工修正）+ Qwen3.8-Flash 0 系数（前端 checkbox override 手法）
+- 前端：QoderApiService Intl 区——积分横幅 + 池指标 3 卡（`qoder_global_pool_status` 3s 轮询）+ 账号池选择（分组/标签过滤 D5 交集）+ 6 参数键（`qoderGlobalEnabled` 默认关等）+ 模型目录表 + **地区说明卡文案反转**；API 使用帮助倍率列 +qoder-global 档（最小倍率口径扩展）；ApiManagerModal 档位下拉 +QoderGlobal；API Key `bind_pool='qoder-global'` amber 徽标；ResourceSummary +qoder-global 预设行
+- **前置**：P1 + R-G3/R-G8（**R-G3 未闭合不写上游转发层——红线**）
+- **验收**：Global 池流式对话连通 `api3.qoder.sh`；`record_usage` 落 `qoder-global` bucket；CN 池行为逐字不变（对比迁移前后 app_log 关键行）；`tsc` 无错误
+
+### P5 设置页 + 环境配置收尾（Settings / HelpModal）
+
+- Settings Intl 键镜像（§3.5.4 全表：`qoder_global_ide_path` / `auto_checkin` / `checkin_hhmm` / `gap_secs` / `token_renew_enabled` / credits_sync 四模式 / `sessions_compact_*`）；时刻类键零值回填（对齐 `qoder_checkin_hhmm` 教训）
+- env_reset_items 按 Intl 目录族重排（R-G9 实测后定清单）；任务配置卡（每日领取 + 积分快照 + 6h token renew）
+- 合规提示文案重写（**「多建试用账户将冻结」红线 + 仅本机自用声明**）；HelpModal Intl 分区（套餐体系 / 领取规则 / Qwen 0 系数 / CN/Intl 不互通声明 / 试用冻结红线 / CLI 解密导入教程）
+- CLI 桥状态探测换 `~/.qoder/.auth/`；`qoder_open_ide` 复用开 Intl 桌面端 + 打开数据目录
+- **UI 标注项**：`qoderwork_path` 配置裁剪收敛单路径；调度策略中心 Intl 无独立策略键（跟随统一策略，仅档位可选）——均就地标注
+- **前置**：P1 + R-G9
+- **验收**：设置页逐键可读写；环境重置清单与实际目录族一致；HelpModal 内容完整；逐页与国内对照走查通过
+
+### P6（可选后续）
+
+- 会话明细 Intl 会话域复核（随 R-G3 顺延）
+- CDP/UI 自动化兜底评估（仅当 R-G4 纯 HTTP claim 被渠道风控拦截；先评估成本再定，不阻塞 P1-P5）
+- macOS 端实施（跟随 CN 池 M5 排期）；F-71 Trae SG 复用评估（共享 `QoderRegionEndpoints` + 独立池骨架方法论，决策点 5）
 
 **回滚设计**：池骨架 schema 版本号置位 + 备份；dispatch `qoder-global` 档默认关；CN 侧唯一改动（端点结构体化等价重构）独立 commit 可单独 revert。
+
+**验收口径（全阶段统一）**：
+
+- 每阶段：`cargo test` 全绿 + `tsc --noEmit` 零错误 + 逐页与国内对照走查（结构/交互一比一，数据源差异按 §3.5.0 能力边界总表标注，不做假数据）
+- **Gate 红线**：探测缺口未闭合对应能力不接线（不写无端点的假实现），UI 置灰 + 「待上游验证」提示文案
+- **回归红线**：CN 池行为逐字不变（含 app_log 关键行对比），其余全部「新增而非修改」
+- **安全红线**：凭证不明文出后端（导出 AIWQENC1 加密、CLI 解密导入即入 vault）；device_profile 仅本地为空才补入、绝不覆盖；删除类操作二次确认；写操作有 toast 反馈
 
 ---
 
@@ -506,8 +595,8 @@ CN 现状（[QoderApiService.tsx](file:///d:/code/AIWorkAssistant_main/src/pages
 1. **池 id 命名**：§3.4 推荐 `qoder-global`（对齐 buddy-ai 命名法）；备选 `qoder-intl`。
 2. **前端分区形态**：五页顶部区域 Tab（Buddy 同款）vs 独立 Tab（`QoderGlobal` 与 qoder 平级）——推荐前者（账号/签到/积分九成组件可共用，改动面最小）。
 3. **存储方案**：`qoder_global_*` 四独立表（schema v3→v4，对齐 CN 四表先例）vs 现表加 pool 维度列——推荐前者（与 buddy-ai 独立存储取向一致、迁移回滚干净），若 store 现状更宜分库则从其约定。
-4. **R-G4 若纯 HTTP claim 被渠道风控拦截**：CDP/UI 自动化兜底是否立项（建议：先评估成本再定，不阻塞阶段 1/2）。
-5. **是否同步立项 F-71（Trae SG）**：`QoderRegionEndpoints` + 独立池骨架可被 F-71 复用，若同期立项可共享阶段 0 方法论。
+4. **R-G4 若纯 HTTP claim 被渠道风控拦截**：CDP/UI 自动化兜底是否立项（建议：先评估成本再定，不阻塞 P1-P5）。
+5. **是否同步立项 F-71（Trae SG）**：`QoderRegionEndpoints` + 独立池骨架可被 F-71 复用，若同期立项可共享 P0 方法论。
 6. **Intl 快照/切换/Work 端目标形态（D-6，随 R-G9 闭合）**：Intl 单桌面端下，快照目标（单 `profiles_qoder_global`）、行内切换（单菜单项）、`qoder_open_work` 裁剪或隐藏——§3.5.2 已按「单目标 + 裁剪」预填，评审确认。
 
 ---
@@ -553,7 +642,7 @@ CN 现状（[QoderApiService.tsx](file:///d:/code/AIWorkAssistant_main/src/pages
 | §2.7 | jobToken 交换（center.qoder.sh、appcode/signature、`?Encode=1` 自定义 base64） | §4.1 PAT 通道（R-G6）；§6.1 移植要点为 Rust 翻译对照表 |
 | §2.8 | Device Flow 注册机（client_id、授权页、poll 时序、token 响应字段） | §4.1 设备流登录（R-G2 复核） |
 | §3.1/3.2 | CN 签到直连互证 + campaigns 契约（Intl v0.8.18 统一、CLAIMABLE 唯一权威、claim 失败复查恢复） | §4.3 签到实现（R-G4）；复查恢复逻辑已在 CN 池落地直接继承 |
-| §6.1/6.2 | Rust 移植要点表 + 需实测验证点清单 | 阶段 0/2 实现对照表；§6.2 五点并入 Gate 清单 |
+| §6.1/6.2 | Rust 移植要点表 + 需实测验证点清单 | P0/P4 实现对照表；§6.2 五点并入 Gate 清单 |
 | §7/§8 | 风险清单（条款灰色/旧端点陷阱/域差） | §7 风险对策来源 |
 
 **B.2 → `docs/completed/开源生态仓库价值分析.md`**（v1.1 新增）：
@@ -563,12 +652,12 @@ CN 现状（[QoderApiService.tsx](file:///d:/code/AIWorkAssistant_main/src/pages
 | §6 合规备注 | 自动化访问/凭证使用的合规边界口径 | §1.3 合规红线 + §7 风险 3（仅本机自用、不商用、不分发凭证） |
 | §1 发现 1（workbuddy-cliproxy） | 上游协议避坑情报方法论（code 语义、审核拦截、最小改写） | §3.6.3-10 错误码族护栏设计方法论参照（Intl 错误码 R-G3 抓包复核） |
 | §1 发现 2（antigravity-tools） | 会话粘性指纹、P2C 负载均衡、账号状态机、分级重试工程参照 | §3.6.3-7/8 粘性与冷却独立实例的工程实现参照 |
-| §3.1 Trae 生态高价值项 | 同类包装器协议情报提取手法 | 阶段 0 MITM SOP 复用（复用 device_proxy 探测链） |
+| §3.1 Trae 生态高价值项 | 同类包装器协议情报提取手法 | P0 MITM SOP 复用（复用 device_proxy 探测链） |
 
 ### 🅲 附录 C：参考来源
 
 **官方**：docs.qoder.com（pricing / Credits / events/100credits / events/flashoffer / FAQ）；qoder.com 门户。
 
-**内部**：`docs/completed/Qoder平台支持设计方案.md`（CN 全量底稿 + §5.8 页面表 + §5.10 指纹 + §5.11 网关池方案 + §六 R-1~R-13）；`docs/completed/Qoder外部项目调研归档.md`；`docs/completed/开源生态仓库价值分析.md`；`docs/pending/Buddy国际版支持落地方案.md`（独立池范式与 Gate 方法论）；`docs/backlog.md` F-80-余（Global 区决策留档）。
+**内部**：`docs/completed/Qoder平台支持设计方案.md`（CN 全量底稿 + §5.8 页面表 + §5.10 指纹 + §5.11 网关池方案 + §六 R-1~R-13）；`docs/completed/Qoder外部项目调研归档.md`；`docs/completed/开源生态仓库价值分析.md`；`docs/completed/Buddy国际版支持落地方案.md`（独立池范式与 Gate 方法论）；`docs/backlog.md` F-80-余（Global 区决策留档）。
 
 **代码锚点**（`AIWorkAssistant_main`）：`src-tauri/src/tasks/qoder_{common,checkin,credits,sign,upstream,catalog,refresh}.rs`；`src-tauri/src/api_server/qoder_route.rs`；`src-tauri/src/commands/qoder/{oauth,accounts,credits,checkin,ide_store,data_io,env_reset,cli_status,common,groups,sessions}.rs`（33 命令，§3.5.9 全量清单）；`src/pages/qoder/*.tsx`（五页 + HelpModal）。

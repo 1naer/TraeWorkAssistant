@@ -2218,9 +2218,14 @@ mod tests {
         assert!(msg.contains("bind=trae"), "{msg}");
         assert!(msg.contains("whitelist=1"), "{msg}");
         assert!(msg.contains("healthy_in_scope=0"), "{msg}");
+        // issue #130 指引：约束排除全部健康账号（池内尚有 1 个）→ 显式 hint
+        assert!(msg.contains("hint=约束排除了池内全部健康账号"), "{msg}");
+        assert!(msg.contains("池内尚有 1 个"), "{msg}");
 
         let msg2 = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k2");
         assert!(msg2.contains("healthy_in_scope=1"), "{msg2}");
+        // 作用域内有健康账号 → 不追加 hint（避免噪音）
+        assert!(!msg2.contains("hint="), "{msg2}");
     }
 
     /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、
