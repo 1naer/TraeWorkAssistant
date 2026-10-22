@@ -887,17 +887,15 @@ pub async fn chat_completions(
                 }
             }
             TargetPool::Custom => {
-                // 自定义模型直达（custom_models 命中即 Custom，§dispatch ⓪）；
-                // 条目可能热更新，执行时重读，缺失（已被删）按 404 语义报错
-                match super::custom_models::find_enabled(&state.data_dir, &model) {
-                    Some(cm) => {
-                        if stream {
-                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::OpenAi, key_str, guard)
-                        } else {
-                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::OpenAi, key_str, guard).await
-                        }
-                    }
-                    None => openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),
+                // 自定义上游组执行（P2）：同名多条 = 上游组，组内加权轮询+轮换；
+                // 条目可能热更新，执行时重读全量 enabled 组，缺失（已被删）按 404 报错
+                let group = super::custom_models::find_enabled_all(&state.data_dir, &model);
+                if group.is_empty() {
+                    openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model))
+                } else if stream {
+                    custom_route::custom_stream_chat(state_clone, body_vec, r.model, group, start_ts, Protocol::OpenAi, key_str, guard)
+                } else {
+                    custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, group, stream, start_ts, Protocol::OpenAi, key_str, guard).await
                 }
             }
         },
@@ -1273,15 +1271,14 @@ pub async fn messages(
                 }
             }
             TargetPool::Custom => {
-                match super::custom_models::find_enabled(&state.data_dir, &model) {
-                    Some(cm) => {
-                        if stream {
-                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::Anthropic, key_str, guard)
-                        } else {
-                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::Anthropic, key_str, guard).await
-                        }
-                    }
-                    None => anthropic_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),
+                // 自定义上游组执行（P2）：同名多条 = 上游组（注释同 /v1/chat/completions 分支）
+                let group = super::custom_models::find_enabled_all(&state.data_dir, &model);
+                if group.is_empty() {
+                    anthropic_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model))
+                } else if stream {
+                    custom_route::custom_stream_chat(state_clone, body_vec, r.model, group, start_ts, Protocol::Anthropic, key_str, guard)
+                } else {
+                    custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, group, stream, start_ts, Protocol::Anthropic, key_str, guard).await
                 }
             }
         },
@@ -1413,15 +1410,14 @@ pub async fn completions(
                 }
             }
             TargetPool::Custom => {
-                match super::custom_models::find_enabled(&state.data_dir, &model) {
-                    Some(cm) => {
-                        if stream {
-                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::OpenAiText, key_str, guard)
-                        } else {
-                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::OpenAiText, key_str, guard).await
-                        }
-                    }
-                    None => openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),
+                // 自定义上游组执行（P2）：同名多条 = 上游组（注释同 /v1/chat/completions 分支）
+                let group = super::custom_models::find_enabled_all(&state.data_dir, &model);
+                if group.is_empty() {
+                    openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model))
+                } else if stream {
+                    custom_route::custom_stream_chat(state_clone, body_vec, r.model, group, start_ts, Protocol::OpenAiText, key_str, guard)
+                } else {
+                    custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, group, stream, start_ts, Protocol::OpenAiText, key_str, guard).await
                 }
             }
         },
@@ -3330,6 +3326,8 @@ mod tests {
             buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+            custom_upstream_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         WlFixture { dir, state }
     }

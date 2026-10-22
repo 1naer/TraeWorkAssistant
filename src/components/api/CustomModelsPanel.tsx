@@ -75,11 +75,20 @@ export default function CustomModelsPanel({
   const [rateText, setRateText] = useState('');
   // 同名上游组折叠态（默认展开；键 = canonical 名称）
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // 熔断状态快照（P3 可观测）：cm.id → 剩余冷却秒
+  const [circuits, setCircuits] = useState<Map<string, number>>(new Map());
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       setModels(await api.apiServer.customModelsList());
+      // 熔断快照并行刷新（失败静默——仅可观测徽标，不阻塞列表）
+      try {
+        const snap = await api.apiServer.customLbStatus();
+        setCircuits(new Map(snap.map((s) => [s.id, s.cooling_secs])));
+      } catch {
+        setCircuits(new Map());
+      }
     } catch {
       /* 保留空列表 */
     } finally {
@@ -284,7 +293,14 @@ export default function CustomModelsPanel({
         {m.rate === 0 ? <Badge tone="green">免费</Badge> : `×${m.rate.toFixed(2)}`}
       </td>
       <td className="py-2 pr-4">
-        {m.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
+        <div className="flex items-center gap-1">
+          {m.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
+          {circuits.get(m.id) != null && (
+            <Badge tone="amber" title="上游连续失败进入渐进冷却（成功即恢复），冷却期内组内选路自动跳过">
+              熔断中 {circuits.get(m.id)}s
+            </Badge>
+          )}
+        </div>
       </td>
       <td className="py-2">
         <div className="flex items-center gap-1">

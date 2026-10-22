@@ -2,6 +2,7 @@ pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod config_cache;
+pub mod custom_lb;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
@@ -181,6 +182,13 @@ pub struct ApiSharedState {
     /// 物理同源，改配置未重启时不再出现「配置值 vs 实际监听值」分离导致的
     /// fail-open 误判（配置改非环回但服务仍绑环回时按实际值豁免，反之按实际值走鉴权）
     pub listen_host: std::sync::Mutex<String>,
+    /// custom 上游组会话粘上游（P2）：session_key → (cm.id, 过期 Instant)，
+    /// TTL 60s，内存态不落盘（与池粘性同口径；custom_lb 模块消费）
+    pub custom_upstream_sticky:
+        Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    /// custom 上游组加权轮询计数（P2）：canonical 模型名 → 组内共享计数器——
+    /// 按模型分组各计各的，避免单全局计数器跨组交替破坏组内分布
+    pub custom_lb_counters: Mutex<std::collections::HashMap<String, std::sync::atomic::AtomicUsize>>,
 }
 
 impl ApiSharedState {
@@ -869,6 +877,8 @@ mod inflight_tests {
             buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+            custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         };
         {
             let _g = state.inflight_guard();

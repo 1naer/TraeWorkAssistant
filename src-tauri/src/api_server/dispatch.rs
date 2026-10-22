@@ -825,8 +825,9 @@ pub fn resolve_target(
 }
 
 /// 会话池粘性键（§4.4：复用现有粘性会话键，conversation 维度）。
-/// 空指纹（无 messages / 无 conversation_id）不可粘 → None
-fn pool_session_key(body: &Value) -> Option<String> {
+/// 空指纹（无 messages / 无 conversation_id）不可粘 → None。
+/// pub：custom 上游组会话粘上游（custom_lb）复用同款会话键口径
+pub fn pool_session_key(body: &Value) -> Option<String> {
     let key = super::wb_sticky::SessionKey::from_body(body).cache_key();
     // 空指纹的 cache_key 为 "fp:"（无内容后缀）→ 不可粘
     (!key.is_empty() && !key.ends_with(':')).then_some(key)
@@ -1193,6 +1194,8 @@ mod tests {
             buddy_ai_sticky_enabled: AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+            custom_upstream_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Fixture { dir, state }
     }
