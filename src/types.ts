@@ -480,6 +480,11 @@ export interface Settings {
   /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
   app_icons: Partial<Record<AppKey, string>>;
   /**
+   * 侧边栏应用显示顺序（AppKey 列表，应用显示面板拖拽排序写入；空/缺省 = 内置默认顺序）。
+   * 未提及的应用由 getOrderedApps 按默认顺序补在末尾——新版本新增应用对老配置天然兼容
+   */
+  app_order: AppKey[];
+  /**
    * BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）。
    * 独立于 hidden_apps：存量配置 hidden_apps 已持久化为 []，借道隐藏列表无法
    * 区分「默认隐藏」与「用户显式取消隐藏」，故用 opt-in 字段；

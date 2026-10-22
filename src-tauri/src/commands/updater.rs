@@ -13,9 +13,11 @@
 //                      SHA256 比对（不匹配即删除并报错），通过后落 .sha256 sidecar；
 //                      ③ update_run_installer 安装前校验「文件名与资产名绑定 + SHA256 复验」。
 //                      返回文件路径由前端确认后再安装；
-//   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
+//   update_run_installer 经 cmd /c start 中转以 /P /UPDATE /R 启动 NSIS 安装器（issue #135）：
 //                      /P 被动模式（仅显示进度条）+ /UPDATE 跳过卸载直接覆盖 + /R 安装完成后自动重启应用
-//                      （自定义模板 build-assets/installer.nsi 支持上述标志），随后应用退出。
+//                      （自定义模板 build-assets/installer.nsi 支持上述标志）；中转启动令安装器在应用
+//                      退出前即脱离本应用进程树，避免安装器 PREINSTALL 的 taskkill 树杀误伤自身，
+//                      随后应用退出。
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -698,11 +700,39 @@ pub fn update_run_installer(
         );
     }
 
-    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
-    std::process::Command::new(path)
-        .args(["/P", "/UPDATE", "/R"])
-        .spawn()
-        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用。
+    // Windows 经 `cmd /c start` 中转启动（issue #135）：cmd 启动安装器后立即退出，
+    // 安装器随即脱离本应用的进程树——安装器 PREINSTALL 钩子会 taskkill 本产品主程序，
+    // 若安装器仍是本应用的子进程，树杀（/T）会连同安装器一起强杀，安装中途静默中断
+    // 导致升级失败；脱树后 taskkill 只命中应用自身。CREATE_NO_WINDOW 防止 cmd 控制台
+    // 窗口闪现（安装包路径与存在性已在上方校验，start 找不到文件的场景已排除）。
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // .status() 等待 cmd 自身退出（cmd 启动 start 后立即退出，毫秒级，不阻塞脱树）：
+        // spawn 成功只代表 cmd 进程创建成功，start 的 ShellExecute 失败（如杀软拦截、
+        // 文件关联损坏）时 cmd 返回非零——校验退出码可在此报错提示手动运行安装包，
+        // 而不是照常 emit+exit 静默失败（issue #135 加固）
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", "", file_path.as_str(), "/P", "/UPDATE", "/R"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+        if !status.success() {
+            return Err(format!(
+                "启动安装程序失败（退出码 {}），可手动运行：{file_path}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new(path)
+            .args(["/P", "/UPDATE", "/R"])
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+    }
 
     // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
     // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
