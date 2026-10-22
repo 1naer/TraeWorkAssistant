@@ -427,7 +427,8 @@ pub async fn custom_aggregate_chat(
         loop {
             let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical)
             else {
-                // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）
+                // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）；
+                // [DEBUG] 排障行由 loop 后收尾统一落（此处 break 即达，不重复）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 503, "custom",

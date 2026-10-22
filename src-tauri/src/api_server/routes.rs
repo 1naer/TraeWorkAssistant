@@ -395,7 +395,8 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
         TargetPool::Buddy => &state.wb_pool,
         TargetPool::BuddyAi => &state.buddy_ai_pool,
         TargetPool::Qoder => &state.qoder_pool,
-        // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
+        // custom 池无账号列表，无 healthier 账号枚举——直接按错误矩阵基准文案返回
+        // （v3：组内全熔断 → NoHealthy(Custom) 走此处；前缀锁池即 503 单池语义）
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
     let (healthy_total, _) = pool_ref.selectable_stats_in(None, false);

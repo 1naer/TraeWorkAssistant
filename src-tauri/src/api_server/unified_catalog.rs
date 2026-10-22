@@ -665,6 +665,7 @@ pub fn unified_models_ex(
                 if m.enabled {
                     if !g.enabled {
                         // 首条为 disabled：整组展示值改由首个 enabled 条目接手
+                        // （rate 此前为 None 占位，直接赋值即脱离 disabled 污染）
                         g.enabled = true;
                         g.vendor = m.vendor.clone();
                         g.img = m.supports_image;
@@ -680,7 +681,10 @@ pub fn unified_models_ex(
                     canonical,
                     CustomGroupAgg {
                         name: m.name.clone(),
-                        rate: Some(m.rate),
+                        // 倍率只统计 enabled 条目（disabled 条目 0=免费 会污染组内
+                        // 最小倍率，展示「免费」而实际服务条目有价）——disabled
+                        // 首条以 None 占位，首个 enabled 条目接手时直接赋值
+                        rate: if m.enabled { Some(m.rate) } else { None },
                         enabled: m.enabled,
                         vendor: m.vendor.clone(),
                         img: m.supports_image,
@@ -1483,7 +1487,8 @@ mod tests {
                     cm("cm-a", "https://a.example.com", 0.05, true),
                     cm("cm-b", "https://b.example.com", 0.01, true),
                     // 完全第三条：disabled —— find_enabled_all 已过滤，聚合不含其倍率
-                    cm("cm-c", "https://c.example.com", 99.0, false),
+                    // 完全第三条：disabled 且 rate=0（免费）——不得污染组内最小倍率
+                    cm("cm-c", "https://c.example.com", 0.0, false),
                 ],
                 updated_at: 0,
             },
@@ -1496,7 +1501,7 @@ mod tests {
         let m = hits[0];
         let custom_sources: Vec<_> = m.sources.iter().filter(|s| s.pool == "custom").collect();
         assert_eq!(custom_sources.len(), 1, "单 custom 源标记（非多条）");
-        assert_eq!(custom_sources[0].rate, Some(0.01), "倍率取组内 enabled 最小");
+        assert_eq!(custom_sources[0].rate, Some(0.01), "倍率取组内 enabled 最小（disabled 免费(0) 条目不污染）");
         assert!(custom_sources[0].enabled, "任一条 enabled 即整体可命中");
         assert_eq!(m.rate, Some(0.01), "顶层展示倍率随聚合倍率");
     }

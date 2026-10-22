@@ -1,12 +1,13 @@
-//! 自定义模型资源池（OpenAI 兼容上游直通）
+//! 自定义模型资源池（OpenAI 兼容上游组）
 //!
 //! `data/custom_models.json`：用户以列表方式维护的自定义模型——
 //! 名称（请求模型名，路由键）、OpenAI 兼容 API 地址、API Key 及模型其他字段
-//! （上下文长度 / 最大输出 / 图片支持 / 倍率 / 备注 / 启用开关）。
+//! （上下文长度 / 最大输出 / 图片支持 / 倍率 / 负载权重 / 备胎 / 备注 / 启用开关）。
 //!
-//! 调度语义（dispatch.rs ⓪ 段）：请求模型名 canonical 命中 enabled 条目 →
-//! 直达自定义上游（用户显式配置优先于内置目录），单源无跨池回退；
-//! 未命中或 enabled=false → 回落 Trae/Buddy 统一调度管线。
+//! 调度语义（v3，dispatch.rs）：同名多条 = 上游组（custom_lb 组内加权轮询 +
+//! 主备 failover + 熔断切换）；作为第五资源池参与统一调度（默认候选序尾部兜底），
+//! `custom/模型名` 前缀锁池直达、Key 绑定 "custom" 与 per_model 写 "custom" 生效；
+//! 纯 custom 模型（无同名内置源）为唯一源直达。
 //!
 //! 协议约定：上游为 OpenAI 兼容 chat completions（`{base}/v1/chat/completions`，
 //! base 以 `/v1` 结尾时直接拼 `/chat/completions`），Bearer 鉴权。
