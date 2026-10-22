@@ -291,6 +291,18 @@ pub struct UnifiedSource {
     pub enabled: bool,
 }
 
+/// 自定义模型上游组的目录聚合中间态（P1：同 canonical 多条合并为单行）——
+/// rate 取组内最小、vendor/img/ctx/mt 取首个 enabled 条目、enabled = 组内任一 enabled
+struct CustomGroupAgg {
+    name: String,
+    rate: Option<f64>,
+    enabled: bool,
+    vendor: String,
+    img: bool,
+    ctx: Option<u64>,
+    mt: Option<u64>,
+}
+
 /// 统一目录条目（api_unified_models 命令 / GET /v1/models 共用）
 #[derive(Debug, Clone, Serialize)]
 pub struct UnifiedModel {
@@ -633,41 +645,79 @@ pub fn unified_models_ex(
         }
     }
 
-    // 源3：自定义模型（custom_models.json，对外标识 custom）——命中即直达的
-    // 第三资源来源；同 canonical 与内置目录合并时仅追加来源标记（调度短路 custom）
+    // 源3：自定义模型（custom_models.json，对外标识 custom）——P1 同名多条 = 上游组：
+    // 同 canonical 多条必须聚合为单行单源标记（否则 /v1/models 出现重复模型名）。
+    // 倍率取组内最小（展示口径与 Smart 调度「倍率小者优先」一致）；vendor /
+    // supports_image / context / max_tokens 取首条 enabled 条目；组内任一条
+    // enabled 即整体可命中（find_enabled_all 已按 enabled 过滤，天然一致）
+    let mut custom_groups: Vec<(String, CustomGroupAgg)> = Vec::new();
+    let mut custom_idx: HashMap<String, usize> = HashMap::new();
     for m in super::custom_models::load(data_dir).iter() {
         let canonical = canonical_id(&m.name);
         if canonical.is_empty() {
             continue;
         }
-        if !m.vendor.is_empty() {
-            custom_vendor.insert(canonical.clone(), m.vendor.clone());
+        let cctx = if m.context_length > 0 { Some(m.context_length) } else { None };
+        let cmt = if m.max_tokens > 0 { Some(m.max_tokens) } else { None };
+        match custom_idx.get(&canonical) {
+            Some(&i) => {
+                let g = &mut custom_groups[i].1;
+                if m.enabled {
+                    if !g.enabled {
+                        // 首条为 disabled：整组展示值改由首个 enabled 条目接手
+                        g.enabled = true;
+                        g.vendor = m.vendor.clone();
+                        g.img = m.supports_image;
+                        g.ctx = cctx;
+                        g.mt = cmt;
+                    }
+                    g.rate = Some(g.rate.map_or(m.rate, |r| r.min(m.rate)));
+                }
+            }
+            None => {
+                custom_idx.insert(canonical.clone(), custom_groups.len());
+                custom_groups.push((
+                    canonical,
+                    CustomGroupAgg {
+                        name: m.name.clone(),
+                        rate: Some(m.rate),
+                        enabled: m.enabled,
+                        vendor: m.vendor.clone(),
+                        img: m.supports_image,
+                        ctx: cctx,
+                        mt: cmt,
+                    },
+                ));
+            }
+        }
+    }
+    for (canonical, g) in &custom_groups {
+        if !g.vendor.is_empty() {
+            custom_vendor.insert(canonical.clone(), g.vendor.clone());
         }
         // 展示倍率：0 = 免费（有效语义，透传聚合层）——命中 custom 即按免费展示；
         // 聚合尾部 rate=命中侧倍率，disabled 的 custom 源不会被命中，不影响 Trae/Buddy 侧
-        let crate_rate: Option<f64> = Some(m.rate);
-        let cctx = if m.context_length > 0 { Some(m.context_length) } else { None };
-        let cmt = if m.max_tokens > 0 { Some(m.max_tokens) } else { None };
-        match acc.get_mut(&canonical) {
+        let crate_rate: Option<f64> = g.rate;
+        match acc.get_mut(canonical) {
             Some(u) => {
                 u.sources.push(UnifiedSource {
                     pool: "custom",
                     rate: crate_rate,
-                    enabled: m.enabled,
+                    enabled: g.enabled,
                 });
-                if let Some(r) = crate_rate {
-                    u.rate = Some(r);
-                }
-                if let Some(c) = cctx {
-                    u.context_length = Some(c);
-                }
-                if let Some(t) = cmt {
-                    u.max_tokens = Some(t);
-                }
-                // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
-                // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
-                if m.enabled {
-                    u.supports_image = Some(m.supports_image);
+                if g.enabled {
+                    if let Some(r) = crate_rate {
+                        u.rate = Some(r);
+                    }
+                    if let Some(c) = g.ctx {
+                        u.context_length = Some(c);
+                    }
+                    if let Some(t) = g.mt {
+                        u.max_tokens = Some(t);
+                    }
+                    // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
+                    // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
+                    u.supports_image = Some(g.img);
                 }
             }
             None => {
@@ -675,20 +725,20 @@ pub fn unified_models_ex(
                 acc.insert(
                     canonical.clone(),
                     UnifiedModel {
-                        id: m.name.clone(),
-                        display: m.name.clone(),
-                        vendor: m.vendor.clone(),
+                        id: g.name.clone(),
+                        display: g.name.clone(),
+                        vendor: g.vendor.clone(),
                         region: None,
-                        rate: crate_rate,
+                        rate: if g.enabled { crate_rate } else { None },
                         efforts: Vec::new(),
                         max_mode: false,
-                        context_length: cctx,
-                        max_tokens: cmt,
-                        supports_image: Some(m.supports_image),
+                        context_length: g.ctx,
+                        max_tokens: g.mt,
+                        supports_image: g.enabled.then_some(g.img),
                         sources: vec![UnifiedSource {
                             pool: "custom",
                             rate: crate_rate,
-                            enabled: m.enabled,
+                            enabled: g.enabled,
                         }],
                         manual: false,
                     },
