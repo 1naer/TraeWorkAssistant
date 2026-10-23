@@ -14,7 +14,11 @@
   ;    注意：本产品两行禁用 /T（树杀，issue #135）——应用内更新场景下安装器是本产品
   ;    主程序的子进程，/T 会连同安装器一起强杀，安装中途静默中断升级失败；主程序
   ;    文件锁由主进程映像持有，杀主进程即解锁，无需树杀（CheckIfAppIsRunning 会兜底）。
-  ;    老品牌二进制行保留 /T：老品牌进程不可能是本安装器的祖先，树杀无副作用。
+  ;    trae-work-assistant.exe 行保留 /T：考古确认该名是本产品 v2.4.4 时代的构建
+  ;    二进制名（package_portable.py 直引 target/release/trae-work-assistant.exe），
+  ;    强杀属本产品旧命名自清理（POSTINSTALL 同口径，兼防自定义/便携解压目录重合
+  ;    的文件锁）；该时期无应用内更新器，进程不可能是本安装器的祖先，树杀无副作用。
+  ;    真正不触碰的老品牌进程是 "Trae Work 助手.exe"（独立安装目录，两版并存）。
   nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe"'
   Pop $R9
   nsExec::Exec 'taskkill /F /IM "trae-work-assistant.exe" /T'

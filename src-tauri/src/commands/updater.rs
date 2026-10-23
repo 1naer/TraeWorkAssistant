@@ -2,7 +2,7 @@
 //
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
-//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（仅作手动安装备选；应用内更新不使用，见 pick_asset）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
@@ -163,30 +163,28 @@ fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
     ))
 }
 
-/// 在 release 资产中挑选安装包：优先 NSIS（x64-setup.exe），退而求其次 MSI。
+/// 在 release 资产中挑选安装包：仅接受 NSIS（x64-setup.exe）。
+/// MSI 不参与挑选（P4，#135 审查收尾）：update_run_installer 统一按 NSIS 参数
+/// （/P /UPDATE /R）启动安装器，msiexec 语义中 /P 是补丁模式——旧「MSI 兜底」
+/// 选出即死路，宁可在此返回 None 走「没有可用的安装包资产」显式报错引导手动下载，
+/// 也不静默选出必然失败的资产。
 fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
-    // [(name, url, size)] 两轮：先 NSIS 后 MSI
-    let mut parsed: Vec<(String, String, u64, bool)> = Vec::new(); // bool=is_nsis
+    let mut parsed: Vec<(String, String, u64)> = Vec::new();
     for a in assets {
         let name = a.get("name")?.as_str()?.to_string();
         let url = a.get("browser_download_url")?.as_str()?.to_string();
         let size = a.get("size")?.as_u64().unwrap_or(0);
-        let is_nsis = name.ends_with("_x64-setup.exe");
-        let is_msi = name.ends_with("_x64_zh-CN.msi");
-        if is_nsis || is_msi {
-            parsed.push((name, url, size, is_nsis));
+        if name.ends_with("_x64-setup.exe") {
+            parsed.push((name, url, size));
         }
     }
-    // NSIS 优先；同类型取文件名版本号最大者（release 内一般只有一个，防御性处理）
+    // 同类型取文件名版本号最大者（release 内一般只有一个，防御性处理）
     parsed.sort_by(|a, b| {
-        let ka = (a.3, version_from_asset(&a.0).unwrap_or((0, 0, 0)));
-        let kb = (b.3, version_from_asset(&b.0).unwrap_or((0, 0, 0)));
-        kb.cmp(&ka)
+        version_from_asset(&b.0)
+            .unwrap_or((0, 0, 0))
+            .cmp(&version_from_asset(&a.0).unwrap_or((0, 0, 0)))
     });
-    parsed
-        .into_iter()
-        .next()
-        .map(|(name, url, size, _)| (name, url, size))
+    parsed.into_iter().next()
 }
 
 // ---------------- 发布校验清单（latest.json） ----------------
@@ -818,6 +816,36 @@ mod tests {
             assert!(ensure_safe_asset_name(bad).is_err(), "须拒绝: {bad:?}");
         }
         assert!(ensure_safe_asset_name("").is_err(), "空名拒绝");
+    }
+
+    /// P4（#135 审查收尾）：pick_asset 仅接受 NSIS——MSI 兜底是死路
+    /// （update_run_installer 统一按 NSIS 参数启动，msiexec /P 为补丁模式），
+    /// 仅 MSI 的 release 显式报「没有可用的安装包资产」引导手动下载。
+    #[test]
+    fn pick_asset_nsis_only() {
+        let asset = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("https://example.com/{name}"),
+                "size": 1u64,
+            })
+        };
+        // NSIS 优先：MSI 在场也不影响
+        let (name, _, _) = pick_asset(&[
+            asset("AI Work 助手_3.8.1_x64_zh-CN.msi"),
+            asset("AI Work 助手_3.8.2_x64-setup.exe"),
+        ])
+        .unwrap();
+        assert_eq!(name, "AI Work 助手_3.8.2_x64-setup.exe");
+        // 仅 MSI → None（旧逻辑会选中并必然失败于 msiexec）
+        assert!(pick_asset(&[asset("AI Work 助手_3.8.2_x64_zh-CN.msi")]).is_none());
+        // 同类多资产取版本最高者
+        let (name, _, _) = pick_asset(&[
+            asset("AI Work 助手_3.8.1_x64-setup.exe"),
+            asset("AI Work 助手_3.8.2_x64-setup.exe"),
+        ])
+        .unwrap();
+        assert_eq!(name, "AI Work 助手_3.8.2_x64-setup.exe");
     }
 
     #[test]
