@@ -106,20 +106,49 @@ impl CaAuthority {
 }
 
 /// 查询 Windows 受信任根存储是否含本代理 CA（TraeDeviceProxyCA）。
-/// HKLM 与 HKCU Root 任一命中即视为已安装（与 commands::cert::cert_status 同语义）；
-/// 查询失败一律视为未安装。供代理启动日志输出真实安装状态（此前为无条件提示，误导）。
+/// CryptoAPI 进程内查询：CertOpenSystemStoreW("ROOT") 打开的系统存储为
+/// HKLM Root + HKCU Root 合并只读视图，一次查询覆盖原 certutil `-store Root`
+/// 与 `-user -store Root` 双查语义；查询失败一律视为未安装（与
+/// commands::cert::cert_status 同语义）。替代 certutil 子进程：auto_start_proxy
+/// 开机自启链路登录早期会走到本探测，spawn 控制台程序可能撞系统初始化窗口期
+/// 报 0xc0000142（issue #137 同类风险清零）。
 #[cfg(target_os = "windows")]
 pub fn installed_in_windows_root() -> bool {
-    use std::os::windows::process::CommandExt;
-    let run = |args: &[&str]| -> bool {
-        std::process::Command::new("certutil")
-            .args(args)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("TraeDeviceProxyCA"))
-            .unwrap_or(false)
+    root_store_has_subject("TraeDeviceProxyCA")
+}
+
+/// 在受信任根系统存储中按主题串查找证书（CryptoAPI 名称匹配，null 结尾宽串）。
+/// 打开/查找失败或未命中返回 false（对齐原 certutil 失败=未安装口径）。
+#[cfg(target_os = "windows")]
+fn root_store_has_subject(subject: &str) -> bool {
+    use windows_sys::Win32::Security::Cryptography::{
+        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext,
+        CertOpenSystemStoreW, CERT_FIND_SUBJECT_STR_W, PKCS_7_ASN_ENCODING,
+        X509_ASN_ENCODING,
     };
-    run(&["-store", "Root"]) || run(&["-user", "-store", "Root"])
+    // PCWSTR / CERT_FIND_SUBJECT_STR_W 的 pvFindPara 均需 null 结尾宽串
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+    let store_name = wide("ROOT");
+    let subject_w = wide(subject);
+    unsafe {
+        let store = CertOpenSystemStoreW(0, store_name.as_ptr());
+        if store.is_null() {
+            return false;
+        }
+        let found = CertFindCertificateInStore(
+            store,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            CERT_FIND_SUBJECT_STR_W,
+            subject_w.as_ptr().cast(),
+            std::ptr::null(),
+        );
+        if !found.is_null() {
+            CertFreeCertificateContext(found);
+        }
+        CertCloseStore(store, 0);
+        !found.is_null()
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -443,5 +472,16 @@ mod tests {
         assert_eq!(std::fs::read(&cert).unwrap(), b"cert");
         assert_eq!(std::fs::read(&key).unwrap(), b"key");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 实证回归：ROOT 系统存储查询链路（CryptoAPI 进程内，替代 certutil 子进程）。
+    /// 查一个必然不存在的主题必须返回 false——锁定「未命中≠恒真」；若实现退化为
+    /// 匹配一切或 API 调用链错误（打开存储失败未拦截等），本测试即红。正向命中
+    /// （本机已装 TraeDeviceProxyCA 时 installed_in_windows_root 返回 true）依赖
+    /// 系统状态，不入自动化断言。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn root_store_未命中主题返回false() {
+        assert!(!root_store_has_subject("DefinitelyNotARealCA-0xC0000142-Test"));
     }
 }
