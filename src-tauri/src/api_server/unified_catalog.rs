@@ -881,7 +881,9 @@ pub fn unified_models_ex(
             .filter_map(|s| TargetPool::parse(s))
             .collect();
         // 命中池：自定义来源命中即直达（dispatch ⓪ 短路）→ 显示层同步命中 custom；
-        // 否则优先级序首个 enabled 源 → 任一 enabled 源 → 首源
+        // 否则优先级序首个 enabled 源 → 任一 enabled 源（A2：按 POOL_FIXED_ORDER，
+        // 与 dispatch 候选序尾部补全同源——此前按 sources 插入序，buddy-ai 被插在
+        // trae 之前导致回退顺序与默认候选序不一致）→ 首源
         let hit = u
             .sources
             .iter()
@@ -897,12 +899,26 @@ pub fn unified_models_ex(
                             .map(|s| s.pool)
                     })
             })
-            .or_else(|| u.sources.iter().find(|s| s.enabled).map(|s| s.pool))
+            .or_else(|| {
+                super::dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+                    u.sources
+                        .iter()
+                        .find(|s| s.pool == p.as_str() && s.enabled)
+                        .map(|s| s.pool)
+                })
+            })
             .or_else(|| u.sources.first().map(|s| s.pool));
-        // rate = 命中侧倍率；未声明退可用源 → 首源 → 保持原值
+        // rate = 命中侧倍率；未声明退可用源（A2：同 POOL_FIXED_ORDER 口径）→ 首源 → 保持原值
         u.rate = hit
             .and_then(|hp| u.sources.iter().find(|s| s.pool == hp).and_then(|s| s.rate))
-            .or_else(|| u.sources.iter().find(|s| s.enabled).and_then(|s| s.rate))
+            .or_else(|| {
+                super::dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+                    u.sources
+                        .iter()
+                        .find(|s| s.pool == p.as_str() && s.enabled)
+                        .and_then(|s| s.rate)
+                })
+            })
             .or_else(|| u.sources.first().and_then(|s| s.rate))
             .or(u.rate);
         // context_length 跟随命中侧（issue #38-4）：命中 buddy → WB 目录值；

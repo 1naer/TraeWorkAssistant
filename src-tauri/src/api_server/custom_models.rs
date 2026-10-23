@@ -127,12 +127,42 @@ pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String
     r
 }
 
+/// base_url 规范化（A5/A6）：scheme 统一小写化 + 剥离默认端口（https:443 /
+/// http:80）+ 去尾部斜杠——`HTTPS://x:443/` 与 `https://x` 归一为同键，杜绝
+/// 大小写与默认端口变体绕过查重与匹配。host 大小写保持原文（审查范围仅 scheme）；
+/// IPv6 裸地址无端口形态含 ']'，rsplit_once(':') 取末段不会误剥离，安全。
+pub fn norm_base(base_url: &str) -> String {
+    let s = base_url.trim();
+    // scheme 通用小写化（A5）：任意大小写前缀归一；无 "://" 原样去尾斜杠返回
+    let (scheme, rest) = match s.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => return s.trim_end_matches('/').to_string(),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // 剥离默认端口（A6）：rsplit_once 取最后一段冒号比对纯数字端口
+    let authority = match authority.rsplit_once(':') {
+        Some((host, "443")) if scheme == "https" => host,
+        Some((host, "80")) if scheme == "http" => host,
+        _ => authority,
+    };
+    let mut out = format!("{scheme}://{authority}{path}");
+    while out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
 /// upsert 单条：id 为空或不存在则新增（生成 cm-<12hex> id），存在则整条覆盖。
 /// 返回保存后的完整列表。校验：name / base_url 必填；仅拒绝「同名 + 同 base_url +
 /// 同 api_key」完全重复——同名不同上游 = 合法上游组成员（P1：同名多条 = 上游组）。
 pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, String> {
     m.name = m.name.trim().to_string();
-    m.base_url = m.base_url.trim().trim_end_matches('/').to_string();
+    // A5/A6：保存即归一（scheme 小写 + 剥默认端口 + 去尾斜杠），后续校验/查重/
+    // 请求拼 URL 全部基于归一形态
+    m.base_url = norm_base(&m.base_url);
     m.vendor = m.vendor.trim().to_string();
     if m.weight == 0 {
         m.weight = 1; // 0 视为 1，防除零与无效权重
@@ -148,11 +178,12 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     let mut list = load(data_dir);
     let canonical = canonical_id(&m.name);
     // 完全重复校验（P1 放宽）：同名（canonical 相同）+ 同 base_url + 同 api_key
-    // = 无意义冗余，拒绝；同名不同上游（base_url 或 api_key 不同）= 上游组成员，放行
+    // = 无意义冗余，拒绝；同名不同上游（base_url 或 api_key 不同）= 上游组成员，放行。
+    // 查重两侧过 norm_base（A5/A6）：存量数据未归一，`HTTPS://x:443` 变体不得绕过
     if let Some(dup) = list.iter().find(|e| {
         e.id != m.id
             && canonical_id(&e.name) == canonical
-            && e.base_url == m.base_url
+            && norm_base(&e.base_url) == norm_base(&m.base_url)
             && e.api_key == m.api_key
     }) {
         return Err(format!("相同模型与上游地址/Key 的条目已存在：{}", dup.name));
@@ -160,6 +191,9 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     match list.iter_mut().find(|e| e.id == m.id && !m.id.is_empty()) {
         Some(slot) => {
             m.updated_at = now_ts();
+            // B2：编辑保存即清熔断——旧条目的熔断状态不得残留影响新配置
+            // （base_url/api_key 改动后原冷却窗与新上游无关）
+            super::custom_lb::clear_circuit(&m.id);
             *slot = m;
         }
         None => {
@@ -380,5 +414,26 @@ mod tests {
         let f = Fixture::new();
         let list = upsert(&f.0, CustomModel { name: "w".into(), base_url: "https://w.com".into(), weight: 0, ..Default::default() }).unwrap();
         assert_eq!(list[0].weight, 1);
+    }
+
+    /// A5/A6：base_url 规范化——scheme 小写化 + 默认端口剥离 + 尾斜杠去除；
+    /// 保存归一 + 查重两侧归一命中（`HTTPS://x:443` 变体不得绕过查重）
+    #[test]
+    fn t08_norm_base_scheme_and_port() {
+        assert_eq!(norm_base("HTTPS://api.example.com/"), "https://api.example.com", "scheme 小写化");
+        assert_eq!(norm_base("https://x:443"), "https://x", "https 默认端口剥离");
+        assert_eq!(norm_base("http://x:80/v1"), "http://x/v1", "http 默认端口剥离");
+        assert_eq!(norm_base("https://x:8443"), "https://x:8443", "非默认端口保留");
+        assert_eq!(norm_base("https://x"), "https://x", "无端口形态不变");
+        assert_eq!(norm_base("https://[::1]:443/v1"), "https://[::1]/v1", "IPv6 带默认端口剥离");
+        assert_eq!(norm_base("  https://x/  "), "https://x", "首尾空白");
+        let f = Fixture::new();
+        let list = upsert(&f.0, CustomModel { name: "m".into(), base_url: "HTTPS://a.com:443".into(), api_key: "k1".into(), ..Default::default() }).unwrap();
+        assert_eq!(list[0].base_url, "https://a.com", "保存即归一");
+        // 查重两侧归一：HTTPS:// + :443 变体命中既有 https://a.com → 拒绝
+        assert!(
+            upsert(&f.0, CustomModel { name: "m".into(), base_url: "HTTPS://a.com:443".into(), api_key: "k1".into(), ..Default::default() }).is_err(),
+            "大小写/默认端口变体须命中查重"
+        );
     }
 }

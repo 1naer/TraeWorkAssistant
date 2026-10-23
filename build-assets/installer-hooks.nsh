@@ -21,6 +21,49 @@
   Pop $R9
   nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe"'
   Pop $R9
+
+  ; ---- 升级宽限等待（D2 恢复回归 + M-1 修正存活判定）----
+  ; 首轮 taskkill 后静默 1.2s 给应用退出链留时间（updater 侧 800ms 延迟退出，
+  ; 两值耦合：应用退出 < 安装器兜底强杀，调整需同步）。
+  ; 存活探测不依赖退出码——tasklist /FI 无匹配时退出码恒为 0，IntCmp 退出码判定
+  ; 是死逻辑（M-1 实证）；改用 nsExec::ExecToStack 捕获 /NH 输出，取首列定长映像名
+  ; StrCmp 判定（Unicode NSIS 按字符计数；无匹配时输出为 INFO 行，首列 ≠ 映像名，
+  ; 天然判「不在」）。任一本产品线进程仍存活 → Sleep 500 重试，上限 30 次（≈15s）；
+  ; 超时仍存活 → taskkill /F 兜底强杀后继续安装。
+  Sleep 1200
+  StrCpy $R8 0
+preinstall_grace_loop:
+  ; 探测 1/3：ai-work-assistant.exe（首列 21 字符）
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq ai-work-assistant.exe" /NH'
+  Pop $R9 ; 退出码（恒 0，不用于判定）
+  Pop $R7 ; 输出首行
+  StrCpy $R7 "$R7" 21
+  StrCmp $R7 "ai-work-assistant.exe" preinstall_grace_alive
+  ; 探测 2/3：AI Work 助手.exe（首列 14 字符）
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq AI Work 助手.exe" /NH'
+  Pop $R9
+  Pop $R7
+  StrCpy $R7 "$R7" 14
+  StrCmp $R7 "AI Work 助手.exe" preinstall_grace_alive
+  ; 探测 3/3：trae-work-assistant.exe（首列 23 字符）
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq trae-work-assistant.exe" /NH'
+  Pop $R9
+  Pop $R7
+  StrCpy $R7 "$R7" 23
+  StrCmp $R7 "trae-work-assistant.exe" preinstall_grace_alive
+  Goto preinstall_grace_done
+preinstall_grace_alive:
+  Sleep 500
+  IntOp $R8 $R8 + 1
+  IntCmp $R8 30 preinstall_grace_kill preinstall_grace_loop preinstall_grace_kill
+preinstall_grace_kill:
+  nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe"'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM "trae-work-assistant.exe" /T'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe"'
+  Pop $R9
+preinstall_grace_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

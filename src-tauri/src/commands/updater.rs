@@ -459,9 +459,30 @@ pub struct UpdateDownloaded {
     pub version: String,
 }
 
+/// 资产文件名白名单（D1，cmd 元字符注入防御）：update_run_installer 将安装包
+/// 路径传入 `cmd /C start` 拼接，且 asset_name 参与临时目录/sidecar 路径 join。
+/// Rust Command 对含空格参数自动加引号，但 `"` 可闭合引导，`&`/`^`/`%`/`!` 等
+/// 在 cmd 解析层存在注入面。白名单仅放行字母数字（Unicode 语义，含既有资产名
+/// 中文）+ 空格 `. _ - ( ) #`——发布流资产名 "AI Work 助手_<ver>_x64-setup.exe"
+/// / "_x64_zh-CN.msi" 全命中，其余一律拒绝。
+fn ensure_safe_asset_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("资产文件名为空，已中止".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')' | '#'))
+    {
+        return Err(format!("资产文件名包含非法字符，已中止: {name}"));
+    }
+    Ok(())
+}
+
 /// 校验下载目标：资产名版本必须与检查结果一致，且大于当前版本。
 /// 同时防御路径注入：资产名只允许安全文件名字符（来自 GitHub API，纵深防御）。
 fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64, u64), String> {
+    // D1（cmd 元字符注入防御，先于路径校验）：文件名将参与 `cmd /C start` 拼接
+    ensure_safe_asset_name(asset_name)?;
     if asset_name.contains(['/', '\\', ':'])
         || asset_name.split(['.', ' ']).any(|seg| seg == "..")
         || asset_name.contains("..")
@@ -665,6 +686,9 @@ pub fn update_run_installer(
         Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
     }
+    // D1（cmd 元字符注入防御）：下方经 `cmd /C start` 拼接启动，asset_name 同时
+    // 参与 sidecar 路径拼接——白名单拒绝 cmd 元字符（受信前端直调也纵深拦截）
+    ensure_safe_asset_name(&asset_name)?;
 
     // 审查修复（H4，闸③）：安装前两道校验——
     // ① 文件名与资产名绑定：拒绝「A 文件路径 + B 资产名」的组合，防止借合法资产名
@@ -737,6 +761,9 @@ pub fn update_run_installer(
     // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
     // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
     crate::events::emit_logged(&app, "update-installing", serde_json::Value::String(asset_name.clone()), None);
+    // D2：800ms 延迟退出与安装器 PREINSTALL 宽限等待（installer-hooks.nsh：1.2s
+    // 静默 + 存活探测循环）耦合——正常时序本应用先自行退出，安装器宽限仅兜底
+    // 锁占用；两值需同步调整（应用退出耗时应 < 安装器兜底强杀）
     std::thread::sleep(Duration::from_millis(800));
     // 审查修复：走 Tauri 退出链（RunEvent::Exit）而非 std::process::exit——
     // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
@@ -756,6 +783,41 @@ mod tests {
         assert!(!is_sha256_hex(&"a".repeat(63))); // 不足 64 位
         assert!(!is_sha256_hex(&"g".repeat(64))); // 非十六进制字符
         assert!(!is_sha256_hex(""));
+    }
+
+    /// D1：资产文件名白名单——既有发布流资产名全命中，cmd 元字符一律拒绝
+    #[test]
+    fn safe_asset_name_whitelist() {
+        assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64-setup.exe").is_ok());
+        assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64_zh-CN.msi").is_ok());
+        assert!(ensure_safe_asset_name("AI.Work._3.3.3_x64-setup.exe").is_ok());
+        assert!(ensure_safe_asset_name("setup(1).exe").is_ok());
+        // cmd 元字符 / 引号 / 分隔符 / 控制字符一律拒绝
+        for bad in [
+            "x&calc.exe",
+            "x|ver.exe",
+            "x^1.exe",
+            "x%PATH%.exe",
+            "x!U!.exe",
+            "a\"b.exe",
+            "a<b.exe",
+            "a>b.exe",
+            "a;b.exe",
+            "a'b.exe",
+            "a`b.exe",
+            "a\\b.exe",
+            "a/b.exe",
+            "a:b.exe",
+            "a$b.exe",
+            "a=b.exe",
+            "a,cmd.exe",
+            "a@x.exe",
+            "x\t.exe",
+            "x\n.exe",
+        ] {
+            assert!(ensure_safe_asset_name(bad).is_err(), "须拒绝: {bad:?}");
+        }
+        assert!(ensure_safe_asset_name("").is_err(), "空名拒绝");
     }
 
     #[test]

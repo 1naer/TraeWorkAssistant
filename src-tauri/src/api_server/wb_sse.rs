@@ -845,8 +845,9 @@ pub fn stream_forward_ex(
     (error_info, sent_any, failed_inline, usage)
 }
 
-/// 兼容封装：旧三元组返回（既有调用方不感知流内失败标记；
-/// 新调用方请用 stream_forward_ex）
+/// 兼容封装：旧三元组返回（B1 后生产侧已全部迁移 stream_forward_ex，仅测试使用，
+/// #[cfg(test)] 门控消 dead_code；新调用方请用 stream_forward_ex）
+#[cfg(test)]
 pub fn stream_forward(
     lines: InterruptibleLines,
     tx: &Sender,

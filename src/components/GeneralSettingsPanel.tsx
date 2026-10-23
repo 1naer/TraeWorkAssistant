@@ -31,7 +31,7 @@ export default function GeneralSettingsPanel() {
   // 应用图标选择器：当前展开替换哪个应用的图标（null = 全部收起）
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
   // 侧边栏显示拖拽排序态：dragKey = 正在拖拽的行（半透明反馈）；listRef = 列表容器
-  // （mousemove 据此定位指针所在行）；「侧边栏显示」列表行序即侧边栏应用 Tab 展示顺序
+  // （pointermove 据此定位指针所在行）；「侧边栏显示」列表行序即侧边栏应用 Tab 展示顺序
   const [dragKey, setDragKey] = useState<AppKey | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   // 当前拖拽的监听器清理函数（onUp）：拖拽中组件被卸载（如 Esc 关闭设置弹框）时兜底移除
@@ -127,16 +127,16 @@ export default function GeneralSettingsPanel() {
     });
   };
 
-  // 抓手按下启动拖拽：window 级 mousemove 实时检测指针所在行并换位（松开即止）。
+  // 抓手按下启动拖拽（C2：Pointer Events 统一鼠标/触控/触笔——鼠标事件在触屏
+  // 上不触发）：window 级 pointermove 实时检测指针所在行并换位（松开即止）。
   // 不用 HTML5 DnD——Tauri Windows 端 dragDropEnabled 默认开启，原生文件拖放
   // 处理器会拦截网页内 dragstart，draggable 完全失效（实测无法拖动）
-  const beginDrag = (key: AppKey) => (e: React.MouseEvent) => {
-    e.preventDefault(); // 防止拖动时选中文字
+  const beginDrag = (key: AppKey) => (e: React.PointerEvent) => {
     let current = key;
     setDragKey(current);
-    const onMove = (ev: MouseEvent) => {
-      // 鼠标按键已全部抬起却没有收到 mouseup：焦点被抢走（alt-tab/系统弹窗）后
-      // 松开鼠标的事件落在了别处。此时若继续处理移动会无按键持续换位、拖拽态
+    const onMove = (ev: PointerEvent) => {
+      // 按键已全部抬起却没有收到 pointerup：焦点被抢走（alt-tab/系统弹窗）后
+      // 松开按键的事件落在了别处。此时若继续处理移动会无按键持续换位、拖拽态
       // 卡死到下一次点击，且乱序会被「保存设置」持久化——立即结束拖拽。
       if (ev.buttons === 0) {
         onUp();
@@ -158,13 +158,28 @@ export default function GeneralSettingsPanel() {
     };
     const onUp = () => {
       setDragKey(null);
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
       dragCleanupRef.current = null;
     };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
     dragCleanupRef.current = onUp;
+  };
+
+  // C1：键盘替代拖拽——抓手聚焦后 ↑/↓ 与相邻行换位（纯拖拽对键盘用户不可达；
+  // 与拖拽同走 reorderApps，保存语义一致）
+  const moveByKeyboard = (key: AppKey) => (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    if (!form) return;
+    const order = getOrderedApps(form);
+    const i = order.indexOf(key);
+    const j = e.key === 'ArrowUp' ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= order.length) return;
+    e.preventDefault();
+    reorderApps(order[i], order[j]);
   };
 
   // 设置应用图标：null 或与内置默认同名 = 删除自定义项（回退 APP_TABS 默认图标）
@@ -240,7 +255,8 @@ export default function GeneralSettingsPanel() {
           控制左下角侧边栏显示哪些应用。「固定应用」始终显示且不可隐藏（默认 Trae）；其余应用可自由勾选。
           「侧边栏显示」行可上下拖动调整展示顺序（保存后侧边栏应用 Tab 按新顺序排列）；
           隐藏仅收起入口，<b>不删除账号数据、不影响签到 / 保活等定时任务</b>，重新勾选即可恢复；
-          若当前正在浏览的应用被隐藏，会自动跳回固定应用。按住行首抓手上下拖动调整顺序，图标可点击更换应用图标。
+          若当前正在浏览的应用被隐藏，会自动跳回固定应用。按住行首抓手上下拖动调整顺序（触屏/触笔同样支持），
+          或聚焦抓手后按 ↑/↓ 键与相邻行换位；图标可点击更换应用图标。
         </p>
         <div className="grid gap-x-8 gap-y-2 sm:grid-cols-2">
           <div className="space-y-2">
@@ -282,18 +298,23 @@ export default function GeneralSettingsPanel() {
                     dragging ? 'opacity-40' : pinned && 'opacity-60',
                   )}
                 >
-                  {/* 拖拽抓手：按住上下拖动实时换位（仅抓手触发，避免误碰勾选/图标按钮） */}
-                  <span
-                    title="按住拖动调整显示顺序"
-                    className="flex shrink-0 cursor-grab active:cursor-grabbing"
+                  {/* 拖拽抓手（button）：按住上下拖动实时换位，或聚焦后按 ↑/↓ 与相邻行换位
+                      （C1 键盘替代 + C2 Pointer Events；select-none 承担原 preventDefault 防文字选择，
+                       保留按钮聚焦能力供键盘操作） */}
+                  <button
+                    type="button"
+                    title={`调整「${tab.label}」顺序：按住拖动，或聚焦后按 ↑/↓ 键`}
+                    aria-label={`调整「${tab.label}」顺序：按住拖动，或按上下方向键`}
+                    onPointerDown={beginDrag(tab.key)}
+                    onKeyDown={moveByKeyboard(tab.key)}
+                    className="flex h-7 w-7 shrink-0 cursor-grab touch-none select-none items-center justify-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-sky-500 active:cursor-grabbing"
                   >
                     <GripVertical
                       size={14}
-                      onMouseDown={beginDrag(tab.key)}
                       className="text-slate-300 dark:text-zinc-600"
                       aria-hidden
                     />
-                  </span>
+                  </button>
                   {/* 行首图标：点击弹出候选表更换该应用在侧边栏的显示图标（仅 UI 偏好） */}
                   <button
                     type="button"

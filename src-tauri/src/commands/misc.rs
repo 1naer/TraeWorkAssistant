@@ -827,6 +827,25 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
                     None => continue,
                 }
             }
+            // C4：app_order 元素合法性校验——合法键走 models::is_valid_app_key 单一来源
+            // （与 state.rs 读取侧归一同谓词），任意字符串不得入库；非法元素剔除 +
+            // HashSet 全量去重保序（对齐读取侧，Vec::dedup 只去相邻重复）；
+            // 非数组形态不写入（防破坏 Vec<String> 反序列化）
+            if k == "app_order" {
+                let Some(arr) = v.as_array() else {
+                    continue;
+                };
+                let mut seen = std::collections::HashSet::new();
+                let cleaned: Vec<serde_json::Value> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .filter(|s| crate::models::is_valid_app_key(s))
+                    .filter(|s| seen.insert(*s))
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect();
+                current_obj.insert(k.clone(), serde_json::Value::Array(cleaned));
+                continue;
+            }
             current_obj.insert(k.clone(), v.clone());
         }
     }

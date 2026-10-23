@@ -33,6 +33,18 @@ pub fn default_priority() -> Vec<String> {
     vec!["buddy".into(), "trae".into(), "qoder".into()]
 }
 
+/// 池固定序（A2 共享常量）：候选序尾部补全与统一目录显示层兜底回退共用同一
+/// 顺序，杜绝两处字面量漂移（unified_catalog 曾按 sources 插入序回退，buddy-ai
+/// 被插在 trae 之前与默认候选序不一致）。默认 priority 下尾部补全结果
+/// [buddy, trae, qoder, buddy-ai, custom] 与既有行为零差异；custom 保持尾部兜底位。
+pub const POOL_FIXED_ORDER: [TargetPool; 5] = [
+    TargetPool::Buddy,
+    TargetPool::Trae,
+    TargetPool::Qoder,
+    TargetPool::BuddyAi,
+    TargetPool::Custom,
+];
+
 /// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `buddy-ai` / `custom`）。
 /// v3 拍板：custom 为第五资源池参与统一调度规则（priority / per_model / Smart /
 /// Key 绑定 / fallback 全链路生效），默认候选序尾部兜底——不再「命中即直达」
@@ -714,11 +726,12 @@ pub fn resolve_target(
             .filter_map(|s| TargetPool::parse(s))
             .collect()
     };
-    // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
-    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加。v3：custom 尾部兜底位——
-    // 默认候选序 = [buddy, trae, qoder, custom]）
+    // per_model / 绑定序可能只写了部分池：其余可用源按 POOL_FIXED_ORDER 追加尾部，
+    // 保证多源回退有序（issue #90 修复③a：前缀锁定 = 单池候选，不追加。
+    // v3：custom 尾部兜底位——默认候选序 = [buddy, trae, qoder, buddy-ai, custom]，
+    // 与 unified_catalog 显示层兜底回退同源 A2）
     if forced_pool.is_none() {
-        for p in [TargetPool::Buddy, TargetPool::BuddyAi, TargetPool::Trae, TargetPool::Qoder, TargetPool::Custom] {
+        for p in POOL_FIXED_ORDER {
             if !order.contains(&p) {
                 order.push(p);
             }
@@ -1012,13 +1025,18 @@ fn pool_health(
             }
             Ok(())
         }
-        // v3：custom 上游组健康判定——任一上游未熔断即可候选（组内选路跳过
-        // 熔断条目；全熔断 → NoHealthyAccount 走现有 fallback 按序回退下一池）
+        // v3：custom 上游组健康判定——任一上游「未熔断且在 Key 白名单内」即可候选
+        // （M-2 预检感知白名单，与 custom_lb::pick_upstream 执行侧同口径：白名单
+        // 排除组内全部健康条目时判不健康走 fallback，避免执行侧 pick_next 返回
+        // None 才 503 exhausted、丢失本可成功的跨池回退）
         TargetPool::Custom => {
             if sources
                 .custom
                 .iter()
-                .any(|cm| !super::custom_lb::circuit_open(&cm.id))
+                .any(|cm| {
+                    !super::custom_lb::circuit_open(&cm.id)
+                        && allowed.map_or(true, |set| set.contains(&cm.id))
+                })
             {
                 Ok(())
             } else {
@@ -1471,6 +1489,57 @@ mod tests {
         assert!(f
             .app_log_contains("dispatch fallback: model=glm-5.3 pool=trae preferred=custom reason=no_healthy_account"));
         super::super::custom_lb::clear_circuit(&list[0].id);
+    }
+
+    /// M-2：custom 白名单预检感知（正反对照）——Key 白名单排除组内全部健康条目
+    /// 时预检判不健康走跨池 fallback（而非执行侧 pick_next 返回 None 才 503
+    /// exhausted）；白名单条目健康时照常落 Custom。
+    /// seed_key 须在首次 resolve 之前调用（constraints_for 经 KEYS_STATE 首读固化
+    /// 内存副本）；CustomModel 显式唯一 id 隔离进程级全局熔断表
+    #[test]
+    fn t91_custom_whitelist_excluded_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        // 绑定 custom + 白名单仅含 cm-whitelist0001（bind Key → pool_constraints
+        // 旧语义生效）；两条 custom 均显式唯一 id
+        f.seed_key("k-cw", "custom", &["cm-whitelist0001"]);
+        let cm1: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "id": "cm-whitelist0001",
+            "name": "glm-5.3",
+            "base_url": "https://custom-a.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        let cm2: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "id": "cm-excluded00001",
+            "name": "glm-5.3",
+            "base_url": "https://custom-b.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        super::super::custom_models::upsert(&f.dir, cm1).unwrap();
+        super::super::custom_models::upsert(&f.dir, cm2).unwrap();
+
+        // 反对照：白名单条目熔断 → 组内全部健康条目被白名单排除 → 预检不健康
+        // → 落 Trae（fallback_from=Custom），而非留到执行侧 503。
+        // 用 Auth 类 600s 长窗记账（pool_health 仅判 circuit_open，不分类别）：
+        // Server 类基准窗仅 30s，全量并行跑时 constraints_for 可能在 KEYS_STATE
+        // 锁上被其他测试的 vault 加密操作阻塞超 30s，窗口过期会假失败
+        super::super::custom_lb::note_circuit_failure(
+            "cm-whitelist0001",
+            super::super::custom_lb::FailKind::Auth,
+        );
+        let r = f.resolve_key("glm-5.3", "k-cw").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae, "白名单排除全部健康条目须走跨池回退");
+        assert_eq!(r.fallback_from, Some(TargetPool::Custom));
+        assert!(f
+            .app_log_contains("dispatch fallback: model=glm-5.3 pool=trae preferred=custom reason=no_healthy_account"));
+
+        // 正对照：白名单条目熔断清除 → 预检健康 → 照常落 Custom
+        super::super::custom_lb::clear_circuit("cm-whitelist0001");
+        let r = f.resolve_key("glm-5.3", "k-cw").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom, "白名单内条目健康时正常命中 custom");
+        super::super::custom_lb::clear_circuit("cm-whitelist0001");
     }
 
     /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthy(Custom) 显式报错
