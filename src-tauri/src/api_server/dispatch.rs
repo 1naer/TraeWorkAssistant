@@ -845,9 +845,9 @@ pub fn resolve_target(
             }
         }
     }
-    // 可用源全部耗尽（零可用源 / 双源回退目标也不可用 / Key 白名单排除）：
-    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名；
-    // issue #136：追加逐池失败归因 candidates，跨池错位一行日志即可定位）
+    // 仅零可用源（循环内全部 continue）才走到此处；有可用池但失败的场景均在
+    // 循环内 !can_fallback 提前终止并落同款归因日志（issue #136）。落盘调度
+    // 日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
     log_dispatch_exhausted(state, model, key_id, preferred, &pool_reasons);
     Err(DispatchError::NoHealthy(
         // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
@@ -858,7 +858,9 @@ pub fn resolve_target(
 
 /// dispatch 耗尽/提前终止的逐池归因日志（issue #30 可观测 + issue #136 逐池
 /// candidates）：候选序中每个池的失败原因（unavailable / no_healthy_account /
-/// model_cooldown）一行落盘，「白名单把池排除」与「账号不健康」直接可辨
+/// model_cooldown）一行落盘，「白名单把池排除」与「账号不健康」直接可辨。
+/// 连续相同归因 60s 内去重（客户端重试风暴防刷屏，对齐调度器 Busy 不重复
+/// 落日志先例），data_dir 参与去重键——多实例/测试目录互不干扰
 fn log_dispatch_exhausted(
     state: &Arc<ApiSharedState>,
     model: &str,
@@ -870,16 +872,25 @@ fn log_dispatch_exhausted(
         .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "anonymous".to_string());
-    crate::fs_utils::app_log(
-        &state.data_dir,
-        &format!(
-            "dispatch exhausted: model={} key={} preferred={} candidates={}",
-            model,
-            key_label,
-            preferred.map(|p| p.as_str()).unwrap_or("none"),
-            reasons.join(","),
-        ),
+    let line = format!(
+        "dispatch exhausted: model={} key={} preferred={} candidates={}",
+        model,
+        key_label,
+        preferred.map(|p| p.as_str()).unwrap_or("none"),
+        reasons.join(","),
     );
+    static LAST: std::sync::OnceLock<std::sync::Mutex<(String, std::time::Instant)>> =
+        std::sync::OnceLock::new();
+    let cell = LAST
+        .get_or_init(|| std::sync::Mutex::new((String::new(), std::time::Instant::now())));
+    if let Ok(mut g) = cell.lock() {
+        let dedup_key = format!("{}\u{1}{}", state.data_dir.display(), line);
+        if g.0 == dedup_key && g.1.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+        *g = (dedup_key, std::time::Instant::now());
+    }
+    crate::fs_utils::app_log(&state.data_dir, &line);
 }
 
 /// 会话池粘性键（§4.4：复用现有粘性会话键，conversation 维度）。
@@ -2543,8 +2554,9 @@ mod tests {
         f.seed_healthy(true); // trae 池健康账号 t1（healthy=1，在作用域外）
         // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
         f.seed_key("k1", "", &["buddy-ai:u1", "buddy-ai:u2"]); // 白名单仅国际版账号
-        // 专一锁他池变体：白名单/专一均指向 buddy-ai → trae 整体排除（dedicated 不随行）
-        f.seed_key_cfg("k2", "", &["buddy-ai:u1"], "dedicated", "buddy-ai:u9");
+        // 专一锁他池变体：白名单指向 buddy-ai + 专一指向 qoder → trae 整体排除
+        // （dedicated 不随行，且 dedicated 指向池对约束涉及池列表有可见增量 qoder）
+        f.seed_key_cfg("k2", "", &["buddy-ai:u1"], "dedicated", "qoder:u9");
 
         let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k1");
         assert!(msg.contains("pool=trae healthy=1"), "{msg}");
@@ -2565,8 +2577,8 @@ mod tests {
         assert!(msg2.contains("whitelist=0"), "{msg2}");
         assert!(msg2.contains("dedicated=-"), "非归属池排除分支 dedicated 不随行: {msg2}");
         assert!(
-            msg2.contains("hint=该 Key 的账号约束均指向其他资源池（buddy-ai）"),
-            "{msg2}"
+            msg2.contains("hint=该 Key 的账号约束均指向其他资源池（buddy-ai/qoder）"),
+            "dedicated 指向池应并入约束涉及池列表: {msg2}"
         );
     }
 
