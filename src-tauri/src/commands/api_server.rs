@@ -2065,14 +2065,19 @@ pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bo
 pub async fn custom_model_test(
     model: crate::api_server::custom_models::CustomModel,
 ) -> Result<String, String> {
-    // 与保存同口径的参数预检：给出明确错误而非透传上游 4xx
+    // 与保存侧（custom_models::upsert）完全同口径的参数预检：给出明确错误而非
+    // 透传上游 4xx。base_url 必须先过 norm_base 归一（scheme 小写 + 剥默认端口
+    // 443/80 + 去尾斜杠），校验镜像 upsert——否则 HTTPS://x:443/ 能保存、此处
+    // 探活却被大小写敏感 starts_with 拒绝，两侧口径分裂
     let mut cm = model;
     cm.name = cm.name.trim().to_string();
-    cm.base_url = cm.base_url.trim().trim_end_matches('/').to_string();
+    cm.base_url = crate::api_server::custom_models::norm_base(&cm.base_url);
     if cm.name.is_empty() {
         return Err("请先填写模型名称".into());
     }
-    if !cm.base_url.starts_with("http://") && !cm.base_url.starts_with("https://") {
+    if cm.base_url.is_empty()
+        || (!cm.base_url.starts_with("http://") && !cm.base_url.starts_with("https://"))
+    {
         return Err("API 地址必须以 http:// 或 https:// 开头".into());
     }
     let handle = tokio::task::spawn_blocking(move || crate::api_server::custom_route::probe(&cm));

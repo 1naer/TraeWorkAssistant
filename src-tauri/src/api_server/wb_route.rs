@@ -365,7 +365,8 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
         return ErrKind::None;
     }
     // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
-    // 禁用待申诉（申诉成功后 UI 手动启用恢复）；流内走既有 kind 分支——
+    // 禁用为内存态，无手动启用入口——申诉处理后重启应用或重新登录账号即随
+    // 池快照重建恢复调度；流内走既有 kind 分支——
     // 未流出 break 换号接替 / 已流出就地收尾，禁用与解绑粘性由 note_error 生效
     if code == 11140 || super::retry::is_account_restricted_error(msg) {
         return ErrKind::Forbidden;

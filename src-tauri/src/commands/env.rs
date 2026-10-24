@@ -630,38 +630,49 @@ fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Optio
 }
 
 /// 注册表卸载键搜索（按应用档案的 DisplayName 片段与 exe 名参数化）。
-/// windows-registry 进程内枚举（HKCU + HKLM 64 位视图，与原 `reg query /s /f`
-/// 语义对齐）：DisplayName 含模式串 → DisplayIcon / InstallLocation 解析。
+/// windows-registry 进程内枚举（HKCU + HKLM 64 位视图 + 32 位视图 WOW6432Node，
+/// 与原 `reg query /s /f` 语义对齐）：DisplayName 含模式串 → DisplayIcon /
+/// InstallLocation 解析。
 /// 不再 spawn reg.exe 子进程（issue #137：开机自启后登录早期 spawn 的 reg.exe
 /// 撞系统初始化窗口期报 0xc0000142），同时消除 /s /f 全量搜索 ~250ms/次开销；
 /// 同键直读三个值，原「/f 输出不全再回查全值」的两段式不再需要。
+/// WOW6432Node：64 位进程视角不发生 WOW64 重定向，32 位安装器条目的真实落点是
+/// HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall（reg query
+/// 实证存在大量此类子键），只枚举直接卸载键会漏检；HKCU\Software 无 WOW64
+/// 重定向、其下对应视图键通常不存在，open 失败自然跳过。
 fn registry_app_path(profile: &AppProfile) -> Option<String> {
     use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
     let uninstall_sub = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    let uninstall_views = [
+        uninstall_sub,
+        "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    ];
     for pattern in profile.reg_patterns {
         let pat_upper = pattern.to_uppercase();
         for root in [CURRENT_USER, LOCAL_MACHINE] {
-            let Ok(uninstall) = root.open(uninstall_sub) else {
-                continue;
-            };
-            let Ok(subkeys) = uninstall.keys() else {
-                continue;
-            };
-            for key in subkeys {
-                let Ok(item) = uninstall.open(&key) else {
+            for view in uninstall_views {
+                let Ok(uninstall) = root.open(view) else {
                     continue;
                 };
-                // 原实现仅接受 DisplayName 数据含模式串的键（/f 命中行人工过滤）
-                let Ok(display) = item.get_string("DisplayName") else {
+                let Ok(subkeys) = uninstall.keys() else {
                     continue;
                 };
-                if !display.to_uppercase().contains(&pat_upper) {
-                    continue;
-                }
-                let icon = item.get_string("DisplayIcon").ok();
-                let loc = item.get_string("InstallLocation").ok();
-                if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
-                    return Some(hit);
+                for key in subkeys {
+                    let Ok(item) = uninstall.open(&key) else {
+                        continue;
+                    };
+                    // 原实现仅接受 DisplayName 数据含模式串的键（/f 命中行人工过滤）
+                    let Ok(display) = item.get_string("DisplayName") else {
+                        continue;
+                    };
+                    if !display.to_uppercase().contains(&pat_upper) {
+                        continue;
+                    }
+                    let icon = item.get_string("DisplayIcon").ok();
+                    let loc = item.get_string("InstallLocation").ok();
+                    if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
+                        return Some(hit);
+                    }
                 }
             }
         }

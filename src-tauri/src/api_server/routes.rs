@@ -465,34 +465,44 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
             // B) allowed=Some(非空) 且作用域内 0 健康：白名单指向的本池账号均不可用
             let hint = if healthy_scope == 0 && healthy_total > 0 {
                 if matches!(&c.allowed, Some(s) if s.is_empty()) {
-                    // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
-                    let mut pools: Vec<&'static str> = Vec::new();
-                    for u in &rk.allowed_accounts {
-                        let (p, _) = super::api_keys::split_pool_tagged(u);
-                        let p = p.unwrap_or("buddy");
-                        if !pools.contains(&p) {
-                            pools.push(p);
-                        }
-                    }
-                    if rk.schedule_mode == super::api_keys::MODE_DEDICATED {
-                        let (p, _) = super::api_keys::split_pool_tagged(&rk.dedicated_account);
-                        if let Some(p) = p {
+                    if rk.org_constrained {
+                        // 组/标签约束（api_keys::apply_org_expansion 展开条目必带池前缀
+                        // 如 trae:xxx）：交集为空即本池被整池排除。此时按原始白名单
+                        // 条目回拼池名会得出「约束均指向其他池（trae）」，与本池即
+                        // trae 的排除事实同句矛盾——直接给组/标签口径提示
+                        format!(
+                            " hint=该 Key 的组/标签约束与本池账号交集为空（交集为空即整池排除）：请编辑该 Key 的组/标签或账号白名单后重试"
+                        )
+                    } else {
+                        // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
+                        let mut pools: Vec<&'static str> = Vec::new();
+                        for u in &rk.allowed_accounts {
+                            let (p, _) = super::api_keys::split_pool_tagged(u);
+                            let p = p.unwrap_or("buddy");
                             if !pools.contains(&p) {
                                 pools.push(p);
                             }
                         }
-                    }
-                    if pools.is_empty() {
-                        format!(
-                            " hint=该 Key 的账号约束未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号后重试",
-                            pool = pool.as_str(),
-                        )
-                    } else {
-                        format!(
-                            " hint=该 Key 的账号约束均指向其他资源池（{pools}），未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号纳入 {pool} 池，或检查约束目标池的账号健康度后重试",
-                            pools = pools.join("/"),
-                            pool = pool.as_str(),
-                        )
+                        if rk.schedule_mode == super::api_keys::MODE_DEDICATED {
+                            let (p, _) = super::api_keys::split_pool_tagged(&rk.dedicated_account);
+                            if let Some(p) = p {
+                                if !pools.contains(&p) {
+                                    pools.push(p);
+                                }
+                            }
+                        }
+                        if pools.is_empty() {
+                            format!(
+                                " hint=该 Key 的账号约束未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号后重试",
+                                pool = pool.as_str(),
+                            )
+                        } else {
+                            format!(
+                                " hint=该 Key 的账号约束均指向其他资源池（{pools}），未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号纳入 {pool} 池，或检查约束目标池的账号健康度后重试",
+                                pools = pools.join("/"),
+                                pool = pool.as_str(),
+                            )
+                        }
                     }
                 } else {
                     format!(
