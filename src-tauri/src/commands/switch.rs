@@ -135,11 +135,18 @@ fn run_in_background(
         let result = match result {
             Ok(Ok(msg)) => match post_check {
                 Some(check) => {
-                    let warn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // 审查修复（P2）：post_check panic 时先向前端发一条进度文案，再降级为
+                    // None（跳过复核）——避免 panic 被静默吞掉、用户不知道复核为何被跳过
+                    let warn = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         check(&app, &data_dir)
-                    }))
-                    .ok()
-                    .flatten();
+                    })) {
+                        Ok(warn) => warn,
+                        Err(_) => {
+                            let line = "[post-check] 登录身份确认回调异常终止（panic），跳过登录身份确认".to_string();
+                            emit_or_log(&app, event_progress, serde_json::Value::String(line), &data_dir);
+                            None
+                        }
+                    };
                     match warn {
                         Some(w) => Ok(Ok(format!("{msg}（警告：{w}）"))),
                         None => Ok(Ok(msg)),
@@ -330,6 +337,19 @@ pub fn switch_account(
                     &format!("切换前会话迁移: {label} {src} → {uid}（自动备份 + 复制）"),
                 );
                 Some(Box::new(move |app: &AppHandle| {
+                    // 审查修复（P5）：src 取自本地登录态文件（auth 文件/genie.userId/池反查），
+                    // 拼接备份/复制路径前过 uid 白名单，与目标 uid 入口同标准；
+                    // 非法则跳过迁移（与备份失败语义一致，不影响切换）
+                    if let Err(e) = fs_utils::ensure_uid_safe(src.trim()) {
+                        emit_switch_step(
+                            app,
+                            &data_dir,
+                            "migrate",
+                            "warn",
+                            &format!("源账号 id 非法（已跳过会话迁移）: {e}"),
+                        );
+                        return;
+                    }
                     emit_switch_step(
                         app,
                         &data_dir,
@@ -428,6 +448,15 @@ pub fn switch_account(
                     );
                 }
             };
+            // 审查修复（P4）：复核轮询最长 20 秒，先发一条 running 进度，
+            // 避免 done 终态静默延迟期间前端进度条无反馈（对齐 authfile confirm_switch）
+            emit_switch_step(
+                app,
+                dc_dir,
+                "verify",
+                "running",
+                "正在确认登录身份（最多等待 20 秒）…",
+            );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             loop {
                 let live = if is_qoder2 {
