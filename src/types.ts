@@ -628,11 +628,15 @@ export interface ApiServiceStatus {
 }
 
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
-/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
+/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘；
+ *  disabled 为 L1 显式静态禁用（issue #145 渠道内单模型开关，meta.enabled=false），
+ *  与运行时 enabled 徽章不同构：disabled 源不参与调度且不对外发布） */
 export interface UnifiedModelSource {
   pool: 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
   rate: number | null;
   enabled: boolean;
+  /** L1 显式禁用（issue #145）：true = 该源被管理端单模型开关停用 */
+  disabled: boolean;
 }
 
 /** 统一模型目录条目（api_unified_models 返回，实时聚合派生视图） */
@@ -729,6 +733,8 @@ export interface TraeModelMeta {
   context_length?: number | null;
   max_tokens?: number | null;
   supports_image?: boolean | null;
+  /** 渠道内单模型开关（issue #145）：null = 默认启用；false = 禁用该模型（不路由 Trae 源） */
+  enabled?: boolean | null;
 }
 
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */

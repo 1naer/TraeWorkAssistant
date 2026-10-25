@@ -775,6 +775,27 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     }))
 }
 
+/// 对外 /v1/models 条目可见性（issue #145）：
+/// ① WB 准入口径——wb_enabled=false 时仅 WB 系源（buddy / buddy-ai）的条目不发布，
+///    多源模型保留（仍可由 Trae 源服务 §3.4；buddy-ai 开启时 CN 目录模型经 buddy-ai
+///    池仍可路由，不得在准入目录层被滤掉——与 dispatch available 门控同口径）。
+///    判定将 s.disabled 视同源不存在，防「WB 关 + 仅剩 Trae 源被 L1 禁用」组合
+///    产生幽灵条目（目录列出但任何请求都 400 wb_upstream_disabled）；
+/// ② issue #145：全部源被 L1 显式禁用的条目不对外发布（管理端 api_unified_models
+///    不受此限，仍可见以便重新启用）
+fn models_entry_visible(
+    m: &unified_catalog::UnifiedModel,
+    wb_enabled: bool,
+    buddy_ai_enabled: bool,
+) -> bool {
+    (wb_enabled
+        || buddy_ai_enabled
+        || !m.sources
+            .iter()
+            .all(|s| s.pool == "buddy" || s.pool == "buddy-ai" || s.disabled))
+        && !m.sources.iter().all(|s| s.disabled)
+}
+
 pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     // 统一模型目录（§3.4）：实时聚合 data/api_models.json（Trae，元数据四层链）
     // 与 data/wb_model_catalog.json（Buddy），纯派生不落盘。官网/目录同步后
@@ -820,15 +841,13 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // wb_enabled=false：仅 WB 系源（buddy / buddy-ai）的模型过滤，多源模型保留
     //（仍可由 Trae 源服务 §3.4；buddy-ai 开启时 CN 目录模型经 buddy-ai 池仍可路由，
     // 不得在准入目录层被滤掉——与 dispatch available 门控同口径）
+    // issue #145：全部源被 L1 显式禁用的条目不对外发布（管理端 api_unified_models
+    // 不受此限，仍可见以便重新启用）
+    let entry_visible =
+        |m: &unified_catalog::UnifiedModel| models_entry_visible(m, wb_enabled, buddy_ai_enabled);
     let mut data: Vec<Value> = list
         .iter()
-        .filter(|m| {
-            wb_enabled
-                || buddy_ai_enabled
-                || !m.sources
-                    .iter()
-                    .all(|s| s.pool == "buddy" || s.pool == "buddy-ai")
-        })
+        .filter(|m| entry_visible(m))
         .map(|m| {
             json!({
                 "id": m.id,
@@ -856,9 +875,11 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 白名单按裸名放行（whitelist_check 同步剥离）；别名条目随基础条目白名单
     // 过滤结果派生，不重复过滤
     if source_labels {
-        for m in list.iter().filter(|m| m.sources.len() >= 2) {
+        // 别名随基础条目可见性派生（issue #145：全禁条目不生成别名）；
+        // 被禁单源不发布前缀别名（trae/xxx 指向不可路由源无意义）
+        for m in list.iter().filter(|m| entry_visible(m) && m.sources.len() >= 2) {
             // v3：custom 入别名列表（custom/xxx 前缀锁池直达与其他池同语义）
-            for s in m.sources.iter() {
+            for s in m.sources.iter().filter(|s| !s.disabled) {
                 data.push(json!({
                     "id": format!("{}/{}", s.pool, m.id),
                     "object": "model",
@@ -3322,6 +3343,60 @@ mod tests {
         let (msg, tag) = exhaust_message(6, 10, 2);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    // ==================== /v1/models 条目可见性（issue #145） ====================
+
+    /// 最小 UnifiedModel 构造（仅可见性判定用字段）
+    fn um(id: &str, sources: Vec<unified_catalog::UnifiedSource>) -> unified_catalog::UnifiedModel {
+        unified_catalog::UnifiedModel {
+            id: id.into(),
+            display: id.into(),
+            vendor: String::new(),
+            region: None,
+            rate: None,
+            efforts: vec![],
+            max_mode: false,
+            context_length: None,
+            max_tokens: None,
+            supports_image: None,
+            sources,
+            manual: false,
+        }
+    }
+
+    fn src(pool: &'static str, disabled: bool) -> unified_catalog::UnifiedSource {
+        unified_catalog::UnifiedSource {
+            pool,
+            rate: None,
+            enabled: false,
+            disabled,
+        }
+    }
+
+    #[test]
+    fn models_entry_visible_filters_ghost_and_all_disabled() {
+        // 幽灵条目（issue #145 审查修复）：WB 关 + buddy-ai 关 + 多源模型仅剩的
+        // Trae 源被 L1 禁用 → buddy 源不可路由、trae 源被禁，条目不得对外发布
+        //（旧行为两子句均放行，发布后任何请求都 400 wb_upstream_disabled）
+        let ghost = um("m1", vec![src("buddy", false), src("trae", true)]);
+        assert!(!models_entry_visible(&ghost, false, false));
+        // 同条目 WB 开启 → buddy 源可路由，正常发布
+        assert!(models_entry_visible(&ghost, true, false));
+        // 对照：trae 未禁时 WB 关仍保留条目（由 Trae 源服务，§3.4 既有口径）
+        let multi = um("m2", vec![src("buddy", false), src("trae", false)]);
+        assert!(models_entry_visible(&multi, false, false));
+        // 唯一 Trae 源被 L1 全禁 → 不发布（无论 WB 开关，全禁条款 ②）
+        let trae_only = um("m3", vec![src("trae", true)]);
+        assert!(!models_entry_visible(&trae_only, false, false));
+        assert!(!models_entry_visible(&trae_only, true, false));
+        // 仅 WB 系源 + WB 关 → 准入口径过滤（既有行为不回退）
+        let buddy_only = um("m4", vec![src("buddy", false)]);
+        assert!(!models_entry_visible(&buddy_only, false, false));
+        assert!(models_entry_visible(&buddy_only, true, false));
+        // 纯 Trae 源未禁 + WB 关 → 保留（trae 不受 WB 准入约束）
+        let trae_ok = um("m5", vec![src("trae", false)]);
+        assert!(models_entry_visible(&trae_ok, false, false));
     }
 
     // ==================== P2 修复6：safe_slice 字符边界截断 ====================

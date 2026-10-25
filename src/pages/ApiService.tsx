@@ -87,6 +87,8 @@ export default function ApiService() {
   const [fContext, setFContext] = useState('');
   const [fMaxTokens, setFMaxTokens] = useState('');
   const [fImage, setFImage] = useState<'' | 'true' | 'false'>('');
+  // 渠道内单模型开关（issue #145）：'' = 默认启用（未设置），'false' = 禁用该模型
+  const [fEnabled, setFEnabled] = useState<'' | 'true' | 'false'>('');
   const [savingMeta, setSavingMeta] = useState(false);
   const [clearingMeta, setClearingMeta] = useState(false);
 
@@ -343,6 +345,7 @@ export default function ApiService() {
     setFImage(
       known?.supports_image === true ? 'true' : known?.supports_image === false ? 'false' : '',
     );
+    setFEnabled(known?.enabled === true ? 'true' : known?.enabled === false ? 'false' : '');
   };
 
   const saveMeta = async () => {
@@ -362,6 +365,7 @@ export default function ApiService() {
       context_length: context,
       max_tokens: maxTokens,
       supports_image: fImage === '' ? null : fImage === 'true',
+      enabled: fEnabled === '' ? null : fEnabled === 'true',
     };
     setSavingMeta(true);
     try {
@@ -932,13 +936,24 @@ export default function ApiService() {
                   </tr>
                 </thead>
                 <tbody>
-                  {models.map((m) => (
+                  {models.map((m) => {
+                    const traeDisabled =
+                      m.sources.find((s) => s.pool === 'trae')?.disabled === true;
+                    return (
                     <tr
                       key={m.id}
                       className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
                     >
                       <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
                         {m.id}
+                        {traeDisabled && (
+                          <sup
+                            className="ml-0.5 font-sans text-[9px] font-bold leading-none text-slate-400 dark:text-zinc-500"
+                            title="L1 已禁用：请求不再路由 Trae 源（可在编辑弹框重新启用）"
+                          >
+                            已禁
+                          </sup>
+                        )}
                         {m.max_mode && (
                           <sup
                             className="ml-0.5 font-sans text-[9px] font-bold leading-none text-amber-500 dark:text-amber-400"
@@ -991,7 +1006,8 @@ export default function ApiService() {
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1115,6 +1131,18 @@ export default function ApiService() {
               <option value="">未设置（自动来源）</option>
               <option value="true">支持</option>
               <option value="false">不支持</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">模型启用</label>
+            <select
+              className={inputCls}
+              value={fEnabled}
+              onChange={(e) => setFEnabled(e.target.value as '' | 'true' | 'false')}
+            >
+              <option value="">未设置（默认启用）</option>
+              <option value="true">启用</option>
+              <option value="false">禁用（不路由 Trae 源）</option>
             </select>
           </div>
         </div>
