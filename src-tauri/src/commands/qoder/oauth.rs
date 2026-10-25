@@ -1,6 +1,6 @@
-//! Qoder OAuth 设备流命令（F-80；R-10 抓包固化）：
-//! 浏览器打开授权页（qoder.cn/device/selectAccounts）→ 轮询 deviceToken/poll
-//! → dt- 令牌入池。事件契约对齐 wb-oauth（qoder-oauth-progress / qoder-oauth-done）。
+//! Qoder OAuth 设备流命令（F-80；R-10 抓包固化；issue #140 修复 2026-10-24）：
+//! 浏览器打开 SSO 登录页（qoder.cn/sso/login/aliyun?oauth_callback=设备授权页）→ 轮询
+//! deviceToken/poll → dt- 令牌入池。事件契约对齐 wb-oauth（qoder-oauth-progress / qoder-oauth-done）。
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -30,22 +30,23 @@ impl Drop for OAuthGuard {
     }
 }
 
-/// 系统浏览器打开 URL（复用 wb oauth 同款实现：cmd /c start + raw_arg 防 & 截断）
+/// 系统浏览器打开 URL（explorer.exe 直开：URL 先经 https/http 前缀 + 引号/空格校验，
+/// 再以单参数传递，& / % 等保留字无需 cmd 层转义——issue #140 复审移除 cmd 层，
+/// 消除密集 %XX URL 的理论 %VAR% 展开面）
 #[cfg(windows)]
 fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
-    Command::new("cmd")
-        .arg("/c")
-        .raw_arg(format!("start \"\" \"{url}\""))
+    Command::new("explorer")
+        .arg(url)
         .creation_flags(0x08000000)
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开浏览器失败: {e}"))
 }
 
-/// 非 Windows 占位（cmd/raw_arg/creation_flags 为 Windows 专属，逐函数门控
+/// 非 Windows 占位（explorer/creation_flags 为 Windows 专属，逐函数门控
 /// 对齐 common.rs is_running 惯例）
 /// macOS 适配预留：用 `open <url>` 子进程（Command::new("open").arg(url)）等价替换，
 /// URL 校验逻辑（https/http 前缀 + 引号/空格拒绝）跨平台保留；Linux 分支可顺手
@@ -74,7 +75,8 @@ fn emit_done(app: &AppHandle, data_dir: &Path, ok: bool, id: &str, nickname: &st
 }
 
 /// 发起 Qoder OAuth 设备流登录：
-/// ① 构造 PKCE 会话并打开授权页 → ② 后台线程 1s 轮询（404=pending，200=授权完成）
+/// ① 构造 PKCE 会话并打开 SSO 登录页（oauth_callback 指向设备授权页，issue #140）
+/// → ② 后台线程 1s 轮询（404=pending，200=授权完成）
 /// → ③ dt- 令牌入池（幂等：同 token 稳定同 id）并回填 uid/昵称/套餐。
 /// `compat`（2026-10-02 审查预案）：兼容模式——授权 URL 不带 client_id（社区实现
 /// 验证可用）。官方常量被 Qoder 轮换导致授权页「参数无效」时，前端在授权超时后
@@ -92,7 +94,7 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
         qoder_oauth::DeviceFlow::new()
     };
     let auth_url = flow.auth_url.clone();
-    emit_progress(&app, "init", "正在打开 Qoder 授权页…", Some(&auth_url));
+    emit_progress(&app, "init", "正在打开 Qoder 登录页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
         return Err(e);
