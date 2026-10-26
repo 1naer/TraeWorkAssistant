@@ -365,7 +365,9 @@ impl ApiSharedState {
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
-    /// uid 固定 "custom"，落盘策略与 record_usage 相同
+    /// uid 固定 "custom"，落盘策略与 record_usage 相同。
+    /// `session`：请求级会话上下文（issue #149 P2）——同步直写 custom_sessions 流水
+    /// （request_id 内部生成 uuid，纯 INSERT；写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_custom(
         &self,
@@ -376,7 +378,11 @@ impl ApiSharedState {
         duration_ms: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
+        session: &usage::CustomSessionCtx,
     ) {
+        // day 先取定（同 record_usage_qoder）：用量行、流水行与标脏行共用同一日期键，
+        // 杜绝跨零点时三者分裂到不同日期
+        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
@@ -386,8 +392,25 @@ impl ApiSharedState {
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
         // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
-        let day = usage::today_key();
         drop(guard);
+        // issue #149 P2：请求级流水同步落库（静默，不影响记账主路径）
+        let _ = crate::store::docs::custom_session_insert(
+            &crate::store::db(&self.data_dir),
+            &uuid::Uuid::new_v4().to_string(),
+            &session.session_id,
+            &session.uid,
+            &day,
+            chrono::Local::now().timestamp(),
+            model,
+            session.stage,
+            &session.key_name,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            duration_ms as i64,
+            is_stream,
+            ok,
+            &session.preview,
+        );
         self.usage_dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())
