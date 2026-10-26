@@ -268,6 +268,17 @@ impl AppState {
         if s.doubao_quota_url.clone().unwrap_or_default().trim().is_empty() {
             s.doubao_quota_url = Some(crate::models::default_doubao_quota_url());
         }
+        // 豆包调度开关（issue #147，默认开）：kv 完全缺失走 Settings::default()
+        //（派生 Default bool=false）会漏开——kv 无 app_settings 键即「从未配置」，
+        // 回填默认开；kv 存在时新增字段由 serde default_true 兜底，
+        // 用户显式关闭后不会被此处重新打开。外层布尔守卫：默认开的常规路径
+        // 不追加第二次 kv 查询（settings() 为高频调用）
+        if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled {
+            if crate::store::db(&self.data_dir).kv_get_raw("app_settings").is_none() {
+                s.doubao_keepalive_enabled = true;
+                s.doubao_quota_enabled = true;
+            }
+        }
         // Trae JWT 续期调度（issue #27）：kv 完全缺失走 Settings::default()（bool=false/
         // String=""）会漏开——时刻为空视为从未配置，统一回填默认开 + 09:00；
         // 用户显式关闭后 hhmm 保持非空，不会被此处重新打开

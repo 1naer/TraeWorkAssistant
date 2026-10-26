@@ -192,6 +192,13 @@ pub struct Settings {
     /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
     #[serde(default)]
     pub doubao_snapshot_include_idb: bool,
+    /// 豆包会话每日续期调度开关（issue #147，默认开）：调度器 doubao-keepalive 可关闭；
+    /// state::settings 对 kv 完全缺失路径回填默认开（派生 Default bool=false 漏开防御）
+    #[serde(default = "default_true")]
+    pub doubao_keepalive_enabled: bool,
+    /// 豆包会员额度每日巡检调度开关（issue #147，默认开）：调度器 doubao-quota 可关闭
+    #[serde(default = "default_true")]
+    pub doubao_quota_enabled: bool,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]

@@ -513,6 +513,11 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     let Some(accounts) = pool.get("accounts").and_then(Value::as_array) else {
         return Err("账号池解析失败".to_string());
     };
+    // 无豆包账号时跳过（issue #147；对齐 qoder/trae 任务 `{"ok":true,"skipped":...}`
+    // 惯例：调度器与 CLI 双路径均静默跳过，不落失败记录、不触发首败通知）
+    if accounts.is_empty() {
+        return Ok(json!({ "ok": true, "skipped": "无豆包账号" }));
+    }
 
     // 端点：settings.doubao_quota_url（state.settings() 已对空值回填默认）
     let url = state

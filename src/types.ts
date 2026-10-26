@@ -383,6 +383,10 @@ export interface Settings {
   doubao_quota_url: string | null;
   /** 豆包快照可选纳入 Default/IndexedDB（对话历史等完整状态随账号迁移；体积代价大） */
   doubao_snapshot_include_idb: boolean;
+  /** issue #147：豆包会话每日续期应用内调度开关（默认开，环境配置页可关） */
+  doubao_keepalive_enabled: boolean;
+  /** issue #147：豆包会员额度每日巡检应用内调度开关（默认开，环境配置页可关） */
+  doubao_quota_enabled: boolean;
   /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
   /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
