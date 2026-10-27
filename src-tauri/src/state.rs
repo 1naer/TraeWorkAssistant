@@ -272,9 +272,17 @@ impl AppState {
         //（派生 Default bool=false）会漏开——kv 无 app_settings 键即「从未配置」，
         // 回填默认开；kv 存在时新增字段由 serde default_true 兜底，
         // 用户显式关闭后不会被此处重新打开。外层布尔守卫：默认开的常规路径
-        // 不追加第二次 kv 查询（settings() 为高频调用）
+        // 不追加第二次 kv 查询（settings() 为高频调用）。
+        // 「从未配置」判定含损坏 kv（审查 Low）：值存在但解析失败时 kv_get 已
+        // 回退默认（豆包双开关落 false），仅按键存在性放行会把损坏行误当
+        // 「已配置」漏回填——值不可解析同样视为从未配置
         if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled {
-            if crate::store::db(&self.data_dir).kv_get_raw("app_settings").is_none() {
+            let never_configured =
+                match crate::store::db(&self.data_dir).kv_get_raw("app_settings") {
+                    None => true,
+                    Some(raw) => serde_json::from_str::<serde_json::Value>(&raw).is_err(),
+                };
+            if never_configured {
                 s.doubao_keepalive_enabled = true;
                 s.doubao_quota_enabled = true;
             }

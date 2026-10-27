@@ -91,6 +91,8 @@ fn view_of(
         &state.data_dir,
     )
     .profiles_dir;
+    // IDE 端 sidecar 位于 profiles 根（profiles_ide/{id}.meta.json），不随 rotate_bak
+    // 进 .bak——无需 Work 侧（槽内 meta 随轮转）的同款 .bak 回退
     let (snapshot_saved_at_ms, snapshot_verify_failed_at_ms) =
         crate::switcher::icube::read_snapshot_sidecar(&profiles_ide, &a.id);
     let (snapshot_saved_at_work_ms, snapshot_verify_failed_work_at_ms) = {
@@ -454,6 +456,9 @@ pub async fn qoder_account_refresh_token(
                     .ok_or_else(|| "续期后回读失败".to_string())
             }
             "no_credential" => Err("该账号无可用凭证，请先导入 PAT 或重新登录".into()),
+            // 暂态：账号级刷新锁被他进程/线程持有（ensure_fresh 沿用现有凭证返回）
+            // ——可稍后重试；英文 note 不得透传用户
+            "refresh_busy" => Err("续期未执行：该账号正在另一任务中刷新，请稍后重试".into()),
             // 暂态失败（网络/服务端抖动）：可重试
             "refresh_failed" => Err("续期失败：网络或服务端异常，请稍后重试".into()),
             // 刷新成功但落库失败（refresh_token 一次性轮换，旧 RT 已作废）：

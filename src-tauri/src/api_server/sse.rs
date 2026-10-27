@@ -819,6 +819,9 @@ fn anthropic_stop_reason(finish: &str) -> &'static str {
     match finish {
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
+        // content_filter 是真实截断语义：映射 refusal（对齐 wb_sse 聚合出口），
+        // 静默归 end_turn 会把「内容被过滤」伪装成「自然结束」
+        "content_filter" => "refusal",
         _ => "end_turn",
     }
 }

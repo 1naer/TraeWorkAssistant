@@ -888,6 +888,8 @@ export interface UsageDayView {
   stream_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /** 缓存读 tokens 累计（M4 审查修复；上游未下发时为 0） */
+  cached_tokens: number;
   /** 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零；上游未下发 usage 的请求不计入） */
   credits: number;
   /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */

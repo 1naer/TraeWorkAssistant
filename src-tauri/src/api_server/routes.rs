@@ -410,7 +410,7 @@ pub(crate) fn exhaust_message(empty_hits: usize, rotated: usize, healthy_total: 
     if rotated >= 2 && empty_hits * 2 > rotated {
         (
             format!(
-                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json or enabling sanitize (pool=trae healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json (UI「指纹清洗」tab) or the tool alias table (UI「工具别名」tab) or enabling sanitize (pool=trae healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
         )
@@ -1818,6 +1818,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        // 11128 显式指纹确认置位（issue #122 缺口3 审查补口）：强制清洗 rebuild 后
+        // 同号重试直接消费 rebuild 结果（内层循环不重算 converted），但换号到下一
+        // 账号 / 触发对冲竞速时循环顶会以 empty_hits>0 || fp_block_recent 重算激进
+        // 位——纯 11128 首拦两条件均假，激进意图被丢弃且主/对冲清洗强度不一致。
+        // 此处置位后循环顶与对冲重建统一沿用全力清洗
+        let mut force_aggressive = false;
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
         // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
         // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
@@ -1875,15 +1881,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             // 多候选改写种子（issue #122 方案 C1）：tried.len() 随换号轮换递增；
-            // 空完成后（empty_hits>0）或池级指纹拦截 TTL 内（issue #122 缺口2）
-            // 追加激进清洗（issue #122 方案 C2）
+            // 空完成后（empty_hits>0）、池级指纹拦截 TTL 内（issue #122 缺口2）
+            // 或 11128 强制清洗置位（force_aggressive）时追加激进清洗（方案 C2）
             let seed = super::wb_payload::variant_seed(&seed_base, tried.len() as u64);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
                 sanitize, &templates,
-                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
+                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae") || force_aggressive,
             );
             // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
             //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
@@ -1924,8 +1930,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
                             &tool_alias_rules,
-                            // 对冲重建沿用主请求的激进口径与种子（issue #122 C1/C2）
-                            seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
+                            // 对冲重建沿用主请求的激进口径与种子（issue #122 C1/C2；
+                            // 11128 强制清洗后 force_aggressive 贯穿，主/对冲同强度）
+                            seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae") || force_aggressive,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -2119,6 +2126,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
                             if !sanitize {
                                 sanitize = true;
+                                // 激进口径贯穿（issue #122 缺口3）：置位后换号/对冲重建
+                                // 仍全力清洗，不被循环顶重算丢弃
+                                force_aggressive = true;
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
                                 ));
@@ -2421,6 +2431,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        // 11128 显式指纹确认置位（issue #122 缺口3 审查补口）：强制清洗 rebuild 后
+        // 同号重试直接消费 rebuild 结果（内层循环不重算 converted），但换号到下一
+        // 账号 / 触发对冲竞速时循环顶会以 empty_hits>0 || fp_block_recent 重算激进
+        // 位——纯 11128 首拦两条件均假，激进意图被丢弃且主/对冲清洗强度不一致。
+        // 此处置位后循环顶与对冲重建统一沿用全力清洗
+        let mut force_aggressive = false;
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
         // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
         // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
@@ -2465,15 +2481,15 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             // 多候选改写种子（issue #122 方案 C1）：tried.len() 随换号轮换递增；
-            // 空完成后（empty_hits>0）或池级指纹拦截 TTL 内（issue #122 缺口2）
-            // 追加激进清洗（issue #122 方案 C2）
+            // 空完成后（empty_hits>0）、池级指纹拦截 TTL 内（issue #122 缺口2）
+            // 或 11128 强制清洗置位（force_aggressive）时追加激进清洗（方案 C2）
             let seed = super::wb_payload::variant_seed(&seed_base, tried.len() as u64);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
                 sanitize, &templates,
-                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
+                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae") || force_aggressive,
             );
             // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
             //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
@@ -2639,6 +2655,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
                             if !sanitize {
                                 sanitize = true;
+                                // 激进口径贯穿（issue #122 缺口3）：置位后换号重建
+                                // 仍全力清洗，不被循环顶重算丢弃
+                                force_aggressive = true;
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
                                 ));
