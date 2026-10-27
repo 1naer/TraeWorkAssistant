@@ -1184,6 +1184,17 @@ export interface SanitizeMapView {
 // 'buddy-ai' = 国际档独立键（buddy_ai_template_map）
 export type SanitizeTier = 'wb' | 'buddy-ai';
 
+// ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
+// 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，
+// 响应侧按逆映射回改（协议对客户端透明）。合并语义同指纹清洗：内置默认表始终
+// 生效，自定义表按 from 覆盖/追加；to=null 停用该规则（原名透传）。
+// 注意：别名必须请求/响应双向一致，不支持指纹清洗的 to="" 剥离语义
+export interface ToolAliasMapView {
+  rules: SanitizeRule[];
+  updated_at: number | null;
+  builtin?: boolean;
+}
+
 // 网关命中（11128 拦截 / 空完成影子风控）落下的指纹样本（内存环形缓冲，最新在前；
 // 重启即清空）。sample 为 fingerprint_sample 输出：system="<首条 system 前 300 字符>" tools=[…]
 export interface FingerprintSample {

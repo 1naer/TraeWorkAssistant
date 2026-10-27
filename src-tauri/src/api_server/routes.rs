@@ -410,7 +410,7 @@ pub(crate) fn exhaust_message(empty_hits: usize, rotated: usize, healthy_total: 
     if rotated >= 2 && empty_hits * 2 > rotated {
         (
             format!(
-                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json or enabling sanitize (pool=trae healthy={healthy_total})",
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json or enabling sanitize (pool=trae healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
         )
@@ -1819,6 +1819,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
+        // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
+        let tool_alias_rules =
+            super::wb_route::load_tool_alias_rules(&super::wb_route::WbView::wb(state.clone()));
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
         // 多候选改写种子基底（issue #122 方案 C1）：会话键 + 请求时间戳绑定请求，
         // tried.len() 随换号轮换递增——跨重试候选必变
@@ -1881,6 +1885,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 sanitize, &templates,
                 seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
             );
+            // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
+            //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
+            let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+            if sanitize {
+                tool_alias =
+                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+            }
             // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
             // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
             if sanitize {
@@ -1912,6 +1923,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         let mut win = match race_trae_first_byte(
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
+                            &tool_alias_rules,
                             // 对冲重建沿用主请求的激进口径与种子（issue #122 C1/C2）
                             seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
                         ) {
@@ -1960,7 +1972,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
                         let (error_info, sent_any, up_usage) = match proto {
                             Protocol::OpenAi => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
+                                let (e, s, u) =
+                                    sse::stream_convert_lines(lines, tx.clone(), &chat_id, tool_alias.as_ref());
                                 (e, s, u)
                             }
                             Protocol::OpenAiText => {
@@ -1969,13 +1982,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 (e, s, u)
                             }
                             Protocol::Anthropic => {
-                                let (e, s, u) =
-                                    sse::stream_convert_anthropic_lines(lines, tx.clone(), &chat_id, &model);
+                                let (e, s, u) = sse::stream_convert_anthropic_lines(
+                                    lines, tx.clone(), &chat_id, &model, tool_alias.as_ref(),
+                                );
                                 (e, s, u)
                             }
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
                             Protocol::Responses => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
+                                let (e, s, u) =
+                                    sse::stream_convert_lines(lines, tx.clone(), &chat_id, tool_alias.as_ref());
                                 (e, s, u)
                             }
                         };
@@ -2115,6 +2130,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     true, &templates,
                                     seed, true,
                                 );
+                                // 11128 强制清洗后别名改写同步重放（issue #150）：
+                                // rebuild 以原始 body_vec 为基，逆映射按新表重算
+                                tool_alias =
+                                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                                 if tx.is_closed() {
@@ -2403,6 +2422,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
+        // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
+        let tool_alias_rules =
+            super::wb_route::load_tool_alias_rules(&super::wb_route::WbView::wb(state.clone()));
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
         // 多候选改写种子基底（issue #122 方案 C1）：会话键 + 请求时间戳绑定请求，
         // tried.len() 随换号轮换递增——跨重试候选必变
@@ -2452,6 +2475,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 sanitize, &templates,
                 seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
             );
+            // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
+            //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
+            let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+            if sanitize {
+                tool_alias =
+                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+            }
             // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
             // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
             if sanitize {
@@ -2479,11 +2509,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             Protocol::Responses => format!("resp_{}", now_ts()),
                         };
                         let (resp, error_info) = match proto {
-                            Protocol::OpenAi => sse::aggregate(reader, &chat_id),
+                            Protocol::OpenAi => sse::aggregate(reader, &chat_id, tool_alias.as_ref()),
                             Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
-                            Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
+                            Protocol::Anthropic => {
+                                sse::aggregate_anthropic(reader, &chat_id, &model, tool_alias.as_ref())
+                            }
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 聚合
-                            Protocol::Responses => sse::aggregate(reader, &chat_id),
+                            Protocol::Responses => sse::aggregate(reader, &chat_id, tool_alias.as_ref()),
                         };
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
@@ -2618,6 +2650,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     true, &templates,
                                     seed, true,
                                 );
+                                // 11128 强制清洗后别名改写同步重放（issue #150）：
+                                // rebuild 以原始 body_vec 为基，逆映射按新表重算
+                                tool_alias =
+                                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
                             }
@@ -2859,6 +2895,7 @@ fn race_trae_first_byte(
     body_vec: &[u8],
     sanitize: bool,
     templates: &[(String, String)],
+    tool_alias_rules: &[(String, String)],
     seed: u64,
     aggressive: bool,
 ) -> Result<TraeRaceWin, ()> {
@@ -2896,7 +2933,7 @@ fn race_trae_first_byte(
         // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
         let mut lease = TraeHedgeLease::acquire(&state2, &picked2.uid);
         // 对冲请求体按对冲账号指纹重建
-        let converted2 = super::payload::prepare_llm_chat_body(
+        let mut converted2 = super::payload::prepare_llm_chat_body(
             &body,
             &state2.default_model,
             &picked2.uid,
@@ -2908,6 +2945,12 @@ fn race_trae_first_byte(
             hedge_seed,
             aggressive,
         );
+        // 工具别名正向改写（issue #150）：与主请求同规则表——别名集跨主/对冲
+        // 一致（表不依赖种子，见 wb_payload::merged_tool_alias_rules 注记），
+        // 任一侧胜出，响应侧逆映射（stream_chat 持有）均能正确回改
+        if sanitize {
+            let _ = super::wb_payload::apply_tool_alias_forward(&mut converted2, tool_alias_rules);
+        }
         let (reader2, hdr2) = make_upstream_request(
             &picked2.jwt,
             &picked2.uid,
@@ -3308,6 +3351,8 @@ mod tests {
         assert!(msg.contains("3 empty completion(s) across 3 rotated accounts"), "{msg}");
         assert!(msg.contains("healthy=4"), "{msg}");
         assert!(msg.contains("wb_template_map.json"), "{msg}");
+        // issue #150：客户端侧绕过提示（agent 工具形态识别，关工具/普通对话可绕过）
+        assert!(msg.contains("agent-tool fingerprint"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
     }
 

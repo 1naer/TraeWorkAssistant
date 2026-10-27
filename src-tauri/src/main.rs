@@ -261,6 +261,8 @@ fn main() {
             commands::wb_config::wb_route_config_set,
             commands::wb_config::wb_template_map_get,
             commands::wb_config::wb_template_map_set,
+            commands::wb_config::wb_tool_alias_map_get,
+            commands::wb_config::wb_tool_alias_map_set,
             commands::wb_config::fingerprint_samples_get,
             commands::wb_config::fingerprint_samples_clear,
             commands::api_server::api_unified_models,

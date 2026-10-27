@@ -13,6 +13,7 @@ import type {
   SanitizeMapView,
   SanitizeRule,
   SanitizeTier,
+  ToolAliasMapView,
   FingerprintSample,
   AppLocate,
   CheckinDone,
@@ -1086,6 +1087,16 @@ export const api = {
       invoke<void>('wb_template_map_set', {
         tier: tier ?? null,
         map: { templates, updated_at: Math.floor(Date.now() / 1000) },
+      }),
+    // ---- 工具名别名表（issue #150：tool_alias_map KV，单键不分档）----
+    // Trae 池 tools 工具集指纹识别治本：请求侧工具名→别名、响应侧逆映射回改。
+    // builtin=true = 当前生效内置默认表（尚未自定义）；保存后成为独立自定义副本
+    // （合并语义：内置表全量生效，自定义按 from 覆盖/追加，to=null 停用）。
+    // load_tool_alias_rules 每请求读取，保存即对下一请求生效，无需重启网关
+    toolAliasMapGet: () => invoke<ToolAliasMapView>('wb_tool_alias_map_get'),
+    toolAliasMapSet: (rules: SanitizeRule[]) =>
+      invoke<void>('wb_tool_alias_map_set', {
+        map: { rules, updated_at: Math.floor(Date.now() / 1000) },
       }),
     // ---- 指纹样本（issue #125 增强：一键从样本生成规则）----
     // 网关命中（11128/空完成影子风控）落下的样本环形缓冲（最新在前，重启即清空）

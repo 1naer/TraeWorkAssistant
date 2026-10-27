@@ -167,6 +167,18 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
     Some(ev)
 }
 
+/// 工具名逆向回改映射（issue #150）：请求侧 apply_tool_alias_forward 产出的
+/// 别名→原名逆映射，按请求作用域（与账号/轮换无关）；None = 无工具别名
+type ToolAliasReverse = std::collections::HashMap<String, String>;
+
+/// 工具名逆向回改（issue #150）：响应侧把上游所见别名换回客户端原名——
+/// 客户端按名匹配响应 tool_calls/tool_use，单向改名即废。None / 未命中 = 原样
+fn rename_tool_back(map: Option<&ToolAliasReverse>, name: &mut String) {
+    if let Some(orig) = map.and_then(|m| m.get(name.as_str())) {
+        *name = orig.clone();
+    }
+}
+
 /// 流式转换：SOLO SSE → OpenAI SSE chunks，逐 chunk 通过 sender 发送
 ///
 /// 返回 (错误信息, 是否已向客户端发送过数据, 上游 token usage)。
@@ -178,14 +190,16 @@ pub fn stream_convert_lines(
     lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    stream_convert_src(lines, sender, chat_id)
+    stream_convert_src(lines, sender, chat_id, tool_alias)
 }
 
 fn stream_convert_src(
     mut src: LineSrc,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
@@ -264,6 +278,19 @@ fn stream_convert_src(
                                         let mut clean = fn_obj.clone();
                                         clean.remove("namespace");
                                         clean.remove("partial_arguments");
+                                        // issue #150：别名回改——上游所见的别名换回客户端原名
+                                        if let Some(m) = tool_alias {
+                                            if let Some(n) =
+                                                clean.get("name").and_then(Value::as_str)
+                                            {
+                                                if let Some(orig) = m.get(n) {
+                                                    clean.insert(
+                                                        "name".into(),
+                                                        Value::String(orig.clone()),
+                                                    );
+                                                }
+                                            }
+                                        }
                                         if let Some(obj) = c.as_object_mut() {
                                             obj.insert("function".into(), Value::Object(clean));
                                         }
@@ -676,10 +703,27 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
 pub fn aggregate<R: Read + Send>(
     reader: R,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
-    let c = collect_plain(reader);
+    let mut c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // issue #150：别名回改——合并后的 tool_calls.function.name 还原客户端原名
+    if let Some(m) = tool_alias {
+        for t in c.tools.iter_mut() {
+            if let Some(orig) = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .and_then(|n| m.get(n))
+                .cloned()
+            {
+                if let Some(slot) = t.get_mut("function").and_then(Value::as_object_mut) {
+                    slot.insert("name".into(), Value::String(orig));
+                }
+            }
+        }
     }
 
     let mut message = json!({
@@ -825,8 +869,9 @@ pub fn stream_convert_anthropic_lines(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    stream_convert_anthropic_src(lines, sender, msg_id, model)
+    stream_convert_anthropic_src(lines, sender, msg_id, model, tool_alias)
 }
 
 /// 事件序列：message_start → content_block_start/delta/stop… → message_delta → message_stop
@@ -838,6 +883,7 @@ fn stream_convert_anthropic_src(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut message_started = false;
@@ -1053,11 +1099,13 @@ fn stream_convert_anthropic_src(
                                     }
                                     None => continue,
                                 };
-                                let name = fn_obj
+                                let mut name = fn_obj
                                     .get("name")
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                // issue #150：别名回改——tool_use.name 还原客户端原名
+                                rename_tool_back(tool_alias, &mut name);
                                 let args = fn_obj
                                     .get("arguments")
                                     .and_then(|a| a.as_str())
@@ -1185,6 +1233,7 @@ pub fn aggregate_anthropic<R: Read + Send>(
     reader: R,
     msg_id: &str,
     model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
@@ -1223,11 +1272,13 @@ pub fn aggregate_anthropic<R: Read + Send>(
                                     }
                                     None => continue,
                                 };
-                                let name = fn_obj
+                                let mut name = fn_obj
                                     .get("name")
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                // issue #150：别名回改——tool_use.name 还原客户端原名
+                                rename_tool_back(tool_alias, &mut name);
                                 let args = fn_obj
                                     .get("arguments")
                                     .and_then(|a| a.as_str())
@@ -1394,6 +1445,7 @@ mod tests {
             tx,
             "msg_t",
             "m",
+            None,
         );
         assert_eq!(error_info, Some((500, "boom".to_string())));
         assert!(sent_any, "已有内容发出时 sent_any 应为 true");
@@ -1423,6 +1475,7 @@ mod tests {
             tx,
             "msg_t",
             "m",
+            None,
         );
         assert_eq!(error_info, Some((4001, "model config is empty".to_string())));
         assert!(!sent_any, "流未开始：错误延迟给调用方决策（可重试）");
@@ -1439,12 +1492,12 @@ mod tests {
         let cursor_lines =
             std::io::Cursor::new(input).lines().map(|l| l.expect("读行失败"));
         let (e1, s1, _) =
-            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1");
+            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1", None);
         // 内存切分形态（首字超时包装产物形态）
         let (tx2, rx2) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let lines: InterruptibleLines =
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string)));
-        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1");
+        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1", None);
         assert_eq!(e1, e2);
         assert_eq!(s1, s2);
         let a = collect_events(rx).join("\n");
@@ -1465,6 +1518,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         let (code, msg) = error_info.expect("空完成必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
@@ -1486,6 +1540,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         let (code, _msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
@@ -1502,6 +1557,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         assert!(error_info.is_none(), "有内容不得触发哨兵");
         assert!(sent_any);
@@ -1521,7 +1577,7 @@ mod tests {
             "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"北京\\\"}\"}}]}\n\n",
             "event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n",
         );
-        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
         assert!(err.is_none());
         let resp = resp.expect("tool_calls 流必须产出聚合结果");
         let msg = &resp["choices"][0]["message"];
@@ -1552,6 +1608,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         assert!(error_info.is_none());
         assert!(sent_any);
@@ -1586,6 +1643,7 @@ mod tests {
                 )),
                 tx,
                 "c1",
+                None,
             );
             assert!(error_info.is_none());
             let joined = collect_events(rx).join("\n");
@@ -1608,6 +1666,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         assert!(error_info.is_none());
         let joined = collect_events(rx).join("\n");
@@ -1623,6 +1682,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         assert!(error_info.is_none());
         assert!(sent_any);
@@ -1641,7 +1701,7 @@ mod tests {
             "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
             "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
         );
-        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
         assert!(err.is_none());
         let resp = resp.expect("聚合结果");
         assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
@@ -1661,6 +1721,7 @@ mod tests {
             tx,
             "msg_t",
             "m",
+            None,
         );
         assert!(error_info.is_none());
         assert!(sent_any);
@@ -1682,7 +1743,7 @@ mod tests {
             "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
             "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
         );
-        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_t", "m");
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_t", "m", None);
         assert!(err.is_none());
         let resp = resp.expect("聚合结果");
         assert_eq!(resp["stop_reason"], "tool_use");
@@ -1789,7 +1850,7 @@ mod tests {
             "data: {\"finish_reason\": \"stop\"}\n",
             "\n",
         );
-        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3");
+        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3", None);
         assert!(err.is_none());
         let resp = resp.expect("message");
         let usage = &resp["usage"];
@@ -1798,5 +1859,62 @@ mod tests {
         // 0 值别名（cache_read_input_tokens=0）不遮蔽有效别名（cache_read_token=80）
         assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(80));
         assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(5));
+    }
+
+    // ==================== 工具名别名响应侧回改（issue #150）====================
+
+    const ALIAS_TOOL_SSE: &str = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function_call\":{\"name\":\"ask_user\",\"arguments\":\"{\\\"q\\\":\\\"1\\\"}\"}}]}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+
+    fn alias_reverse() -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("ask_user".to_string(), "ask_user_question".to_string());
+        m
+    }
+
+    /// OpenAI 流式：delta.tool_calls.function.name 把上游所见别名回改为客户端
+    /// 原名（请求侧改写 + 响应侧回改，协议对客户端透明）
+    #[test]
+    fn tool_alias_reverse_applied_on_openai_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let lines: InterruptibleLines =
+            InterruptibleLines::from_iterator(Box::new(ALIAS_TOOL_SSE.lines().map(str::to_string)));
+        let (e, s, _) = stream_convert_lines(lines, tx, "c1", Some(&alias_reverse()));
+        assert_eq!(e, None);
+        assert!(s);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("ask_user_question"), "{joined}");
+        assert!(
+            !joined.contains("\"ask_user\""),
+            "别名不得残留（原名为其前缀，须带引号精确断言）: {joined}"
+        );
+        // 收尾帧 finish_reason 应为 tool_calls（issue #148 语义）
+        assert!(joined.contains("\"finish_reason\":\"tool_calls\""), "{joined}");
+    }
+
+    /// OpenAI 非流式聚合：合并后 tool_calls.function.name 回改原名
+    #[test]
+    fn tool_alias_reverse_applied_on_aggregate() {
+        let (v, err) = aggregate(std::io::Cursor::new(ALIAS_TOOL_SSE), "c1", Some(&alias_reverse()));
+        assert!(err.is_none());
+        let v = v.expect("聚合应产出消息");
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            serde_json::json!("ask_user_question")
+        );
+    }
+
+    /// Anthropic 流式：tool_use.name 回改原名
+    #[test]
+    fn tool_alias_reverse_applied_on_anthropic_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let lines: InterruptibleLines =
+            InterruptibleLines::from_iterator(Box::new(ALIAS_TOOL_SSE.lines().map(str::to_string)));
+        let (e, s, _) = stream_convert_anthropic_lines(lines, tx, "msg_t", "m", Some(&alias_reverse()));
+        assert_eq!(e, None);
+        assert!(s);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("\"type\":\"tool_use\""), "{joined}");
+        assert!(joined.contains("ask_user_question"), "{joined}");
+        assert!(!joined.contains("\"ask_user\""), "别名不得残留: {joined}");
     }
 }
